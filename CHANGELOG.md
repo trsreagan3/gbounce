@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gbounce investigate` per #273: one-shot Claude-ready evidence pack.
+  Composes the existing `audit tail --export ocsf-bundle` (#268) and
+  `diagnostics bundle` (#277) into a single command that writes two
+  artifact files into `--out-dir` —
+  `gbounce-investigation.ndjson` (OCSF v1.1.0 class 2004 Detection
+  Finding wrapping filtered audit events + trailing
+  investigate-metadata NDJSON line) and
+  `gbounce-investigation-context.zip` (the standard diagnostics
+  bundle with `--no-audit`). Operator drops both files into THEIR
+  local Claude client (Claude Code, Cursor's Claude integration,
+  desktop Claude, the Anthropic console — whichever they use) and
+  asks an investigative prompt; gbounce never calls Anthropic.
+  Flags: `--out-dir`, `--time-range` (e.g. `24h`/`7d`/`4w`),
+  `--filter`, `--print-prompts` (lists the 10 starter prompts as a
+  paste-able block without writing files), `--db`,
+  `--audit-log-path`, `--healthz-url`. Cross-product alignment per
+  `[[cross-product-agent-parity]]` — ibounce / kbounce / dbounce
+  ship the same shape with product-specific prompt swaps. Per
+  `[[self-host-zero-billing-dependency]]` the only network call is
+  the loopback `/healthz` GET the diagnostics bundle already makes;
+  per `[[creates-never-mutates]]` read-only against the store + the
+  audit log. Docs: `docs/INVESTIGATE-WITH-CLAUDE.md`.
 - `gbounce audit tail` per #268: live-tail + filter + summary + export
   surface around the existing audit-tail subcommand. New flags:
   `--follow` (500ms polling loop; exits on SIGINT), `--filter EXPR`
