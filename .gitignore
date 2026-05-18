@@ -1,0 +1,22 @@
+# Go build artifacts. Anchor /gbounce to the repo root so the pattern
+# matches the built binary at ./gbounce WITHOUT filtering the
+# cmd/gbounce/ source tree (whose Go files MUST be tracked).
+/gbounce
+*.test
+*.out
+*.exe
+bin/
+dist/
+
+# SQLite state files (runtime)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store

@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/trsreagan3/gbounce/blob/main/schemas/gbounce-config.schema.json",
+  "title": "gbounce config export",
+  "description": "Schema for the JSON body emitted by `gbounce config export` and consumed by `gbounce config import`. Cross-product cousin to kbounce + dbounce + ibounce config schemas; the top-level `product` field gates per-product import refusal. G-Slice 1 captures the runtime-config surface (mode + bind defaults + audit-log path); profile / rule / task sections are absent and reported via the `*_supported` fields so cross-product re-import logic stays simple.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "product",
+    "gbounce_version",
+    "exported_at",
+    "source_hostname_hash",
+    "profiles_supported",
+    "rules_supported",
+    "tasks_supported",
+    "alert_rules_supported",
+    "mcp_install_history_supported",
+    "runtime_config",
+    "audit_webhook"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Wire-format version. Currently \"1.0\".",
+      "type": "string",
+      "enum": ["1.0"]
+    },
+    "product": {
+      "description": "Product name. Must be \"gbounce\" for a gbounce import.",
+      "type": "string",
+      "enum": ["gbounce"]
+    },
+    "gbounce_version": {
+      "description": "Version of the gbounce binary that produced the export.",
+      "type": "string"
+    },
+    "exported_at": {
+      "description": "RFC3339 UTC timestamp the export was generated.",
+      "type": "string"
+    },
+    "source_hostname_hash": {
+      "description": "First 12 hex chars of sha256(hostname). Lets a reviewer correlate two exports as coming from the same host without leaking the hostname itself.",
+      "type": "string"
+    },
+    "profiles_supported": {
+      "description": "False in G-Slice 1: gbounce does not yet have a profile subsystem. Reported explicitly so cross-product re-import logic can skip the section without ambiguity.",
+      "type": "boolean"
+    },
+    "rules_supported": {
+      "description": "False in G-Slice 1: gbounce does not yet have a global-rules-table subsystem.",
+      "type": "boolean"
+    },
+    "tasks_supported": {
+      "description": "False in G-Slice 1: gbounce does not yet have a tasks subsystem.",
+      "type": "boolean"
+    },
+    "alert_rules_supported": {
+      "description": "False in G-Slice 1: gbounce does not yet have an alert-rules subsystem.",
+      "type": "boolean"
+    },
+    "mcp_install_history_supported": {
+      "description": "False in G-Slice 1: gbounce does not yet ship an MCP-server install path.",
+      "type": "boolean"
+    },
+    "runtime_config": {
+      "description": "Runtime-config snapshot (mode + bind defaults + audit-log path).",
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "description": "Proxy mode. G-Slice 1 supports only \"discovery\".",
+          "type": "string"
+        },
+        "host": {"type": "string"},
+        "port": {"type": "integer"},
+        "mgmt_host": {"type": "string"},
+        "mgmt_port": {"type": "integer"},
+        "upstream_url_present": {"type": "boolean"},
+        "allow_connect": {"type": "boolean"},
+        "forward_timeout_seconds": {"type": "integer"},
+        "audit_log_path": {"type": "string"},
+        "audit_log_fsync": {"type": "boolean"}
+      }
+    },
+    "audit_webhook": {
+      "description": "Audit-webhook channel configuration. Token + URL are masked when --redact-secrets (default) was in effect; the `redacted` flag records which mode was used. G-Slice 1 does not yet ship a webhook pusher; this block round-trips operator intent only.",
+      "type": "object",
+      "required": ["redacted"],
+      "properties": {
+        "url": {"type": "string"},
+        "token": {"type": "string"},
+        "redacted": {"type": "boolean"}
+      }
+    },
+    "license": {
+      "description": "License pointer. Bytes are NEVER emitted; license_id + expires_at are round-tripped when present.",
+      "type": "object",
+      "properties": {
+        "license_id": {"type": "string"},
+        "expires_at": {"type": "string"}
+      }
+    },
+    "audit_prompts": {
+      "description": "Optional captured prompts (only when --include-prompts was passed at export time).",
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "audit_tail": {
+      "description": "Optional tail of the local decisions audit log (only when --include-audit was passed). Bodies / tokens are never included.",
+      "type": "array",
+      "items": {"type": "object"}
+    }
+  }
+}
