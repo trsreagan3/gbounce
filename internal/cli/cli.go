@@ -120,6 +120,7 @@ func newRunCmd() *cobra.Command {
 		auditLogFsync     bool
 		forceExternalBind bool
 		forwardTimeout    int
+		mode              string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -155,6 +156,16 @@ pass --i-know-this-binds-externally to acknowledge the threat model.
 Management endpoint: /healthz lives on a SEPARATE port (default 8769)
 so liveness probes never touch the proxy data path.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			switch mode {
+			case "discovery":
+				// G-Slice 1: the only supported mode.
+			case "profile":
+				return fmt.Errorf("--mode profile is not in G-Slice 1; queued for G-Slice 2")
+			case "tap":
+				return fmt.Errorf("--mode tap is not in G-Slice 1; queued for G-Slice 3")
+			default:
+				return fmt.Errorf("--mode %q not recognized; G-Slice 1 supports: discovery", mode)
+			}
 			if upstreamURL == "" && !allowConnect {
 				return fmt.Errorf("--upstream is required (or pass --allow-connect for CONNECT-tunnel mode)")
 			}
@@ -228,6 +239,7 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().BoolVar(&auditLogFsync, "audit-log-fsync", false, "fsync after every audit-log write (slower; safer on crash)")
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false, "acknowledge the threat model of binding off loopback")
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
+	cmd.Flags().StringVar(&mode, "mode", "discovery", "operating mode (G-Slice 1: discovery only; G-Slice 2 adds profile; G-Slice 3 adds tap)")
 	return cmd
 }
 

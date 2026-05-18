@@ -84,6 +84,51 @@ func TestRunCmd_RefusesNonLoopback(t *testing.T) {
 	}
 }
 
+func TestRunCmd_RejectsUnknownMode(t *testing.T) {
+	root := newRootCmd()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"run", "--mode", "bogus", "--upstream", "http://example.com", "--port", "0", "--mgmt-port", "0"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected error when --mode is not recognized")
+	}
+	if !strings.Contains(err.Error(), "not recognized") || !strings.Contains(err.Error(), "discovery") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestRunCmd_RejectsProfileModeNotYetInGSlice1(t *testing.T) {
+	root := newRootCmd()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"run", "--mode", "profile", "--upstream", "http://example.com", "--port", "0", "--mgmt-port", "0"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected error when --mode profile is requested in G-Slice 1")
+	}
+	if !strings.Contains(err.Error(), "G-Slice 2") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestRunCmd_RejectsTapModeNotYetInGSlice1(t *testing.T) {
+	root := newRootCmd()
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"run", "--mode", "tap", "--upstream", "http://example.com", "--port", "0", "--mgmt-port", "0"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected error when --mode tap is requested in G-Slice 1")
+	}
+	if !strings.Contains(err.Error(), "G-Slice 3") {
+		t.Errorf("err = %v", err)
+	}
+}
+
 func TestAuditTail_EmptyMessage(t *testing.T) {
 	dir := t.TempDir()
 	root := newRootCmd()
