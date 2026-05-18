@@ -23,6 +23,13 @@ enforcement.
   - Emits one OCSF audit event per request/response pair
 - `gbounce audit tail` prints recent rows from the local SQLite audit
   DB
+- `gbounce config export | import` portable JSON bundle for backup +
+  migration + change-management review (see
+  [`docs/CONFIG-EXPORT-IMPORT.md`](docs/CONFIG-EXPORT-IMPORT.md))
+- `gbounce diagnostics bundle` (alias `gbounce diag bundle`) produces
+  a single redacted ZIP with config + audit-log tail + `/healthz`
+  snapshot + system info, safe to share with support OR a Claude
+  agent (see [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md))
 - `gbounce --version` reports build metadata
 - `gbounce version-check` opt-in informational check against GitHub
   Releases (no telemetry; disable with `GBOUNCE_NO_VERSION_CHECK=1`)

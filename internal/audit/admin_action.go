@@ -54,6 +54,18 @@ const (
 	// Activity is Create (1) — the destination's effective config
 	// state is brought into existence from the bundle.
 	AdminActionConfigImport AdminAction = "config.import"
+
+	// AdminActionDiagnosticsBundle — operator produced a diagnostics
+	// bundle via `gbounce diagnostics bundle` (#277). The bundle is a
+	// support-package ZIP with redacted config + audit-log tail +
+	// /healthz snapshot; recording the action gives a security team a
+	// witness for "who pulled diagnostics + when?" so the bundle's
+	// later appearance in a support ticket / agent thread is
+	// traceable. The bundle output path lands in EntityName. Mirrors
+	// the kbounce + dbounce constant of the same name so a single
+	// SIEM correlation rule keyed on activity_name="diagnostics.bundle"
+	// catches the event regardless of which Bounce product fired it.
+	AdminActionDiagnosticsBundle AdminAction = "diagnostics.bundle"
 )
 
 // AdminActionActivityID maps an action to its OCSF activity_id (class
@@ -64,7 +76,8 @@ func AdminActionActivityID(a AdminAction) int {
 	switch a {
 	case AdminActionConfigImport:
 		return ActivityCreate
-	case AdminActionConfigExport:
+	case AdminActionConfigExport,
+		AdminActionDiagnosticsBundle:
 		return ActivityOther
 	default:
 		return ActivityOther

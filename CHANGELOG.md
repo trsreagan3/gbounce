@@ -7,8 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `gbounce diagnostics bundle` (alias `gbounce diag bundle`) per #277:
+  produces a single ZIP with the operator's redacted config + audit-
+  log tail + `/healthz` snapshot + system info + listener status +
+  optional panic-log tail + a sha256 manifest. The bundle is safe to
+  share with support OR to paste to a Claude agent for analysis (per
+  #273) — webhook tokens / URLs, license bytes, user identifiers,
+  env-var values, hostnames-in-URLs, and the audit-log path itself
+  are all redacted. Reuses the `BuildExport` pipeline from #275's
+  `config export` so the config-section redaction has one canonical
+  source. Read-only ([[creates-never-mutates]]); one network call
+  only (local `/healthz` GET, loopback by default). Cross-product
+  parity with `kbounce diagnostics bundle` + `dbounce diagnostics
+  bundle` per [[cross-product-agent-parity]]: same subcommand shape,
+  same flag names, same `sha256:<12hex>` user-id hash format, same
+  deterministic ZIP modtime (Bounce-suite epoch 2026-05-17).
+  Emits an OCSF v1.1.0 class 6003 admin-action event with
+  `activity_name="diagnostics.bundle"` so a SIEM correlation rule
+  catches the lifecycle event regardless of which Bounce product
+  fired it.
+
 ### Docs
 
+- New `docs/DIAGNOSTICS.md`: bundle layout, redaction contract, flag
+  reference, sample `unzip -l`, and cross-links to the kbounce +
+  dbounce equivalents.
 - README now shows two concrete `gbounce run` examples for the two
   start-mode shapes (`--upstream` for single-target rewrite,
   `--allow-connect` for CONNECT-method tunnel) so the first command
