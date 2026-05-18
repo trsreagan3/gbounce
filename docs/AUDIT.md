@@ -282,6 +282,63 @@ the results. See
 [`iam-roles/docs/IAM-JIT-AUDIT-QUERY.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/IAM-JIT-AUDIT-QUERY.md)
 for the cross-product correlation workflow.
 
+## Live web UI at `GET /` (`#272`)
+
+gbounce serves a minimal vanilla-JS web UI on its mgmt port
+(`8769` by default) — the same port that hosts `/healthz` and
+`/audit/events`. The page is a single self-contained HTML+CSS+JS
+file (no build step, no CDN, no Google Fonts, no analytics, no
+telemetry) that long-polls `/audit/events?since=<cursor>` every two
+seconds and renders a live-updating colour-coded table.
+
+### How to access
+
+```bash
+# Loopback default (no auth needed).
+gbounce run
+# Then open in a browser:
+open http://127.0.0.1:8769/
+
+# Quick smoke test from curl.
+curl -s http://127.0.0.1:8769/ | head
+```
+
+External-bind operators pass the bearer token through the URL
+fragment (the JS extracts it client-side; the page itself never
+embeds it):
+
+```
+https://gbounce.example.com:8769/#token=YOUR_AUDIT_EVENTS_TOKEN
+```
+
+### Visual conventions
+
+- **DENIED** rows tinted red; **ALLOWED** rows untinted with a
+  green verdict pill; **ADMIN_*** rows tinted blue; **HEARTBEAT**
+  rows greyed out. Matches the cross-bouncer TUI shipped alongside
+  this UI (see below).
+- Top bar shows total event count + per-class breakdown (allow /
+  deny / admin / heartbeat).
+- Filter input forwards to the same `/audit/events?filter=` server-
+  side syntax documented above.
+- Pause / clear buttons; mobile-responsive layout.
+
+### Read-only
+
+Per `[[creates-never-mutates]]` the web UI is a **viewer**, never a
+controller. No buttons mutate gbounce state — no "kill session",
+no "pause profile". Operators run the existing `gbounce` CLI for
+actions. The HTML response carries a strict `Content-Security-
+Policy` header (`default-src 'self'; frame-ancestors 'none'; ...`).
+
+### Cross-bouncer TUI sibling
+
+For a single merged view across ibounce / kbounce / dbounce /
+gbounce, see
+[`iam-roles/docs/AUDIT-STREAM-TUI.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/AUDIT-STREAM-TUI.md)
+— `iam-jit audit stream` is the terminal-UI sibling of the per-
+bouncer web pages.
+
 ## See also
 
 - [`docs/HARDENING-AGAINST-PROMPT-INJECTION.md`](HARDENING-AGAINST-PROMPT-INJECTION.md)

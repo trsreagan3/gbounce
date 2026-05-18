@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Live audit-stream web UI at `GET /` per #272: minimal vanilla-JS
+  page served on gbounce's mgmt port (default `8769`) alongside
+  `/healthz` and `/audit/events`. Single self-contained
+  HTML+CSS+JS file (no build step, no CDN, no Google Fonts, no
+  analytics, no telemetry), under 500 lines. Long-polls
+  `/audit/events?since=<cursor>` every two seconds and renders a
+  colour-coded table with top-bar event counters, filter input
+  (same syntax as `/audit/events?filter=`), pause + clear controls,
+  mobile-responsive layout. Wire model: long-polling rather than
+  SSE — the existing `auditEventsHandler` doesn't ship streaming
+  response semantics today and the operator UX is identical at
+  2 s tick; a future bump can swap to `EventSource` without
+  touching the server contract. Same auth model as
+  `/audit/events`: loopback no auth; external bind takes the
+  bearer token through the URL `#token=...` fragment so the HTML
+  body never embeds the secret. Strict `Content-Security-Policy`
+  header. Cross-product-identical HTML shape with ibounce /
+  kbounce / dbounce per `[[cross-product-agent-parity]]`. Per
+  `[[creates-never-mutates]]` the UI is read-only — no button
+  mutates gbounce state. Per `[[security-team-positioning-safety-
+  not-surveillance]]` event labels use "deny" / "allow", never
+  "violation" / "infraction" / "unauthorized". Per `[[self-host-
+  zero-billing-dependency]]` no CDN dependencies; everything
+  inline. New file: `internal/proxy/events_ui.go`. Tests:
+  `internal/proxy/events_ui_test.go`. Doc section in
+  `docs/AUDIT.md`. The cross-bouncer TUI sibling (`iam-jit audit
+  stream`) merges live streams from every reachable bouncer into
+  one terminal table; see `iam-roles/docs/AUDIT-STREAM-TUI.md`.
 - HTTP `GET /audit/events` endpoint per #271: headless sibling of
   `gbounce audit tail --export jsonl`. Lives on the existing mgmt
   port (default `8769`) alongside `/healthz`. Same filter language,
