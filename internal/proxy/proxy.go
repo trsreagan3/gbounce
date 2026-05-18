@@ -224,6 +224,15 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter) (*Server, error
 
 	mgmtMux := http.NewServeMux()
 	mgmtMux.HandleFunc("/healthz", s.healthz)
+	// #276 — GET /schemas/config serves the embedded
+	// gbounce-config.schema.json byte-for-byte. Agents that want to
+	// validate a proposed `gbounce config import` payload against
+	// the LIVE bouncer's accepted shape fetch this rather than
+	// relying on a stale GitHub URL. Per [[cross-product-agent-
+	// parity]]: ibounce + kbounce + dbounce ship the same endpoint
+	// shape with their own product schema. READ-ONLY; no auth
+	// (matches /healthz — the schema is non-sensitive metadata).
+	mgmtMux.HandleFunc("/schemas/config", schemasConfigHandler)
 	// #271 — GET /audit/events ships the headless audit-tail query
 	// surface. Same filter language as `gbounce audit tail --filter`;
 	// the cross-bouncer `iam-jit audit query` CLI calls this endpoint

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GET /schemas/config` HTTP endpoint** (#276) — gbounce's mgmt
+  port now serves the embedded `gbounce-config.schema.json`
+  byte-for-byte at `Content-Type: application/schema+json`. Agents
+  that want to validate a proposed `gbounce config import` payload
+  against the LIVE bouncer's accepted shape fetch this rather than
+  relying on a stale GitHub URL. READ-only (PUT/POST/DELETE return
+  405); no auth (matches `/healthz` — the schema is non-sensitive
+  metadata). The served bytes are a build-time copy of
+  `schemas/gbounce-config.schema.json`; a test asserts byte-equality
+  so drift between the two fails the build. Per
+  `[[cross-product-agent-parity]]`: ibounce + kbounce + dbounce
+  ship the same endpoint shape with their own product schemas.
 - Live audit-stream web UI at `GET /` per #272: minimal vanilla-JS
   page served on gbounce's mgmt port (default `8769`) alongside
   `/healthz` and `/audit/events`. Single self-contained
