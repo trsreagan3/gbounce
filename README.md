@@ -22,7 +22,12 @@ enforcement.
   - Returns the upstream's actual response
   - Emits one OCSF audit event per request/response pair
 - `gbounce audit tail` prints recent rows from the local SQLite audit
-  DB
+  DB. Supports `--follow` (live-tail), `--filter EXPR` (repeatable;
+  AND semantics), `--summary` (count-summary by event_type /
+  severity_id / upstream_host / method / http_status / composite
+  request-shape), and `--export jsonl|csv|ocsf-bundle --out PATH`
+  (URL-token redaction always applied on export). See
+  [`docs/AUDIT.md`](docs/AUDIT.md) for the full reference.
 - `gbounce config export | import` portable JSON bundle for backup +
   migration + change-management review (see
   [`docs/CONFIG-EXPORT-IMPORT.md`](docs/CONFIG-EXPORT-IMPORT.md))
@@ -179,6 +184,32 @@ gbounce run --upstream https://api.target.com \
 
 Point Fluent Bit / Vector / logrotate at the file. gbounce does not
 rotate the file itself.
+
+### Reading + filtering + exporting
+
+`gbounce audit tail` reads the local SQLite audit DB with live-tail,
+filter expressions, count-summary, and CSV / JSONL / OCSF Detection
+Finding bundle export:
+
+```sh
+# Live tail with a filter (Ctrl-C to exit).
+gbounce audit tail --follow \
+  --filter upstream_host=api.example.com \
+  --filter http_status>=400
+
+# Count-summary across event_type / upstream_host / method / status.
+gbounce audit tail --summary --limit 1000
+
+# Export a CSV for sharing (query-string tokens auto-redacted).
+gbounce audit tail \
+  --filter http_status>=500 \
+  --export csv --out failures.csv
+```
+
+Full reference + the filter-field allowlist lives in
+[`docs/AUDIT.md`](docs/AUDIT.md). Cross-product parity:
+`ibounce audit tail`, `kbounce audit tail`, and `dbounce audit tail`
+ship the same flag set + grammar.
 
 ### Event shape (abbreviated)
 

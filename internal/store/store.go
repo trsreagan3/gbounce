@@ -166,7 +166,13 @@ func (s *Store) migrate() error {
 
 // DecisionRow is the input to RecordDecision. Plain struct (no proxy
 // import) to keep the package boundary clean.
+//
+// ID is populated when the row is read back via RecentDecisions /
+// DecisionsAfterID; it is ignored on the RecordDecision path (the
+// auto-increment id is assigned by SQLite + returned via the function
+// signature).
 type DecisionRow struct {
+	ID             int64
 	At             time.Time
 	Method         string
 	Path           string
@@ -248,6 +254,7 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		limit = 1000
 	}
 	rows, err := s.db.Query(`SELECT
+		id,
 		at, method, path,
 		upstream_host, upstream_port, upstream_scheme,
 		client_host, client_port,
@@ -260,28 +267,93 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 	defer rows.Close()
 	out := make([]DecisionRow, 0, limit)
 	for rows.Next() {
-		var (
-			d        DecisionRow
-			atStr    string
-			enforced int
-		)
-		if err := rows.Scan(
-			&atStr, &d.Method, &d.Path,
-			&d.UpstreamHost, &d.UpstreamPort, &d.UpstreamScheme,
-			&d.ClientHost, &d.ClientPort,
-			&d.HTTPStatus, &d.ResponseSize, &d.LatencyMS,
-			&d.Verdict, &d.Mode, &enforced,
-		); err != nil {
-			return nil, fmt.Errorf("gbounce: recent decisions scan: %w", err)
+		d, err := scanDecisionRow(rows)
+		if err != nil {
+			return nil, err
 		}
-		if t, perr := time.Parse("2006-01-02T15:04:05Z", atStr); perr == nil {
-			d.At = t
-		}
-		d.Enforced = enforced != 0
 		out = append(out, d)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("gbounce: recent decisions iterate: %w", err)
 	}
 	return out, nil
+}
+
+// DecisionsAfterID returns every decision row with id > afterID,
+// oldest-first. Used by `gbounce audit tail --follow` to drain new
+// rows since the last poll. Pass 0 to fetch the entire table (caller
+// is responsible for not doing this on a busy proxy).
+//
+// Returns the rows + the highest id observed in the result; the caller
+// passes the latter back on the next poll to get only the newer rows.
+func (s *Store) DecisionsAfterID(afterID int64) ([]DecisionRow, int64, error) {
+	rows, err := s.db.Query(`SELECT
+		id,
+		at, method, path,
+		upstream_host, upstream_port, upstream_scheme,
+		client_host, client_port,
+		http_status, response_size, latency_ms,
+		decision_verdict, mode_at_decision, enforced
+		FROM decisions WHERE id > ? ORDER BY id ASC`, afterID)
+	if err != nil {
+		return nil, afterID, fmt.Errorf("gbounce: decisions after id query: %w", err)
+	}
+	defer rows.Close()
+	out := make([]DecisionRow, 0)
+	maxID := afterID
+	for rows.Next() {
+		d, err := scanDecisionRow(rows)
+		if err != nil {
+			return nil, afterID, err
+		}
+		if d.ID > maxID {
+			maxID = d.ID
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, afterID, fmt.Errorf("gbounce: decisions after id iterate: %w", err)
+	}
+	return out, maxID, nil
+}
+
+// MaxDecisionID returns the highest id in the decisions table, or 0
+// when the table is empty. Used as the starting watermark for
+// `--follow`: a fresh follow only prints rows created AFTER the
+// command starts.
+func (s *Store) MaxDecisionID() (int64, error) {
+	var id sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(id) FROM decisions`).Scan(&id); err != nil {
+		return 0, fmt.Errorf("gbounce: max decision id: %w", err)
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
+}
+
+// scanDecisionRow centralizes the column-scanning logic shared by
+// RecentDecisions + DecisionsAfterID so the column-order stays in one
+// place. Caller must `defer rows.Close()` separately.
+func scanDecisionRow(rows *sql.Rows) (DecisionRow, error) {
+	var (
+		d        DecisionRow
+		atStr    string
+		enforced int
+	)
+	if err := rows.Scan(
+		&d.ID,
+		&atStr, &d.Method, &d.Path,
+		&d.UpstreamHost, &d.UpstreamPort, &d.UpstreamScheme,
+		&d.ClientHost, &d.ClientPort,
+		&d.HTTPStatus, &d.ResponseSize, &d.LatencyMS,
+		&d.Verdict, &d.Mode, &enforced,
+	); err != nil {
+		return DecisionRow{}, fmt.Errorf("gbounce: decision row scan: %w", err)
+	}
+	if t, perr := time.Parse("2006-01-02T15:04:05Z", atStr); perr == nil {
+		d.At = t
+	}
+	d.Enforced = enforced != 0
+	return d, nil
 }

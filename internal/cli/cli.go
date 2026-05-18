@@ -15,10 +15,12 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -257,44 +259,266 @@ func newAuditCmd() *cobra.Command {
 	return cmd
 }
 
+// followPollInterval is how often `--follow` polls the SQLite DB for
+// new rows. 500ms matches the cross-product spec (ibounce + kbounce +
+// dbounce all use the same interval per [[cross-product-agent-parity]])
+// — fast enough to feel live, slow enough that a quiet proxy doesn't
+// spam the disk with empty queries.
+const followPollInterval = 500 * time.Millisecond
+
+// signalCtxFunc is the constructor for the SIGINT/SIGTERM context the
+// `--follow` loop respects. Indirected through a package variable so
+// tests can swap in a context that cancels on a test-controlled
+// channel instead of installing real signal handlers.
+var signalCtxFunc = func(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
+}
+
 func newAuditTailCmd() *cobra.Command {
 	var (
-		dbPath string
-		limit  int
+		dbPath     string
+		limit      int
+		follow     bool
+		filterRaw  []string
+		summary    bool
+		exportFmt  string
+		exportOut  string
+		csvColumns []string
 	)
 	cmd := &cobra.Command{
 		Use:   "tail",
 		Short: "Print the most recent decision rows from the local SQLite audit log",
+		Long: `Print decisions from the local audit log.
+
+Default mode: print the most recent N decision rows (newest first),
+one row per line.
+
+` + "`--follow`" + ` polls the audit DB every 500ms for new rows and prints
+them as they arrive; exit with SIGINT (Ctrl-C). Mutually exclusive with
+` + "`--summary`" + `.
+
+` + "`--filter EXPR`" + ` narrows the output (AND semantics — repeatable):
+
+  field=value   string equality
+  field~regex   Go RE2 regex match
+  field>=N      numeric greater-or-equal
+  field<=N      numeric less-or-equal
+
+Supported fields (cross-product OCSF + gbounce-specific):
+` + "  " + strings.Join(audit.SupportedFilterFields(), "\n  ") + `
+
+` + "`--summary`" + ` prints a count-summary keyed by event_type, severity_id,
+actor.user.name, api.operation, plus the gbounce-specific groupings
+upstream_host, method, http_status, and the composite request-shape
+key upstream_host+method+http_status.
+
+` + "`--export FORMAT --out PATH`" + ` writes a file in one of three formats:
+
+  jsonl         one redacted OCSF event per line
+  csv           tabular (default columns; override with --csv-columns)
+  ocsf-bundle   one OCSF v1.1.0 Detection Finding wrapping the events
+
+All exports apply URL-token redaction: query-string params named
+` + "`token`" + `, ` + "`api_key`" + `, ` + "`password`" + `, ` + "`secret`" + `, ` + "`bearer`" + `, ` + "`key`" + `,
+` + "`authorization`" + ` (case-insensitive) are replaced with the literal
+string REDACTED. The live tail leaves the raw value in place so an
+operator can see what an agent called in-context.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if limit < 1 || limit > 1000 {
+				return fmt.Errorf("--limit must be in 1-1000 (got %d)", limit)
+			}
+			if follow && summary {
+				return fmt.Errorf("--follow and --summary are mutually exclusive (one is a live stream, the other is a fixed-snapshot aggregation)")
+			}
+			if exportFmt != "" && exportOut == "" {
+				return fmt.Errorf("--export requires --out PATH")
+			}
+			if exportOut != "" && exportFmt == "" {
+				return fmt.Errorf("--out requires --export FORMAT")
+			}
+			if follow && exportFmt != "" {
+				return fmt.Errorf("--follow and --export are mutually exclusive (an export is a one-shot snapshot)")
+			}
+			filters, err := audit.ParseFilters(filterRaw)
+			if err != nil {
+				return err
+			}
+
 			st, err := store.Open(dbPath)
 			if err != nil {
 				return err
 			}
 			defer st.Close()
+
+			if follow {
+				return runFollowLoop(cmd, st, filters)
+			}
+
 			rows, err := st.RecentDecisions(limit)
 			if err != nil {
 				return err
 			}
-			if len(rows) == 0 {
+			events := rowsToEvents(rows)
+			if len(filters) > 0 {
+				events = filterEvents(events, filters)
+			}
+
+			if summary {
+				s := audit.Summarize(events)
+				fmt.Fprint(cmd.OutOrStdout(), audit.RenderSummary(s))
+				return nil
+			}
+
+			if exportFmt != "" {
+				format, err := audit.ParseExportFormat(exportFmt)
+				if err != nil {
+					return err
+				}
+				f, err := os.OpenFile(exportOut, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+				if err != nil {
+					return fmt.Errorf("open export --out: %w", err)
+				}
+				defer f.Close()
+				if err := audit.Export(f, events, audit.ExportOptions{
+					Format:     format,
+					CSVColumns: csvColumns,
+				}); err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"wrote %d event(s) to %s (format=%s; URL-token redaction applied)\n",
+					len(events), exportOut, format)
+				return nil
+			}
+
+			if len(events) == 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "(no decisions recorded yet)")
 				return nil
 			}
-			// Print newest first; one row per line. Keep the shape
-			// stable so shell tooling can grep it.
-			for _, r := range rows {
-				fmt.Fprintf(cmd.OutOrStdout(),
-					"%s  %-6s %d  %-22s %s\n",
-					r.At.Format("2006-01-02T15:04:05Z"),
-					strings.ToUpper(r.Method),
-					r.HTTPStatus,
-					r.UpstreamHost,
-					r.Path,
-				)
-			}
+			printRows(cmd.OutOrStdout(), rows, filters, events)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite audit DB path (default ~/.gbounce/state.db; honors GBOUNCE_DB)")
 	cmd.Flags().IntVar(&limit, "limit", 50, "max rows to print (1..1000)")
+	cmd.Flags().BoolVar(&follow, "follow", false, "live-tail: poll the audit DB every 500ms; exit on SIGINT")
+	cmd.Flags().StringArrayVar(&filterRaw, "filter", nil, "filter expression (repeatable; AND semantics); see --help for grammar")
+	cmd.Flags().BoolVar(&summary, "summary", false, "print a count-summary instead of individual rows")
+	cmd.Flags().StringVar(&exportFmt, "export", "", "export FORMAT (jsonl|csv|ocsf-bundle); requires --out")
+	cmd.Flags().StringVar(&exportOut, "out", "", "export output file (requires --export)")
+	cmd.Flags().StringSliceVar(&csvColumns, "csv-columns", nil, "comma-separated columns for --export csv (overrides default)")
 	return cmd
+}
+
+// runFollowLoop polls the audit DB for new rows + prints them as they
+// arrive. Exits cleanly on SIGINT/SIGTERM.
+func runFollowLoop(cmd *cobra.Command, st *store.Store, filters []audit.Filter) error {
+	ctx, stop := signalCtxFunc(cmd.Context())
+	defer stop()
+
+	cursor, err := st.MaxDecisionID()
+	if err != nil {
+		return err
+	}
+	w := cmd.OutOrStdout()
+	fmt.Fprintf(w, "# gbounce audit tail --follow (poll=%s; cursor=%d); Ctrl-C to exit\n",
+		followPollInterval, cursor)
+
+	ticker := time.NewTicker(followPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			rows, newCursor, err := st.DecisionsAfterID(cursor)
+			if err != nil {
+				return err
+			}
+			cursor = newCursor
+			if len(rows) == 0 {
+				continue
+			}
+			events := rowsToEvents(rows)
+			if len(filters) > 0 {
+				events = filterEvents(events, filters)
+			}
+			printRows(w, rows, filters, events)
+		}
+	}
+}
+
+// rowsToEvents builds an OCSF Event for each row so filter / summary /
+// export logic can work against a single shape regardless of source.
+func rowsToEvents(rows []store.DecisionRow) []audit.Event {
+	out := make([]audit.Event, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, audit.FromRequest(audit.RequestInput{
+			At:             r.At,
+			DecisionID:     r.ID,
+			Mode:           r.Mode,
+			Method:         r.Method,
+			Path:           r.Path,
+			UpstreamHost:   r.UpstreamHost,
+			UpstreamPort:   r.UpstreamPort,
+			UpstreamScheme: r.UpstreamScheme,
+			ClientHost:     r.ClientHost,
+			ClientPort:     r.ClientPort,
+			HTTPStatus:     r.HTTPStatus,
+			ResponseSize:   r.ResponseSize,
+			LatencyMS:      r.LatencyMS,
+		}))
+	}
+	return out
+}
+
+// filterEvents returns the subset of events that match ALL filters.
+func filterEvents(events []audit.Event, filters []audit.Filter) []audit.Event {
+	out := make([]audit.Event, 0, len(events))
+	for _, ev := range events {
+		if audit.MatchAll(ev, filters) {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// printRows is the bare display shape (`audit tail` and `audit tail
+// --follow`). Iterates rows (not events) so the printed line keeps the
+// raw HTTP fields the operator wants in-context — the unredacted path
+// is intentional here per the spec (the live tail shows the raw
+// value; exports apply redaction).
+//
+// When filters are non-empty, only rows whose corresponding event
+// matched are printed. The events slice mirrors the rows slice in
+// order; we re-derive the membership rather than threading a "kept"
+// bool through the call chain.
+func printRows(w io.Writer, rows []store.DecisionRow, filters []audit.Filter, events []audit.Event) {
+	if len(filters) == 0 {
+		for _, r := range rows {
+			printOneRow(w, r)
+		}
+		return
+	}
+	// Build a set of decision_id values that survived filtering.
+	keep := make(map[int64]struct{}, len(events))
+	for _, ev := range events {
+		keep[ev.DecisionID] = struct{}{}
+	}
+	for _, r := range rows {
+		if _, ok := keep[r.ID]; ok {
+			printOneRow(w, r)
+		}
+	}
+}
+
+func printOneRow(w io.Writer, r store.DecisionRow) {
+	fmt.Fprintf(w,
+		"%s  %-6s %d  %-22s %s\n",
+		r.At.Format("2006-01-02T15:04:05Z"),
+		strings.ToUpper(r.Method),
+		r.HTTPStatus,
+		r.UpstreamHost,
+		r.Path,
+	)
 }

@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gbounce audit tail` per #268: live-tail + filter + summary + export
+  surface around the existing audit-tail subcommand. New flags:
+  `--follow` (500ms polling loop; exits on SIGINT), `--filter EXPR`
+  (repeatable AND semantics; supports `field=value` /
+  `field~regex` / `field>=N` / `field<=N` over the cross-product OCSF
+  field set plus gbounce-specific `upstream_host` / `path` / `method` /
+  `http_status`), `--summary` (count-summary keyed by event_type /
+  severity_id / actor.user.name / api.operation + gbounce-specific
+  upstream_host / method / http_status / composite
+  `upstream_host+method+http_status`), and `--export FORMAT --out PATH`
+  with three formats (`jsonl` one-per-line OCSF; `csv` tabular with
+  `--csv-columns` override; `ocsf-bundle` one OCSF v1.1.0 Detection
+  Finding wrapping the contained API Activity events). Every export
+  format applies a URL-token redaction pass — query-string params named
+  `token`, `api_key`, `password`, `secret`, `bearer`, `key`,
+  `authorization` (and cousins) are replaced with `REDACTED` so a CSV
+  pasted into a support ticket or an OCSF bundle shipped to a SIEM
+  doesn't leak credentials. The live `audit tail` display leaves raw
+  values in place per the spec — operators debugging an agent need to
+  see what was actually called. Cross-product parity per
+  [[cross-product-agent-parity]]: ibounce + kbounce + dbounce ship the
+  identical flag set + grammar + supported-field allowlist. Docs:
+  `docs/AUDIT.md` with the full reference + sample sessions for each
+  new flag + the redaction denylist + cross-links to the sibling
+  product commands.
+
 - `gbounce backup` + `gbounce restore` per #279: single-file SQLite
   backup + gated restore so operators can move gbounce state between
   hosts, snapshot before a risky change, or recover from disaster
