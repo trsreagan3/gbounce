@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`gbounce run --preset security-observe`** (#254) — single-flag
+  shortcut for the canonical security-team observation deployment
+  shape. Equivalent to `--mode discovery --audit-log-path
+  ~/.gbounce/audit/gbounce.jsonl`. Designed for the "gather data
+  first; author profile second" starting position per
+  `[[bouncer-mode-selection-for-agents]]`. HARD override on
+  `--mode` (the entire point of the preset is observation);
+  passing `--preset security-observe --mode profile` errors fast
+  with a clear "drop the preset OR drop the explicit flag" message.
+  SOFT override on `--audit-log-path` (operators have different
+  SIEM destinations).
+- gbounce G-Slice 1 has fewer surfaces than the other Bounce
+  products (no profile / rule engine / heartbeat / alert-rules);
+  the startup banner annotates the cross-product canonical settings
+  (`--default-policy`, `--alert-rules`, `--heartbeat-interval`) as
+  "not applicable to this product (G-Slice 1 has no surface; queued
+  for later slice)" so an operator running the same preset across
+  all four Bounce products sees what's intentionally missing here.
+- Same preset NAME + same override semantics ship across ibounce /
+  kbounce / dbounce per `[[cross-product-agent-parity]]`. Framework
+  documented at `docs/DEPLOYMENT-PRESETS.md` with the post-v1.0
+  roadmap (`dev-loop`, `production-strict`, `compliance-audit`)
+  explicitly NOT shipped in this slice per
+  `[[deliberate-feature-completion]]`.
+- Per `[[security-team-positioning-safety-not-surveillance]]`:
+  preset description + banner use neutral language; no violation /
+  infraction / unauthorized framing.
+- Per `[[self-host-zero-billing-dependency]]`: the preset does NOT
+  configure any webhook URL, so a self-hosted security-observe
+  deployment phones home to nothing without an operator action.
 - **`GET /schemas/config` HTTP endpoint** (#276) — gbounce's mgmt
   port now serves the embedded `gbounce-config.schema.json`
   byte-for-byte at `Content-Type: application/schema+json`. Agents

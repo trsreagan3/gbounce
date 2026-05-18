@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -130,6 +131,11 @@ func newRunCmd() *cobra.Command {
 		forwardTimeout    int
 		mode              string
 		auditEventsToken  string
+		// #254 — deployment preset. Single-flag shortcut for a common
+		// deployment shape (only `security-observe` in v1.0). Resolved
+		// BEFORE downstream mode validation so the preset's HARD/SOFT
+		// semantics fire first.
+		deploymentPreset string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -165,6 +171,48 @@ pass --i-know-this-binds-externally to acknowledge the threat model.
 Management endpoint: /healthz lives on a SEPARATE port (default 8769)
 so liveness probes never touch the proxy data path.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// #254 — deployment preset resolution. Runs BEFORE mode
+			// validation so the preset-resolved values flow through.
+			// HARD-override conflicts (e.g. --preset security-observe
+			// --mode profile) fail-fast here with a "drop one OR the
+			// other" message. SOFT overrides flow through. The preset
+			// BANNER lines are stashed for printing alongside the
+			// existing startup banner.
+			var presetBannerLines []string
+			if deploymentPreset != "" {
+				preset := GetPreset(deploymentPreset, "gbounce")
+				if preset == nil {
+					return fmt.Errorf(
+						"gbounce: unknown --preset %q; available: security-observe",
+						deploymentPreset)
+				}
+				operatorChanged := map[string]bool{
+					"mode":           cmd.Flags().Changed("mode"),
+					"audit-log-path": cmd.Flags().Changed("audit-log-path"),
+				}
+				currentValues := map[string]string{
+					"mode":           mode,
+					"audit-log-path": auditLogPath,
+				}
+				res, err := ApplyPreset(preset, operatorChanged, currentValues, nil)
+				if err != nil {
+					return err
+				}
+				for _, key := range res.DerivedKeys {
+					pv := preset.Values[key]
+					switch key {
+					case "mode":
+						mode = pv.Value
+					case "audit-log-path":
+						auditLogPath = pv.Value
+						if d := filepath.Dir(auditLogPath); d != "" {
+							_ = os.MkdirAll(d, 0o700)
+						}
+					}
+				}
+				presetBannerLines = FormatBanner(preset, res)
+			}
+
 			switch mode {
 			case "discovery":
 				// G-Slice 1: the only supported mode.
@@ -245,6 +293,16 @@ so liveness probes never touch the proxy data path.`,
 				"gbounce listening on %s (mgmt %s); upstream=%q allow_connect=%v audit_log=%q\n",
 				srv.Addr(), srv.MgmtAddr(),
 				upstreamURL, allowConnect, auditLogPath)
+			// #254 — preset-derivation banner sits AFTER the standard
+			// startup line so the operator immediately sees which
+			// settings came from the preset (vs. their own flags / env).
+			// Same format across all four Bounce products per
+			// [[cross-product-agent-parity]]. gbounce G-Slice 1 has
+			// fewer surfaces so most cross-product canonical settings
+			// land in the "not applicable to this product" annotation.
+			for _, line := range presetBannerLines {
+				fmt.Fprintln(cmd.OutOrStdout(), line)
+			}
 			return srv.Serve(ctx)
 		},
 	}
@@ -261,6 +319,23 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
 	cmd.Flags().StringVar(&mode, "mode", "discovery", "operating mode (G-Slice 1: discovery only; G-Slice 2 adds profile; G-Slice 3 adds tap)")
 	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "", "bearer token required for GET /audit/events when the mgmt port is bound externally; empty = loopback-only (no auth)")
+	// #254 — deployment preset. Single-flag shortcut for a common
+	// deployment shape. v1.0 ships only `security-observe` per
+	// [[deliberate-feature-completion]]; the framework supports more
+	// (see docs/DEPLOYMENT-PRESETS.md for the roadmap). gbounce
+	// G-Slice 1 has fewer surfaces than the other Bounce products so
+	// most cross-product canonical settings land in the "not
+	// applicable to this product" annotation in the startup banner.
+	cmd.Flags().StringVar(&deploymentPreset, "preset", "",
+		"#254 — single-flag shortcut for a common deployment shape. "+
+			"security-observe = discovery mode + JSONL audit. Designed for "+
+			"the security-team 'gather data first; author profile second' "+
+			"starting shape per [[bouncer-mode-selection-for-agents]]. "+
+			"Some preset values are HARD (e.g. --mode for security-observe "+
+			"— the entire point of the preset is observation); passing them "+
+			"with a different value is an error. Others are SOFT (e.g. "+
+			"--audit-log-path); the operator's value wins. Startup banner "+
+			"shows which settings are derived from the preset.")
 	return cmd
 }
 

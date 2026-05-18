@@ -185,6 +185,19 @@ gbounce run --upstream https://api.target.com \
 Point Fluent Bit / Vector / logrotate at the file. gbounce does not
 rotate the file itself.
 
+### Security-team observation preset
+
+```sh
+gbounce run --upstream https://api.target.com --preset security-observe
+```
+
+is the one-flag shortcut for `--mode discovery --audit-log-path
+~/.gbounce/audit/gbounce.jsonl`. Same preset name + same override
+semantics ship across every Bounce product per
+`[[cross-product-agent-parity]]`. See
+[docs/DEPLOYMENT-PRESETS.md](docs/DEPLOYMENT-PRESETS.md) for the
+framework + the cross-product preset roadmap.
+
 ### Reading + filtering + exporting
 
 `gbounce audit tail` reads the local SQLite audit DB with live-tail,
