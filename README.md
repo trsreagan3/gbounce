@@ -111,8 +111,50 @@ relay them, so off-loopback binds are an opt-in choice.)
 
 ```sh
 go install github.com/trsreagan3/gbounce/cmd/gbounce@latest
-gbounce run --upstream https://api.target.com --port 8080
 ```
+
+## First run
+
+`gbounce run` refuses to start unless you pick one of two modes; the
+error message names the missing flag, but the choice between the two
+shapes is yours and depends on how the client talks to gbounce.
+
+### Mode A — rewrite onto a single upstream (`--upstream`)
+
+Use when the client speaks plain HTTP to gbounce and you want gbounce
+to forward every request to one upstream service. URL path + method +
+status are visible to the audit log.
+
+```sh
+gbounce run --upstream https://api.target.com --port 8080
+# point the client at http://127.0.0.1:8080
+# (gbounce rewrites scheme/host/port onto https://api.target.com)
+```
+
+### Mode B — CONNECT-method forward proxy (`--allow-connect`)
+
+Use when the client speaks the standard `HTTP_PROXY` / `HTTPS_PROXY`
+protocol — browsers, the AWS SDK with `HTTP_PROXY` set, `curl -x`,
+etc. gbounce accepts the HTTP `CONNECT` verb and splices the TCP
+sockets blindly (no MITM; only the destination `host:port` + tunnel
+metadata appear in the audit log).
+
+```sh
+gbounce run --allow-connect --port 8080
+# export HTTPS_PROXY=http://127.0.0.1:8080
+# (the client picks the upstream per request via the CONNECT verb)
+```
+
+### Picking between them
+
+- One known upstream, plain-HTTP client → `--upstream`.
+- Many upstreams, or a client that already knows how to use an
+  `HTTPS_PROXY` env var → `--allow-connect`.
+- Both can be combined; CONNECT requests use the tunnel, plain
+  requests are rewritten onto `--upstream`.
+
+(G-Slice 1 ships discovery mode only. Both shapes observe + audit; no
+filtering / enforcement yet — that ships in G-Slice 2.)
 
 ### Homebrew
 

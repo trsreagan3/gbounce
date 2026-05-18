@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+
+- README now shows two concrete `gbounce run` examples for the two
+  start-mode shapes (`--upstream` for single-target rewrite,
+  `--allow-connect` for CONNECT-method tunnel) so the first command
+  after `go install` always succeeds — gbounce refuses to start
+  without one of the two flags and the README's first snippet must
+  reflect a working invocation.
+
 ### Added — G-Slice 1 (initial scaffold)
 
 - HTTP/HTTPS forward proxy core (TLS passthrough; no MITM)
