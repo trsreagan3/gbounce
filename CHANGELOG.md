@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-session recording library** (#285) — new
+  `internal/audit/recorder.go` ships the per-session NDJSON recorder.
+  Tees every audit event into `{dir}/{agent.session_id}.ndjson` with
+  the same on-disk shape as ibounce / kbouncer / dbounce per
+  `[[cross-product-agent-parity]]` so the cross-product
+  `iam-jit session replay <FILE>` CLI (lives in iam-roles) consumes
+  gbounce recordings unchanged. Files carry a `_meta` header
+  (recording_schema_version, session_id, agent_name, bouncer_product,
+  recording_started_at) followed by one OCSF event per line.
+  `.partial` suffix while in-flight; atomic rename to `.ndjson` on
+  clean shutdown or 5-minute heartbeat-idle finalisation tick. File
+  mode 0o600. gbounce session_id detection rides on
+  `unmapped.iam_jit.ext[agent_session_id]` until the sibling-to-
+  kbouncer #266 agent-identity block lands; the recorder consumes
+  via the `AgentSessionIDExtKey` constant so the migration is a
+  one-symbol rename. See `docs/SESSION-REPLAY.md` in iam-roles.
 - **`gbounce run --preset security-observe`** (#254) — single-flag
   shortcut for the canonical security-team observation deployment
   shape. Equivalent to `--mode discovery --audit-log-path
