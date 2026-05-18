@@ -129,6 +129,7 @@ func newRunCmd() *cobra.Command {
 		forceExternalBind bool
 		forwardTimeout    int
 		mode              string
+		auditEventsToken  string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -191,6 +192,16 @@ so liveness probes never touch the proxy data path.`,
 						"Re-run with --i-know-this-binds-externally to override.",
 					mgmtHost)
 			}
+			// #271 — GET /audit/events lives on the same mgmt port; an
+			// external bind without a bearer token would expose recent
+			// audit events (which can include URL paths the operator
+			// considers sensitive). Refuse to start in that shape.
+			if _, ok := loopbackHosts[mgmtHost]; !ok && auditEventsToken == "" {
+				return fmt.Errorf(
+					"--audit-events-token TOKEN is required when mgmt-host %q is non-loopback "+
+						"(GET /audit/events would otherwise be exposed without auth)",
+					mgmtHost)
+			}
 
 			st, err := store.Open(dbPath)
 			if err != nil {
@@ -223,6 +234,7 @@ so liveness probes never touch the proxy data path.`,
 				ForwardTimeoutSeconds: forwardTimeout,
 				AuditLogPath:          auditLogPath,
 				AuditLogFsync:         auditLogFsync,
+				AuditEventsToken:      auditEventsToken,
 				Mode:                  proxy.ModeDiscovery,
 			}
 			srv, err := proxy.NewServer(cfg, st, lw)
@@ -248,6 +260,7 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false, "acknowledge the threat model of binding off loopback")
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
 	cmd.Flags().StringVar(&mode, "mode", "discovery", "operating mode (G-Slice 1: discovery only; G-Slice 2 adds profile; G-Slice 3 adds tap)")
+	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "", "bearer token required for GET /audit/events when the mgmt port is bound externally; empty = loopback-only (no auth)")
 	return cmd
 }
 

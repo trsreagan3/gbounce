@@ -234,6 +234,54 @@ same semantics across all four products. Product-specific fields
 others) are documented per-product but follow the same `name=value` /
 `name~regex` / `name>=N` / `name<=N` grammar.
 
+## HTTP `/audit/events` endpoint (`#271`)
+
+Every Bounce-suite proxy exposes a headless audit-query surface on its
+management port. For gbounce that's port `8769` (mgmt-host `127.0.0.1`
+by default).
+
+```
+GET /audit/events?since=ISO8601&until=ISO8601&filter=field=value&filter=...&limit=N&format=jsonl|ocsf-bundle
+```
+
+Same filter language as `gbounce audit tail --filter`, same supported
+field catalog. The defaults are `limit=100` (max `1000`) + `format=jsonl`
+(one OCSF event per line). Pass `format=ocsf-bundle` for a single
+OCSF v1.1.0 class 2004 Detection Finding wrapping the matched events.
+
+### Sample invocations
+
+```bash
+# Loopback bind (default): no auth required.
+curl 'http://127.0.0.1:8769/audit/events?limit=10'
+
+# Filter to one upstream host, last hour, NDJSON.
+curl 'http://127.0.0.1:8769/audit/events?filter=upstream_host=api.example.com&since=2026-05-18T00:00:00Z'
+
+# OCSF Detection Finding bundle for SIEM batch import.
+curl 'http://127.0.0.1:8769/audit/events?format=ocsf-bundle&limit=100'
+```
+
+### Auth model
+
+- **Loopback bind (default)**: the endpoint is reachable only on
+  loopback; no `Authorization` header required. This matches gbounce's
+  baseline trust anchor (the mgmt port refuses to bind off-loopback
+  without `--i-know-this-binds-externally`).
+- **External bind**: `gbounce run --i-know-this-binds-externally
+  --mgmt-host 0.0.0.0 --audit-events-token <TOKEN>` is required.
+  Requests must carry `Authorization: Bearer <TOKEN>`. Missing header
+  → 401; wrong token → 403. gbounce refuses to start in external-bind
+  mode without `--audit-events-token`.
+
+### Cross-bouncer query
+
+The `iam-jit audit query` CLI calls this endpoint on every reachable
+bouncer (ibounce / kbounce / dbounce / gbounce) in parallel and merges
+the results. See
+[`iam-roles/docs/IAM-JIT-AUDIT-QUERY.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/IAM-JIT-AUDIT-QUERY.md)
+for the cross-product correlation workflow.
+
 ## See also
 
 - [`docs/HARDENING-AGAINST-PROMPT-INJECTION.md`](HARDENING-AGAINST-PROMPT-INJECTION.md)

@@ -110,6 +110,12 @@ type Config struct {
 	// this JSONL file. Opt-in.
 	AuditLogPath  string
 	AuditLogFsync bool
+	// AuditEventsToken is the bearer token clients must present on
+	// GET /audit/events when the mgmt server is bound off-loopback.
+	// Empty + loopback-bound: no auth required (the loopback bind is
+	// itself a trust anchor). Empty + external-bound: the constructor
+	// refuses to start.
+	AuditEventsToken string
 	// Mode: G-Slice 1 only supports ModeDiscovery.
 	Mode Mode
 }
@@ -218,6 +224,12 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter) (*Server, error
 
 	mgmtMux := http.NewServeMux()
 	mgmtMux.HandleFunc("/healthz", s.healthz)
+	// #271 — GET /audit/events ships the headless audit-tail query
+	// surface. Same filter language as `gbounce audit tail --filter`;
+	// the cross-bouncer `iam-jit audit query` CLI calls this endpoint
+	// in parallel against each reachable bouncer to produce a single
+	// merged stream.
+	mgmtMux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken))
 	s.mgmtSrv = &http.Server{
 		Addr:              net.JoinHostPort(cfg.MgmtHost, strconv.Itoa(cfg.MgmtPort)),
 		Handler:           mgmtMux,

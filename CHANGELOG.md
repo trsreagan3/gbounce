@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HTTP `GET /audit/events` endpoint per #271: headless sibling of
+  `gbounce audit tail --export jsonl`. Lives on the existing mgmt
+  port (default `8769`) alongside `/healthz`. Same filter language,
+  same supported field catalog, same OCSF v1.1.0 wire shape. Query
+  parameters: `since`/`until` (ISO 8601), `filter` (repeatable;
+  `field=value` / `field~regex` / `field>=N` / `field<=N`), `limit`
+  (default 100, max 1000), `format` (`jsonl` default | `ocsf-bundle`).
+  Loopback bind requires no auth (matches the existing mgmt-port
+  trust anchor); external bind requires a bearer token via the new
+  `gbounce run --audit-events-token TOKEN` flag (refuses to start in
+  external-bind mode without it). Powers the cross-bouncer `iam-jit
+  audit query` CLI (#271 B) which queries every reachable bouncer in
+  parallel + merges the results. Per [[cross-product-agent-parity]] +
+  [[creates-never-mutates]] (read-only) + [[self-host-zero-billing-
+  dependency]] (operator-controlled port; no phone-home).
 - `gbounce investigate` per #273: one-shot Claude-ready evidence pack.
   Composes the existing `audit tail --export ocsf-bundle` (#268) and
   `diagnostics bundle` (#277) into a single command that writes two
