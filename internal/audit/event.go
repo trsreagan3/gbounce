@@ -216,6 +216,15 @@ type RequestInput struct {
 	HTTPStatus     int
 	ResponseSize   int64
 	LatencyMS      int64
+	// AgentSessionID + AgentName carry the agent's per-session context.
+	// The proxy populates these from the inbound `X-Agent-Session-Id`
+	// + `X-Agent-Name` headers (when present); empty otherwise. They
+	// land in `unmapped.iam_jit.ext[agent_session_id|agent_name]` so
+	// the per-session NDJSON recorder (#285) can route events into the
+	// right session file. Empty session_id → event is not routed to a
+	// session file (raw curl from a script has no session identity).
+	AgentSessionID string
+	AgentName      string
 }
 
 // FromRequest builds an OCSF class 6003 (API Activity) Event from a
@@ -292,6 +301,16 @@ func FromRequest(in RequestInput) Event {
 	}
 	if in.LatencyMS != 0 {
 		ext["latency_ms"] = in.LatencyMS
+	}
+	// #285 — agent session context lands at the same fixed Ext keys
+	// the SessionRecorder reads (AgentSessionIDExtKey + AgentNameExtKey).
+	// Only valid session ids flow through; the recorder's IsValidSessionID
+	// gate also rejects malformed input, so this is belt-and-suspenders.
+	if in.AgentSessionID != "" && IsValidSessionID(in.AgentSessionID) {
+		ext[AgentSessionIDExtKey] = in.AgentSessionID
+	}
+	if in.AgentName != "" {
+		ext[AgentNameExtKey] = in.AgentName
 	}
 	if len(ext) == 0 {
 		ext = nil

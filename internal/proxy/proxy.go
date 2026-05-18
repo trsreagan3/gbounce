@@ -152,8 +152,14 @@ type Server struct {
 	cfg     Config
 	store   *store.Store
 	log     *audit.LogWriter
-	httpSrv *http.Server
-	mgmtSrv *http.Server
+	// #285 — optional per-session NDJSON recorder. Nil disables the
+	// channel. When wired, every audit event is teed to
+	// {dir}/{agent.session_id}.ndjson via Recorder.Record. Fail-soft
+	// inside Record so disk failures never propagate the proxy hot
+	// path; same shape as the kbouncer + dbounce wiring.
+	recorder *audit.SessionRecorder
+	httpSrv  *http.Server
+	mgmtSrv  *http.Server
 	// upstreamURL is the parsed cfg.UpstreamURL, kept as *url.URL so
 	// each request avoids re-parsing.
 	upstreamURL *url.URL
@@ -169,8 +175,10 @@ type Server struct {
 // NewServer builds a Server from the given Config + Store. Caller
 // must call Serve to start listening. Audit log writer is OPTIONAL —
 // pass a *audit.LogWriter to also tee decisions into JSONL; nil to
-// skip.
-func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter) (*Server, error) {
+// skip. Session recorder is also OPTIONAL — pass a non-nil
+// *audit.SessionRecorder to also tee events into per-session NDJSON
+// files; pass nil to skip (the #285 default).
+func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.SessionRecorder) (*Server, error) {
 	cfg = cfg.Normalize()
 	if cfg.UpstreamURL == "" && !cfg.AllowConnect {
 		return nil, fmt.Errorf("gbounce: --upstream is required (or pass --allow-connect for CONNECT-tunnel mode)")
@@ -199,6 +207,7 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter) (*Server, error
 		cfg:         cfg,
 		store:       st,
 		log:         lw,
+		recorder:    sr,
 		upstreamURL: up,
 		client: &http.Client{
 			Timeout: timeout,
@@ -296,6 +305,12 @@ func (s *Server) Serve(ctx context.Context) error {
 		defer cancel()
 		_ = s.httpSrv.Shutdown(shutdownCtx)
 		_ = s.mgmtSrv.Shutdown(shutdownCtx)
+		// #285 — finalise every still-open recording (.partial →
+		// .ndjson) before the server exits. SIGKILL-leftover .partial
+		// files are recovered by the next Start().
+		if s.recorder != nil {
+			s.recorder.Stop()
+		}
 		return nil
 	case err := <-proxyErr:
 		return err
@@ -330,6 +345,13 @@ func (s *Server) ServeListeners(ctx context.Context, proxyL, mgmtL net.Listener)
 		defer cancel()
 		_ = s.httpSrv.Shutdown(shutdownCtx)
 		_ = s.mgmtSrv.Shutdown(shutdownCtx)
+		// #285 — finalise every still-open recording (.partial →
+		// .ndjson) before the server exits. Same shape as the Serve
+		// path above (the test-only ServeListeners helper must honor
+		// the same lifecycle).
+		if s.recorder != nil {
+			s.recorder.Stop()
+		}
 		return nil
 	case err := <-proxyErr:
 		return err
@@ -571,7 +593,14 @@ func (s *Server) record(r *http.Request, startedAt time.Time, status int, respSi
 			decisionID = id
 		}
 	}
-	if s.log != nil {
+	if s.log != nil || s.recorder != nil {
+		// #285 — agent session context from inbound headers. Empty is
+		// fine; the recorder drops events without a session_id (raw
+		// curl / unknown caller). When a client (Claude Code, Cursor,
+		// custom agent) sets these headers, the event routes into the
+		// matching per-session NDJSON file.
+		sid := r.Header.Get("X-Agent-Session-Id")
+		agentName := r.Header.Get("X-Agent-Name")
 		ev := audit.FromRequest(audit.RequestInput{
 			At:             row.At,
 			DecisionID:     decisionID,
@@ -586,8 +615,19 @@ func (s *Server) record(r *http.Request, startedAt time.Time, status int, respSi
 			HTTPStatus:     row.HTTPStatus,
 			ResponseSize:   row.ResponseSize,
 			LatencyMS:      row.LatencyMS,
+			AgentSessionID: sid,
+			AgentName:      agentName,
 		})
-		_ = s.log.Write(r.Context(), ev)
+		if s.log != nil {
+			_ = s.log.Write(r.Context(), ev)
+		}
+		// #285 — per-session NDJSON tee. Record is fail-soft (disk
+		// errors land on the recorder's lastErr counter + surface via
+		// Status; never propagated into the proxy hot path so a busted
+		// recording dir can't stall the proxy).
+		if s.recorder != nil {
+			s.recorder.Record(ev)
+		}
 	}
 }
 

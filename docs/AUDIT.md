@@ -339,6 +339,64 @@ gbounce, see
 — `iam-jit audit stream` is the terminal-UI sibling of the per-
 bouncer web pages.
 
+## Per-session recordings (`--record-sessions-dir`, `#285` + `#290`)
+
+`gbounce run --record-sessions-dir PATH` tees every audit event
+into a per-session NDJSON file at
+`{PATH}/{agent.session_id}.ndjson`. Files are portable across
+ibounce / kbouncer / dbounce / gbounce — same on-disk shape per
+`[[cross-product-agent-parity]]` — so the cross-product
+`iam-jit session replay <FILE>` CLI walks any product's
+recordings uniformly. File mode 0o600.
+
+### Per-request agent context
+
+For gbounce the session id arrives on the inbound request as the
+HTTP header `X-Agent-Session-Id` (and optionally `X-Agent-Name`).
+Agents wrapping their HTTP traffic through gbounce set these
+headers so the recorder can route events into a per-session file.
+Requests without a session header are NOT routed to a session
+file (raw curl from a script has no session identity); they
+still land in the JSONL log + the SQLite decision table.
+
+```bash
+# Run the proxy with per-session recording enabled.
+gbounce run --upstream https://api.target.com \
+  --record-sessions-dir ~/.gbounce/sessions
+
+# Agent invokes through the proxy with the session header set:
+#   curl -H 'X-Agent-Session-Id: 01956c44-c5c1-7c31-9bca-7c0aaa000001' \
+#        -H 'X-Agent-Name: claude-code' \
+#        http://127.0.0.1:8080/v1/dashboards
+
+# List what got recorded.
+gbounce session list
+# SESSION_ID                              AGENT          EVENTS START                  END
+# 01956c44-c5c1-7c31-9bca-7c0aaa000001    claude-code         42 2026-05-19T14:01:33Z   2026-05-19T14:08:12Z
+# 01956c44-c5c1-7c31-9bca-7c0aaa000099    cursor              17 2026-05-19T15:22:01Z   2026-05-19T15:24:55Z
+
+# Summary + event-count-by-type for one recording.
+gbounce session show 01956c44-c5c1-7c31-9bca-7c0aaa000001
+
+# OCSF Detection Finding envelope.
+gbounce session export 01956c44-c5c1-7c31-9bca-7c0aaa000001 \
+  --out /tmp/finding.json
+
+# Retention sweep — explicit threshold required; --dry-run lists candidates.
+gbounce session purge --older-than 30d --dry-run
+gbounce session purge --older-than 30d
+```
+
+Cross-product documentation lives at
+[`iam-roles/docs/SESSION-REPLAY.md`](https://github.com/trsreagan3/iam-roles/blob/main/docs/SESSION-REPLAY.md).
+
+Per `[[creates-never-mutates]]` the recorder is additive (it tees
+the existing event stream); the `session` subcommands are read-
+only or destructive-only-via-explicit-`purge --older-than`.
+
+Per `[[self-host-zero-billing-dependency]]`: zero network calls;
+entirely local filesystem.
+
 ## See also
 
 - [`docs/HARDENING-AGAINST-PROMPT-INJECTION.md`](HARDENING-AGAINST-PROMPT-INJECTION.md)

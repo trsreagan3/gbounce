@@ -57,7 +57,7 @@ func startTestProxy(t *testing.T, upstream *httptest.Server, withAuditLog bool, 
 		cfg.UpstreamURL = upstream.URL
 	}
 
-	srv, err := NewServer(cfg, s, lw)
+	srv, err := NewServer(cfg, s, lw, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestProxy_RejectsBadUpstream(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := store.Open(filepath.Join(dir, "state.db"))
 	defer s.Close()
-	_, err := NewServer(Config{UpstreamURL: "ftp://nope.example"}, s, nil)
+	_, err := NewServer(Config{UpstreamURL: "ftp://nope.example"}, s, nil, nil)
 	if err == nil {
 		t.Fatal("expected error for non-http upstream scheme")
 	}
@@ -301,7 +301,7 @@ func TestProxy_RequiresUpstreamOrConnect(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := store.Open(filepath.Join(dir, "state.db"))
 	defer s.Close()
-	_, err := NewServer(Config{}, s, nil)
+	_, err := NewServer(Config{}, s, nil, nil)
 	if err == nil {
 		t.Fatal("expected error when neither --upstream nor --allow-connect")
 	}
@@ -422,7 +422,7 @@ func TestProxy_RecordsOnUpstreamError(t *testing.T) {
 		UpstreamURL:           "http://" + upstreamL.Addr().String(),
 		ForwardTimeoutSeconds: 2,
 	}
-	srv, err := NewServer(cfg, st, nil)
+	srv, err := NewServer(cfg, st, nil, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -454,7 +454,7 @@ func TestProxy_MisconfiguredCONNECTOnlyRejectsForward(t *testing.T) {
 	st, _ := store.Open(filepath.Join(dir, "state.db"))
 	defer st.Close()
 	cfg := Config{AllowConnect: true}
-	srv, err := NewServer(cfg, st, nil)
+	srv, err := NewServer(cfg, st, nil, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

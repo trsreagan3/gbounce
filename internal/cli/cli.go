@@ -88,6 +88,13 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(newVersionCheckCmd())
 	root.AddCommand(newBackupCmd())
 	root.AddCommand(newRestoreCmd())
+	// #285 — `gbounce session list / show / export / purge`. Reads the
+	// per-session NDJSON recordings written when the proxy runs with
+	// `--record-sessions-dir`. Subcommand + flag names match ibounce +
+	// kbounce + dbounce exactly per [[cross-product-agent-parity]] so
+	// orchestrators (and the cross-product `iam-jit session replay
+	// <FILE>` CLI) consume any product's recordings uniformly.
+	root.AddCommand(newSessionCmd())
 	return root
 }
 
@@ -136,6 +143,9 @@ func newRunCmd() *cobra.Command {
 		// BEFORE downstream mode validation so the preset's HARD/SOFT
 		// semantics fire first.
 		deploymentPreset string
+		// #285 — per-session NDJSON recordings directory. Empty disables
+		// the channel. Replayable via `iam-jit session replay <FILE>`.
+		recordSessionsDir string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -272,6 +282,28 @@ so liveness probes never touch the proxy data path.`,
 				defer lw.Close()
 			}
 
+			// #285 — per-session NDJSON recorder. Default off; only
+			// constructed when the operator passed --record-sessions-dir.
+			// Start() creates the dir + recovers any stale .partial
+			// files. Fatal on failure so an unwritable dir surfaces
+			// immediately (mirrors the LogWriter fail-fast above; if
+			// the recording sink can't be opened the operator wants to
+			// know).
+			var sr *audit.SessionRecorder
+			if recordSessionsDir != "" {
+				rec, err := audit.NewSessionRecorder(audit.SessionRecorderOptions{
+					Dir:            recordSessionsDir,
+					BouncerProduct: "gbounce",
+				})
+				if err != nil {
+					return fmt.Errorf("session recorder: %w", err)
+				}
+				if err := rec.Start(); err != nil {
+					return fmt.Errorf("session recorder: %w", err)
+				}
+				sr = rec
+			}
+
 			cfg := proxy.Config{
 				Host:                  host,
 				Port:                  port,
@@ -285,7 +317,7 @@ so liveness probes never touch the proxy data path.`,
 				AuditEventsToken:      auditEventsToken,
 				Mode:                  proxy.ModeDiscovery,
 			}
-			srv, err := proxy.NewServer(cfg, st, lw)
+			srv, err := proxy.NewServer(cfg, st, lw, sr)
 			if err != nil {
 				return err
 			}
@@ -319,6 +351,15 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
 	cmd.Flags().StringVar(&mode, "mode", "discovery", "operating mode (G-Slice 1: discovery only; G-Slice 2 adds profile; G-Slice 3 adds tap)")
 	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "", "bearer token required for GET /audit/events when the mgmt port is bound externally; empty = loopback-only (no auth)")
+	cmd.Flags().StringVar(&recordSessionsDir, "record-sessions-dir", "",
+		"#285 — per-session NDJSON recording directory. When set, every "+
+			"audit event is also written to {dir}/{agent.session_id}.ndjson "+
+			"(one file per agent session). The proxy reads agent identity "+
+			"from inbound X-Agent-Session-Id + X-Agent-Name headers; events "+
+			"without a session id are NOT routed to a session file. "+
+			"Replayable via `iam-jit session replay <FILE>`. File mode 0o600. "+
+			"Default off; the recorder captures agent identity + operation "+
+			"details so it ships opt-in.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more

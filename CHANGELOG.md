@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-session recording CLI wiring** (#290) — wires the #285
+  recorder library into the gbounce proxy hot path + ships the
+  cross-product `gbounce session list / show / export / purge`
+  subcommand group. New surfaces:
+  - `gbounce run --record-sessions-dir PATH` — tees every audit
+    event into `{PATH}/{agent.session_id}.ndjson`. The proxy reads
+    agent identity from inbound `X-Agent-Session-Id` + `X-Agent-Name`
+    headers; events without a session id are NOT routed to a session
+    file (raw curl / unknown caller). Default off; opt-in.
+  - `gbounce session list` — list recorded sessions (table or `--json`)
+  - `gbounce session show` — summary + event-count-by-type
+  - `gbounce session export` — OCSF Detection Finding envelope to
+    `--out`
+  - `gbounce session purge` — remove recordings older than
+    `--older-than` (`--dry-run` supported; explicit threshold
+    required per `[[creates-never-mutates]]`)
+  - `audit.RequestInput` gains `AgentSessionID` + `AgentName` fields;
+    `audit.FromRequest` populates the matching Ext keys with
+    defensive `IsValidSessionID` gating.
+  - `proxy.Server` gains an optional `*audit.SessionRecorder` field;
+    `proxy.NewServer` signature now takes `(cfg, store, log,
+    recorder)`. `Serve` + `ServeListeners` call `Recorder.Stop` on
+    shutdown (atomic-rename `.partial` → `.ndjson`).
+  - Subcommand names + flag shape match ibounce + kbouncer + dbounce
+    exactly per `[[cross-product-agent-parity]]`.
+  - Per `[[self-host-zero-billing-dependency]]`: zero network calls.
+
 - **Per-session recording library** (#285) — new
   `internal/audit/recorder.go` ships the per-session NDJSON recorder.
   Tees every audit event into `{dir}/{agent.session_id}.ndjson` with
