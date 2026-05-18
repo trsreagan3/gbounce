@@ -145,12 +145,63 @@ func TestEmitAdminAction_WritesToJSONL(t *testing.T) {
 
 func TestAdminActionActivityID_AllKnownActions(t *testing.T) {
 	cases := map[AdminAction]int{
-		AdminActionConfigExport: ActivityOther,
-		AdminActionConfigImport: ActivityCreate,
+		AdminActionConfigExport:      ActivityOther,
+		AdminActionConfigImport:      ActivityCreate,
+		AdminActionDiagnosticsBundle: ActivityOther,
+		AdminActionBackupCreate:      ActivityOther,
+		AdminActionBackupRestore:     ActivityUpdate,
 	}
 	for action, want := range cases {
 		if got := AdminActionActivityID(action); got != want {
 			t.Errorf("AdminActionActivityID(%q) = %d; want %d", action, got, want)
 		}
+	}
+}
+
+func TestAdminActionSeverity_RestoreIsHigh(t *testing.T) {
+	// Restore wholesale-replaces the live state DB; a security team
+	// should review every restore. Cross-product parity: kbounce's
+	// restore is also High; backup stays Informational.
+	if id, _ := AdminActionSeverity(AdminActionBackupRestore); id != SeverityHigh {
+		t.Errorf("BackupRestore severity = %d; want SeverityHigh(%d)", id, SeverityHigh)
+	}
+	if id, _ := AdminActionSeverity(AdminActionBackupCreate); id != SeverityInformational {
+		t.Errorf("BackupCreate severity = %d; want SeverityInformational(%d)",
+			id, SeverityInformational)
+	}
+	if id, _ := AdminActionSeverity(AdminActionConfigExport); id != SeverityInformational {
+		t.Errorf("ConfigExport severity = %d; want SeverityInformational(%d)",
+			id, SeverityInformational)
+	}
+}
+
+func TestMakeAdminActionEvent_BackupRestoreSeverityHigh(t *testing.T) {
+	ev := MakeAdminActionEvent(AdminActionInput{
+		Action: AdminActionBackupRestore,
+	})
+	if ev.SeverityID != SeverityHigh {
+		t.Errorf("backup.restore SeverityID = %d; want SeverityHigh(%d)",
+			ev.SeverityID, SeverityHigh)
+	}
+	if ev.Severity != "High" {
+		t.Errorf("backup.restore Severity = %q; want High", ev.Severity)
+	}
+	if ev.ActivityID != ActivityUpdate {
+		t.Errorf("backup.restore ActivityID = %d; want ActivityUpdate(%d)",
+			ev.ActivityID, ActivityUpdate)
+	}
+}
+
+func TestMakeAdminActionEvent_BackupCreateInformational(t *testing.T) {
+	ev := MakeAdminActionEvent(AdminActionInput{
+		Action: AdminActionBackupCreate,
+	})
+	if ev.SeverityID != SeverityInformational {
+		t.Errorf("backup.create SeverityID = %d; want SeverityInformational(%d)",
+			ev.SeverityID, SeverityInformational)
+	}
+	if ev.ActivityID != ActivityOther {
+		t.Errorf("backup.create ActivityID = %d; want ActivityOther(%d)",
+			ev.ActivityID, ActivityOther)
 	}
 }

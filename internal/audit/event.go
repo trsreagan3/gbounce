@@ -84,6 +84,7 @@ const (
 const (
 	SeverityInformational = 1
 	SeverityMedium        = 3
+	SeverityHigh          = 4
 )
 
 // OCSF class / category constants for API Activity events.

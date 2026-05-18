@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gbounce backup` + `gbounce restore` per #279: single-file SQLite
+  backup + gated restore so operators can move gbounce state between
+  hosts, snapshot before a risky change, or recover from disaster
+  WITHOUT the historical "stop daemon and cp state.db" footgun. Online
+  backup via SQLite's `VACUUM INTO` primitive (no shutdown needed;
+  concurrent writers continue uninterrupted); restore validates a
+  `gbounce_backup_metadata` table first, refuses cross-schema
+  restores even with `--force`, and probes loopback ports (8080 +
+  8769) to refuse when `gbounce run` is alive. The decisions table is
+  EXCLUDED by default (it's the dominant volume in a busy proxy — a
+  busy deployment can accumulate GB of audit data; the JSONL audit-log
+  + log-rotation pipeline is the canonical long-term audit channel);
+  opt in via `--include-audit`. `--include-prompts` is accepted as a
+  documented no-op (no prompts subsystem in G-Slice 1; flag exists for
+  cross-product CLI parity). Both subcommands emit OCSF v1.1.0 class
+  6003 admin-action events (`backup.create` Informational + `backup.
+  restore` High) so a SIEM dashboard catches the DR lifecycle.
+  Cross-product parity with kbounce + dbounce + ibounce per
+  [[cross-product-agent-parity]]: same CLI shape, same flag names,
+  same refuse-without-force semantics, same metadata-table format
+  (`gbounce_backup_metadata` / `kbounce_backup_metadata` / etc.).
+  Docs: `docs/BACKUP-RESTORE.md` (why, online-vs-stop-required,
+  schema-version safety, three-artifact comparison with #275 + #277,
+  sample session, cross-links).
+
 - `gbounce diagnostics bundle` (alias `gbounce diag bundle`) per #277:
   produces a single ZIP with the operator's redacted config + audit-
   log tail + `/healthz` snapshot + system info + listener status +

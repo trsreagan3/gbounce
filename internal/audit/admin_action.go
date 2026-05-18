@@ -66,6 +66,24 @@ const (
 	// SIEM correlation rule keyed on activity_name="diagnostics.bundle"
 	// catches the event regardless of which Bounce product fired it.
 	AdminActionDiagnosticsBundle AdminAction = "diagnostics.bundle"
+
+	// AdminActionBackupCreate — operator ran `gbounce backup` (#279).
+	// Backup is read-only against the live store; recording it gives a
+	// security team a "who copied state off the machine + when?"
+	// witness. The on-disk path of the backup file lands in
+	// EntityName. Activity is Other (99) — backup doesn't fit CRUD.
+	// Cross-product parity: kbounce ships `store.backup` and dbounce
+	// ships `backup.create`; gbounce mirrors the dbounce name so the
+	// CLI-layer event name reads identically across both products.
+	AdminActionBackupCreate AdminAction = "backup.create"
+
+	// AdminActionBackupRestore — operator ran `gbounce restore`
+	// (#279). Restore WHOLESALE-REPLACES the destination state.db
+	// file; the OCSF activity_id is Update (3) because the entity's
+	// state is changed (vs. Create, which would build a brand-new
+	// entity). Severity is High because a restore touches every row
+	// of state — a security team should review every restore.
+	AdminActionBackupRestore AdminAction = "backup.restore"
 )
 
 // AdminActionActivityID maps an action to its OCSF activity_id (class
@@ -76,11 +94,35 @@ func AdminActionActivityID(a AdminAction) int {
 	switch a {
 	case AdminActionConfigImport:
 		return ActivityCreate
+	case AdminActionBackupRestore:
+		// Restore wholesale REPLACES the destination DB. CRUD-wise
+		// this is closest to Update (an existing entity's state is
+		// changed) rather than Create (a brand-new one is built).
+		return ActivityUpdate
 	case AdminActionConfigExport,
-		AdminActionDiagnosticsBundle:
+		AdminActionDiagnosticsBundle,
+		AdminActionBackupCreate:
 		return ActivityOther
 	default:
 		return ActivityOther
+	}
+}
+
+// AdminActionSeverity returns the OCSF severity_id + name for an admin
+// action. Most admin actions are Informational (routine audit-trail
+// rows); the few that touch the live state at scale (restore) escalate
+// so a SIEM dashboard surfaces them automatically. Cross-product
+// alignment per [[cross-product-agent-parity]]: kbounce's restore is
+// also High; backup stays Informational.
+func AdminActionSeverity(a AdminAction) (int, string) {
+	switch a {
+	case AdminActionBackupRestore:
+		// Restore replaces the live state DB; a security team
+		// should review every restore (vs. backup, which is
+		// read-only + routine).
+		return SeverityHigh, "High"
+	default:
+		return SeverityInformational, "Informational"
 	}
 }
 
@@ -183,6 +225,8 @@ func MakeAdminActionEvent(in AdminActionInput) Event {
 		"config_change": cfgChange,
 	}
 
+	severityID, severityName := AdminActionSeverity(action)
+
 	return Event{
 		Metadata: OCSFMetadata{
 			Version: OCSFSchemaVersion,
@@ -201,8 +245,8 @@ func MakeAdminActionEvent(in AdminActionInput) Event {
 		ActivityName: string(action),
 		TypeUID:      ClassUID*100 + activityID,
 		TypeName:     typeNameForActivity(activityID),
-		SeverityID:   SeverityInformational,
-		Severity:     "Informational",
+		SeverityID:   severityID,
+		Severity:     severityName,
 		StatusID:     StatusSuccess,
 		Status:       "Success",
 		API: OCSFAPI{
