@@ -85,7 +85,26 @@ func Open(path string) (*Store, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	// Task #296 / §A22: per-connection PRAGMAs applied via DSN so EVERY
+	// pool connection inherits them. SQLite defaults (rollback-journal +
+	// synchronous=FULL + no busy_timeout) cause SQLITE_BUSY at ~5+
+	// concurrent writers because two pool goroutines can both attempt a
+	// BEGIN IMMEDIATE on different connections. The triple here is the
+	// standard concurrency tuning:
+	//   - journal_mode=WAL: one writer + many readers run concurrently
+	//   - busy_timeout=5000: a contending connection retries for up to 5s
+	//     instead of failing immediately (matches dbounce + kbouncer)
+	//   - synchronous=NORMAL: WAL-safe; durable across crashes; fsync at
+	//     checkpoint instead of every commit (audit log keeps its
+	//     guarantee: a committed row survives a crash)
+	// foreign_keys=1 mirrors the defense-in-depth posture of dbounce so
+	// future FK declarations are enforced.
+	dsn := "file:" + path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("gbounce: sql.Open: %w", err)
 	}

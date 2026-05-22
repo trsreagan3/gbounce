@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **#296 / §A22 — SQLite store concurrency hardening (CRITICAL audit-loss fix)** (2026-05-22) —
+  gbounce's `internal/store/store.go` `Open()` now applies
+  `journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`,
+  `foreign_keys=1` via DSN PRAGMA bindings so EVERY connection in the
+  `sql.DB` pool inherits the settings. Pre-#296 gbounce passed ZERO
+  PRAGMAs (modernc.org/sqlite defaults: rollback-journal +
+  synchronous=FULL + no busy_timeout); a 20-session load probe lost
+  **11,804 of 12,000 audit rows** to `SQLITE_BUSY` because two pool
+  goroutines could simultaneously attempt `BEGIN IMMEDIATE` on
+  different connections. After the DSN tuning: 12,000/12,000 committed
+  at 20 writers, 0 errors, p99 = 8.18ms. The new posture matches
+  dbounce + kbouncer's PRAGMA shape across the Go bouncer trio per
+  `[[cross-product-agent-parity]]`. No schema change; no public API
+  change; data on existing DBs is preserved verbatim. Verified by
+  `internal/store/concurrency_load_test.go` (build-tagged `loadtest`
+  so normal `go test ./...` skips it). Lifts the cross-product §B13
+  "1-3 concurrent terminals in v1.0" caveat — the new measured ceiling
+  at the audit-write layer is **30+ concurrent agent sessions on one
+  machine** with zero dropped audit events.
+
 ### Added
 
 - **#324d — dynamic-deny YAML watcher + matcher extension + mgmt-port reload endpoint** (2026-05-22) —
