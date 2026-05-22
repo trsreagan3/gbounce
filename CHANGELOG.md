@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **#311 / §A10 — audit-log retention surface** (2026-05-22) —
+  cross-product launch-blocker resolved on the CLI + primitives side.
+  New `gbounce logs purge --older-than DURATION --yes` /
+  `gbounce logs archive --out FILE` / `gbounce logs verify` subcommand
+  surface (same flag names as ibounce / kbounce / dbounce per
+  [[cross-product-agent-parity]]). New `gbounce doctor logs` health
+  check: integrity + freshness + retention + disk; exits non-zero on
+  any failure. New `internal/audit/rotation.go` ships
+  `ShouldRotateBySize` / `ShouldRotateByAge` / `Rotate` /
+  `RecoverPartialTail` / `PurgeLogsOlderThan` / `ArchiveLogs` /
+  `VerifyIntegrity` / `GetDiskStatus` / `ParseLogDuration`. Crash
+  recovery primitive: `RecoverPartialTail` truncates a partial
+  trailing JSONL line. Cross-product runbook:
+  `iam-roles/docs/LOG-RETENTION.md`. 11 new tests in
+  `internal/audit/rotation_test.go`. **Gap**: LogWriter-level wiring
+  (auto-rotation guard inside the worker goroutine) is deferred — a
+  parallel agent's concurrent work on `internal/audit/log.go`
+  conflicted with the wiring; the primitives + CLI + doctor surface
+  all ship and the writer-level guard ports cleanly from
+  `dbounce/internal/audit/log.go` once the parallel work settles.
+  Status tracked in `iam-roles/docs/LOG-RETENTION.md` "Cross-product
+  parity matrix" + the §A10 entry in `KNOWN-CAVEATS.md`.
+
+- **Deny hosts: per-destination CONNECT blocking** (#314 / KNOWN-CAVEATS §A12)
+  — gbounce can now refuse a CONNECT based on destination host without
+  any MITM:
+  - `--deny-host <entry>` CLI flag (repeatable; supplements any future
+    profile-YAML `deny_hosts:` list).
+  - `--deny-hosts-file PATH` flag for newline-delimited deny lists
+    (also accepts the YAML-list shape the future profile-mode YAML
+    will use: `deny_hosts:` key + `- entry` lines + inline
+    `deny_hosts: [a, b]`). Comments (`#` prefix) + blank lines
+    ignored. Designed so a profile-YAML file containing only
+    `deny_hosts:` parses through unchanged when G-Slice 2 lands.
+  - Match shapes:
+    - **Exact** (`evil.example.com`) — case-insensitive literal match.
+    - **Leading wildcard** (`*.openai.com`) — matches `api.openai.com`,
+      `foo.bar.openai.com`, AND the bare `openai.com` (operator-friendly
+      "this org and all its subs"). Documented choice per the
+      file-header in `internal/proxy/deny_hosts.go`.
+  - Rejected at parse time (NewServer refuses to start; clear error
+    naming the offending entry):
+    - Bare `*` (use a future `--default-policy deny` for that posture).
+    - Multi-level wildcards (`*.foo.*.bar.com`, `foo.*`, `*.*`).
+    - Entries with embedded scheme / path / port / whitespace.
+  - On a match: gbounce returns `403 Forbidden` to the client and
+    emits an OCSF event with `verdict=DENY`, `status_id=4 (Denied)`,
+    `activity_id=6 (Connect)`, and
+    `ext.deny_reason="matched deny_hosts: <rule>"` naming the
+    operator-written rule (the SIEM can pivot on the EXACT string the
+    operator deployed). `/healthz` surfaces `deny_hosts_count` +
+    `total_deny_host_matches` so operators see deny-rule activity
+    without grepping the audit log.
+  - Order of evaluation: deny WINS over any future allow_hosts list
+    (safer-by-default per `[[safety-mode-lean-permissive]]`). When
+    an allow list lands in G-Slice 2, a host in both deny + allow is
+    still denied.
+  - Per `[[creates-never-mutates]]` this is additive — absent any
+    `--deny-host` flags the CONNECT path is unchanged. Per
+    `[[don't-tailor-to-lighthouse]]` the wildcard semantics are
+    generic; no specific provider blocklist is hardcoded.
+  - Regression tests: `TestDenyHosts_ExactMatch_Denied`,
+    `TestDenyHosts_WildcardSubdomain_Denied`,
+    `TestDenyHosts_WildcardMatchesBareDomain_Denied`,
+    `TestDenyHosts_WildcardDoesNotMatchUnrelated`,
+    `TestDenyHosts_NotInList_Allowed`,
+    `TestDenyHosts_BareWildcardRejected`,
+    `TestDenyHosts_MultiLevelWildcardRejected`,
+    `TestDenyHosts_AuditEventEmitted`,
+    `TestDenyHosts_DenyWinsOverAllow`,
+    `TestDenyHosts_CLIAndProfileMerge`,
+    `TestDenyHosts_HealthzCounter` in
+    `internal/proxy/deny_hosts_test.go`.
+
+- **Agent-identity attribution in audit events** (#308) — every OCSF
+  event now carries a populated `unmapped.iam_jit.agent` block:
+  - `agent.name` — value of the inbound `X-Agent-Name` header
+    (validated alphanumeric + `.`/`_`/`-`, max 64 chars); `"anonymous"`
+    when the header is absent or invalid.
+  - `agent.session_id` — value of the inbound `X-Agent-Session-Id`
+    header (validated alphanumeric + `_`/`-`, max 128 chars); omitted
+    when absent or invalid.
+  - `agent.detected_from` — `"http_header"` when either header fired;
+    `"unknown"` on anonymous traffic. Filterable via `unmapped.iam_jit.agent.detected_from=...`.
+  Closes the `[[agent-identity-in-audit]]` (#266) cross-bouncer parity
+  gap — operators can now run `iam-jit audit query --filter
+  unmapped.iam_jit.agent.session_id=...` across all four Bounce
+  products and gbounce events join the result set. Validation rejects
+  shell-injection payloads + control characters (the bad header is
+  treated as absent and the rejection counter surfaces via
+  `/healthz.total_agent_headers_rejected`). Per
+  `[[security-team-positioning-safety-not-surveillance]]` gbounce
+  never fabricates a name — anonymous events surface as
+  `name=anonymous` so the operator can see the attribution gap.
+  Regression tests: `TestProxy_AgentHeadersThreadedIntoOCSF` +
+  `TestProxy_NoAgentHeadersGracefulFallback` +
+  `TestProxy_InvalidAgentHeaders_Rejected` in
+  `internal/proxy/proxy_test.go`; OCSF wire-shape coverage in
+  `TestFromRequest_AgentBlockAlwaysPopulated` +
+  `TestIsValidAgentName` in `internal/audit/event_test.go`.
+
+- **`gbounce doctor caveats` + KNOWN-CAVEATS discoverability surfaces** (#304)
+  — caveats are now surfaced at four sites instead of being buried in
+  `docs/KNOWN-CAVEATS.md`:
+  - `internal/caveats/` — new package centralizes the gbounce-relevant
+    §B entries (B8 + B9 product-specific; B13 + B14 + B15 cross-product)
+    + their canonical-doc anchors. `caveats.BannerLines(Trigger)` returns
+    one banner line per runtime-triggered entry; `caveats.DoctorEntries()`
+    returns the full applicable list for the `doctor` subcommand;
+    `caveats.LinkSuffix(id)` produces an inline `(see KNOWN-CAVEATS §X:
+    <URL>)` suffix for error responses.
+  - **README "Known limitations" section** — top 3 gbounce-relevant §B
+    entries (B9 / B8 / B14) linked to the canonical doc.
+  - **Startup banner** — `gbounce run` emits one line per triggered
+    caveat after the listener address. Discovery mode triggers §B9 (the
+    only G-Slice 1 mode, so always emitted); `--allow-connect` triggers
+    §B8. Quiet when no triggering config applies per the founder
+    direction "the signal should be useful, not noise."
+  - **`gbounce doctor caveats`** — new subcommand under a new `doctor`
+    command group (matches the cross-product `*bounce doctor caveats`
+    shape per `[[cross-product-agent-parity]]`). Prints every
+    gbounce-applicable §B entry + its canonical-doc anchor.
+  - **Error message links** — the 421 "non-CONNECT method on CONNECT-only
+    listener" response body now appends `(see KNOWN-CAVEATS §B8: <URL>)`
+    so an operator hitting the deny lands on the doc immediately. Per
+    `[[security-team-positioning-safety-not-surveillance]]` the link is
+    helpful framing ("here's where to read more"), not accusatory.
+  - gbounce has no MCP server in v1.0 (queued for G-Slice 5); MCP tool
+    descriptions land alongside that slice.
+
 ### Fixed
 
 - **Failed-CONNECT + non-CONNECT requests now audited** (#303 + #305)

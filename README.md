@@ -41,6 +41,16 @@ enforcement.
 - `/healthz` JSON liveness probe on a separate management port
   (default `:8769`)
 
+## Known limitations
+
+Read before you install — knowing the boundaries up-front saves debugging time. The canonical list lives at [`docs/KNOWN-CAVEATS.md`](https://github.com/trsreagan3/iam-jit/blob/main/docs/KNOWN-CAVEATS.md); the top three for gbounce are:
+
+- **§B9 — G-Slice 1 = discovery only.** gbounce v1.0 observes + logs but does NOT block. Profile-mode gating ships in G-Slice 2 (v1.1). If you need to block traffic in v1.0, point gbounce at an egress firewall or a network policy upstream.
+- **§B8 — `--allow-connect` only sees host:port.** HTTPS CONNECT tunnels show `CONNECT host:443` only; URL paths + bodies are NOT visible (TLS passthrough, no MITM). Deliberate per [[ibounce-honest-positioning]] — more privacy + deployability. For URL-level visibility on plain HTTP use `--upstream` rewrite mode.
+- **§B14 — Bounce-suite is "complementary," not "unified."** gbounce is one of four products under one brand. Only ~10% of decisions show TRUE multi-layer composition per UAT. The honest framing per [[ibounce-honest-positioning]].
+
+`gbounce doctor caveats` prints the full applicable list (including cross-product entries B13/B14/B15).
+
 ## Later G-Slices (queued, not in this release)
 
 - **G-Slice 2** — profile mode (deny verdicts honored)
@@ -193,6 +203,67 @@ the iam-roles repo:
 gbounce's webhook + Security Lake export channels ship in G-Slice 6
 (post-launch); in G-Slice 1 use JSONL + Vector / Fluent Bit as
 described above.
+
+### Deny hosts (block a destination through gbounce without MITM)
+
+When you want to refuse a CONNECT to a specific host (e.g. block an
+agent from reaching `api.openai.com` or the EC2 IMDS endpoint),
+gbounce honors a `deny_hosts` list at the CONNECT layer — no MITM,
+no TLS interception, just a 403 + an audit event before the dial.
+
+`--deny-host` is repeatable, and `--deny-hosts-file PATH` accepts
+either newline-delimited entries or the YAML-list shape the future
+profile-mode YAML will use. Both flags union — entries from CLI flags
++ entries from the file all take effect.
+
+```sh
+gbounce run --allow-connect --port 8080 \
+            --deny-host '*.openai.com' \
+            --deny-host '169.254.169.254' \
+            --deny-hosts-file ~/.gbounce/deny-hosts.yaml
+```
+
+A sample `deny-hosts.yaml` (forward-compatible with the G-Slice 2
+profile-YAML surface):
+
+```yaml
+# ~/.gbounce/deny-hosts.yaml
+deny_hosts:
+  - evil.example.com          # exact match (all ports)
+  - "*.openai.com"             # wildcard: api.openai.com, foo.bar.openai.com,
+                                # AND the bare openai.com
+  - "*.anthropic.com"
+  - 169.254.169.254            # IPv4 literal: EC2 / GCE IMDS endpoint
+  - "*.metadata.google.internal"
+```
+
+**Match semantics:**
+
+- **Exact** (`evil.example.com`) — case-insensitive; blocks all ports.
+- **Leading wildcard** (`*.openai.com`) — matches every subdomain of
+  `openai.com` AND the bare `openai.com` itself. (Operators usually
+  mean "this org and all subs" when they write the entry; if you need
+  to block just the subdomains, use the explicit entries.)
+- **Bare `*`** — rejected at startup. Use a future `--default-policy
+  deny` for whole-Internet denials.
+- **Multi-level wildcards** (`*.foo.*.bar.com`, `foo.*`) — rejected at
+  startup with a clear error. The only supported wildcard shape is a
+  single leading `*.<domain>`.
+
+**On match:** gbounce returns `403 Forbidden` to the client + emits an
+OCSF event with `verdict=DENY`, `status_id=4 (Denied)`,
+`activity_id=6 (Connect)`, and `ext.deny_reason="matched deny_hosts:
+<rule>"` (naming the exact operator-written entry that fired). The
+upstream TCP connection is NEVER opened.
+
+**Visibility:** `/healthz` surfaces `deny_hosts_count` (how many rules
+are loaded) + `total_deny_host_matches` (how many CONNECTs the rule
+list has denied since startup) so operators see deny-rule activity
+without grepping the audit log.
+
+**Order of evaluation:** deny WINS over any future `allow_hosts` list.
+A host in both deny + allow is denied (safer-by-default; an operator
+who wrote a deny rule meant it). G-Slice 2 ships the allow side.
 
 ### Security-team observation preset
 

@@ -169,17 +169,62 @@ type OCSFUnmapped struct {
 	IAMJIT IAMJITExt `json:"iam_jit"`
 }
 
+// OCSFAgent is the iam-jit-native agent-identity block populated per
+// [[agent-identity-in-audit]] (#266). Always non-nil on events emitted
+// by FromRequest so a SIEM query on `unmapped.iam_jit.agent.name=
+// "anonymous"` surfaces unattributed traffic as a first-class signal
+// (#308). The shape mirrors kbouncer's OCSFAgent — same field names +
+// JSON tags so cross-bouncer queries port across products. gbounce
+// detects agent identity ONLY from the inbound HTTP headers
+// `X-Agent-Session-Id` + `X-Agent-Name`; it does NOT walk the process
+// tree (kbouncer's domain) so ProcessExe/ParentExe stay omitted.
+// DetectedFrom is "http_header" when either header was present (and
+// passed validation); "unknown" otherwise.
+type OCSFAgent struct {
+	Name         string `json:"name"`
+	SessionID    string `json:"session_id,omitempty"`
+	DetectedFrom string `json:"detected_from"`
+}
+
 // IAMJITExt is the iam-jit vendor extension under unmapped.iam_jit.
 // Common fields (mode/verdict/decision_id/enforced) match across the
 // Bounce suite; gbounce-specific fields (http_status, response_size,
 // latency_ms) live under Ext.
+//
+// Agent is the cross-bouncer agent-identity block (#266 / #308).
+// Always non-nil on events emitted by FromRequest — when neither
+// X-Agent-Session-Id nor X-Agent-Name was present the block surfaces
+// as {name:"anonymous", detected_from:"unknown"} so a SIEM query on
+// unmapped.iam_jit.agent.name="anonymous" finds unattributed traffic
+// as a first-class signal. The flat keys
+// `Ext[AgentSessionIDExtKey]` + `Ext[AgentNameExtKey]` are also
+// populated when present so the existing SessionRecorder
+// (`{dir}/{session_id}.ndjson`) routes events unchanged.
 type IAMJITExt struct {
 	Mode       string         `json:"mode,omitempty"`
 	Verdict    string         `json:"verdict,omitempty"`
 	DecisionID int64          `json:"decision_id,omitempty"`
 	Enforced   bool           `json:"enforced,omitempty"`
+	Agent      *OCSFAgent     `json:"agent,omitempty"`
 	Ext        map[string]any `json:"ext,omitempty"`
 }
+
+// AgentNameAnonymous is the sentinel populated under
+// unmapped.iam_jit.agent.name when no X-Agent-Name header was supplied.
+// Honest-effort: gbounce DOES NOT fabricate a name from User-Agent or
+// peer-PID (those are unreliable for HTTP traffic + would be
+// surveillance-shaped per
+// [[security-team-positioning-safety-not-surveillance]]). "anonymous"
+// makes the absence visible to the SIEM operator.
+const AgentNameAnonymous = "anonymous"
+
+// DetectionSource enum values for unmapped.iam_jit.agent.detected_from.
+// gbounce supports exactly two: http_header (the headers fired) and
+// unknown (no agent identity was supplied).
+const (
+	DetectionSourceHTTPHeader = "http_header"
+	DetectionSourceUnknown    = "unknown"
+)
 
 // Event is the OCSF v1.1.0 class 6003 (API Activity) wire shape. Every
 // field name + nested object matches the OCSF spec verbatim —
@@ -368,10 +413,15 @@ func FromRequest(in RequestInput) Event {
 	// the SessionRecorder reads (AgentSessionIDExtKey + AgentNameExtKey).
 	// Only valid session ids flow through; the recorder's IsValidSessionID
 	// gate also rejects malformed input, so this is belt-and-suspenders.
-	if in.AgentSessionID != "" && IsValidSessionID(in.AgentSessionID) {
+	// #308 — agent block also lands under unmapped.iam_jit.agent (built
+	// further below) so cross-bouncer queries on
+	// `unmapped.iam_jit.agent.{name,session_id}` resolve.
+	validSessionID := in.AgentSessionID != "" && IsValidSessionID(in.AgentSessionID)
+	validAgentName := in.AgentName != "" && IsValidAgentName(in.AgentName)
+	if validSessionID {
 		ext[AgentSessionIDExtKey] = in.AgentSessionID
 	}
-	if in.AgentName != "" {
+	if validAgentName {
 		ext[AgentNameExtKey] = in.AgentName
 	}
 	// #303 + #305 — merge caller-supplied extras (connect_refused,
@@ -397,6 +447,15 @@ func FromRequest(in RequestInput) Event {
 	if verdict == "" {
 		verdict = "ALLOW"
 	}
+
+	// #308 — agent-identity block under unmapped.iam_jit.agent. Always
+	// non-nil so a SIEM query on `unmapped.iam_jit.agent.name=
+	// "anonymous"` finds every unattributed event as a first-class
+	// signal. Detection source is "http_header" when either header
+	// fired (and passed validation); "unknown" otherwise. Honest-effort
+	// per [[ibounce-honest-positioning]] — gbounce never fabricates a
+	// name from User-Agent or peer-PID.
+	agent := buildAgentBlock(in.AgentSessionID, in.AgentName, validSessionID, validAgentName)
 
 	return Event{
 		Metadata: OCSFMetadata{
@@ -430,10 +489,37 @@ func FromRequest(in RequestInput) Event {
 				Verdict:    verdict,
 				DecisionID: in.DecisionID,
 				Enforced:   false,
+				Agent:      agent,
 				Ext:        ext,
 			},
 		},
 		DecisionID: in.DecisionID,
+	}
+}
+
+// buildAgentBlock returns the OCSFAgent for one event. Both inputs are
+// already-validated forms of the inbound X-Agent-Session-Id +
+// X-Agent-Name headers. Empty inputs → anonymous block; either-or-both
+// present → http_header detection source. Always returns a non-nil
+// pointer so `unmapped.iam_jit.agent.name` is queryable as a
+// first-class field on every gbounce event (#308).
+func buildAgentBlock(rawSessionID, rawName string, validSessionID, validName bool) *OCSFAgent {
+	name := AgentNameAnonymous
+	if validName {
+		name = rawName
+	}
+	sessionID := ""
+	if validSessionID {
+		sessionID = rawSessionID
+	}
+	detectedFrom := DetectionSourceUnknown
+	if validSessionID || validName {
+		detectedFrom = DetectionSourceHTTPHeader
+	}
+	return &OCSFAgent{
+		Name:         name,
+		SessionID:    sessionID,
+		DetectedFrom: detectedFrom,
 	}
 }
 
@@ -574,8 +660,20 @@ func ReconstructOverridesFromRow(in *RequestInput) {
 		if in.ExtraExt == nil {
 			in.ExtraExt = map[string]any{}
 		}
+		// #314 — distinguish the two known deny shapes by HTTPStatus.
+		// The JSONL hot path carries the EXACT deny_reason via ExtraExt;
+		// this reconstruction is the SQLite-rebuild fallback used by
+		// `gbounce audit tail` + GET /audit/events to give a SIEM a
+		// useful (if generic) reason when the JSONL log isn't available.
+		//   - HTTP 403 + CONNECT → deny_hosts rule match (#314)
+		//   - HTTP 421 (or anything else) → non-CONNECT on CONNECT-only
+		//     listener (#305)
 		if _, ok := in.ExtraExt["deny_reason"]; !ok {
-			in.ExtraExt["deny_reason"] = "non-CONNECT method on CONNECT-only listener"
+			if in.HTTPStatus == 403 && strings.EqualFold(in.Method, "CONNECT") {
+				in.ExtraExt["deny_reason"] = "matched deny_hosts rule"
+			} else {
+				in.ExtraExt["deny_reason"] = "non-CONNECT method on CONNECT-only listener"
+			}
 		}
 	}
 }

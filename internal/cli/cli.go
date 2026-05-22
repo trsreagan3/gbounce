@@ -26,6 +26,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/trsreagan3/gbounce/internal/audit"
+	"github.com/trsreagan3/gbounce/internal/caveats"
+	"github.com/trsreagan3/gbounce/internal/mitm"
+	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/proxy"
 	"github.com/trsreagan3/gbounce/internal/store"
 )
@@ -81,9 +84,17 @@ func newRootCmd() *cobra.Command {
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newAuditCmd())
+	// #315 / §A13 — `gbounce ca {install,uninstall,info,rotate}` for the
+	// optional MITM mode. Default-off; operator opts in by installing the
+	// CA then running `gbounce run --mode mitm`.
+	root.AddCommand(newCACmd())
 	root.AddCommand(newConfigCmd())
 	root.AddCommand(newDiagnosticsCmd())
 	root.AddCommand(newDiagAliasCmd())
+	// #304 — `gbounce doctor caveats` surfaces the §B entries from
+	// KNOWN-CAVEATS.md that apply to gbounce. Sibling Bounce products
+	// ship the same shape per [[cross-product-agent-parity]].
+	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newInvestigateCmd())
 	root.AddCommand(newVersionCheckCmd())
 	root.AddCommand(newBackupCmd())
@@ -146,6 +157,16 @@ func newRunCmd() *cobra.Command {
 		// #285 — per-session NDJSON recordings directory. Empty disables
 		// the channel. Replayable via `iam-jit session replay <FILE>`.
 		recordSessionsDir string
+		// #315 / §A13 — MITM-mode flags.
+		auditLogIncludeBodies bool
+		profileRulesFile      string
+		// #314 / §A12 — operator-written deny entries. `--deny-host`
+		// is repeatable + supplements `--deny-hosts-file`. Both feed
+		// the same compiled rule list (union). See
+		// internal/proxy/deny_hosts.go for wildcard semantics + the
+		// parse-time rejection rules.
+		denyHosts     []string
+		denyHostsFile string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -223,17 +244,58 @@ so liveness probes never touch the proxy data path.`,
 				presetBannerLines = FormatBanner(preset, res)
 			}
 
+			// #315 / §A13 — MITM mode is opt-in. The CA must already be
+			// installed (`gbounce ca install` from a prior step) +
+			// permissions on the key file must be 0o600. We load the CA
+			// up-front so a misconfigured MITM run fails BEFORE the
+			// listener binds.
+			var mitmMinter *mitm.CertMinter
+			var mitmRules []profile.Rule
 			switch mode {
 			case "discovery":
-				// G-Slice 1: the only supported mode.
+				// G-Slice 1: the default mode.
+			case "mitm":
+				caPaths, err := mitm.DefaultCAPaths()
+				if err != nil {
+					return err
+				}
+				caCert, caKey, err := mitm.LoadCA(caPaths)
+				if err != nil {
+					return fmt.Errorf("--mode mitm: %w", err)
+				}
+				if time.Now().After(caCert.NotAfter) {
+					return fmt.Errorf("--mode mitm: CA cert at %s expired on %s; rotate with `gbounce ca rotate`", caPaths.CertFile, caCert.NotAfter.Format(time.RFC3339))
+				}
+				m, err := mitm.NewCertMinter(caCert, caKey)
+				if err != nil {
+					return fmt.Errorf("--mode mitm: %w", err)
+				}
+				mitmMinter = m
+				if profileRulesFile != "" {
+					rules, err := loadProfileRulesFile(profileRulesFile)
+					if err != nil {
+						return fmt.Errorf("--profile-rules-file: %w", err)
+					}
+					mitmRules = rules
+				}
 			case "profile":
 				return fmt.Errorf("--mode profile is not in G-Slice 1; queued for G-Slice 2")
 			case "tap":
 				return fmt.Errorf("--mode tap is not in G-Slice 1; queued for G-Slice 3")
 			default:
-				return fmt.Errorf("--mode %q not recognized; G-Slice 1 supports: discovery", mode)
+				return fmt.Errorf("--mode %q not recognized; supported: discovery, mitm", mode)
 			}
-			if upstreamURL == "" && !allowConnect {
+			if mode == "mitm" {
+				// MITM mode IS CONNECT-shape. The operator doesn't need
+				// to also pass --allow-connect; we enable it implicitly
+				// so the agent's HTTPS_PROXY env var works out of the
+				// box. --upstream is unsupported in MITM mode (the
+				// destination comes from each CONNECT request).
+				allowConnect = true
+				if upstreamURL != "" {
+					return fmt.Errorf("--mode mitm is incompatible with --upstream (MITM routes each CONNECT to its target host); drop --upstream")
+				}
+			} else if upstreamURL == "" && !allowConnect {
 				return fmt.Errorf("--upstream is required (or pass --allow-connect for CONNECT-tunnel mode)")
 			}
 			if _, ok := loopbackHosts[host]; !ok && !forceExternalBind {
@@ -304,18 +366,48 @@ so liveness probes never touch the proxy data path.`,
 				sr = rec
 			}
 
+			cfgMode := proxy.ModeDiscovery
+			if mode == "mitm" {
+				cfgMode = proxy.ModeMITM
+			}
+			// #314 — collect deny entries from BOTH --deny-host CLI flags
+			// (already in denyHosts slice) and --deny-hosts-file (file is
+			// parsed for newline-delimited or YAML-list-style entries).
+			// Union semantics: the future profile-YAML surface (G-Slice
+			// 2) feeds entries through the same path; the
+			// TestDenyHosts_CLIAndProfileMerge regression asserts both
+			// take effect.
+			denyHostsMerged := append([]string{}, denyHosts...)
+			if denyHostsFile != "" {
+				contents, err := os.ReadFile(denyHostsFile)
+				if err != nil {
+					return fmt.Errorf("--deny-hosts-file %q: %w", denyHostsFile, err)
+				}
+				fileRules, err := proxy.ParseDenyHostsFile(string(contents))
+				if err != nil {
+					return fmt.Errorf("--deny-hosts-file %q: %w", denyHostsFile, err)
+				}
+				for _, r := range fileRules {
+					denyHostsMerged = append(denyHostsMerged, r.Raw)
+				}
+			}
+
 			cfg := proxy.Config{
-				Host:                  host,
-				Port:                  port,
-				MgmtHost:              mgmtHost,
-				MgmtPort:              mgmtPort,
-				UpstreamURL:           upstreamURL,
-				AllowConnect:          allowConnect,
-				ForwardTimeoutSeconds: forwardTimeout,
-				AuditLogPath:          auditLogPath,
-				AuditLogFsync:         auditLogFsync,
-				AuditEventsToken:      auditEventsToken,
-				Mode:                  proxy.ModeDiscovery,
+				Host:                   host,
+				Port:                   port,
+				MgmtHost:               mgmtHost,
+				MgmtPort:               mgmtPort,
+				UpstreamURL:            upstreamURL,
+				AllowConnect:           allowConnect,
+				ForwardTimeoutSeconds:  forwardTimeout,
+				AuditLogPath:           auditLogPath,
+				AuditLogFsync:          auditLogFsync,
+				AuditEventsToken:       auditEventsToken,
+				Mode:                   cfgMode,
+				MITMCertMinter:         mitmMinter,
+				MITMRules:              mitmRules,
+				MITMAuditIncludeBodies: auditLogIncludeBodies,
+				DenyHosts:              denyHostsMerged,
 			}
 			srv, err := proxy.NewServer(cfg, st, lw, sr)
 			if err != nil {
@@ -335,6 +427,17 @@ so liveness probes never touch the proxy data path.`,
 			for _, line := range presetBannerLines {
 				fmt.Fprintln(cmd.OutOrStdout(), line)
 			}
+			// #304 — known-caveats banner. Emits one line per §B entry
+			// whose triggering config is detected. Quiet when no
+			// triggering config applies, per the founder direction
+			// "the signal should be useful, not noise." Full doc:
+			// `gbounce doctor caveats` (every gbounce-relevant entry).
+			for _, line := range caveats.BannerLines(caveats.Trigger{
+				DiscoveryMode: cfg.Mode == proxy.ModeDiscovery,
+				AllowConnect:  allowConnect,
+			}) {
+				fmt.Fprintln(cmd.OutOrStdout(), line)
+			}
 			return srv.Serve(ctx)
 		},
 	}
@@ -349,8 +452,48 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().BoolVar(&auditLogFsync, "audit-log-fsync", false, "fsync after every audit-log write (slower; safer on crash)")
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false, "acknowledge the threat model of binding off loopback")
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
-	cmd.Flags().StringVar(&mode, "mode", "discovery", "operating mode (G-Slice 1: discovery only; G-Slice 2 adds profile; G-Slice 3 adds tap)")
+	cmd.Flags().StringVar(&mode, "mode", "discovery",
+		"operating mode. discovery (DEFAULT) = forward + audit + no MITM; "+
+			"mitm (#315) = terminate TLS with the CA installed via "+
+			"`gbounce ca install` so URL paths + redacted bodies land in "+
+			"the audit log. MITM is OPT-IN; cert-pinning SDKs will break "+
+			"under it (`gbounce ca info` shows the installed CA).")
 	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "", "bearer token required for GET /audit/events when the mgmt port is bound externally; empty = loopback-only (no auth)")
+	// #315 / §A13 — MITM-mode flags.
+	cmd.Flags().BoolVar(&auditLogIncludeBodies, "audit-log-include-bodies", false,
+		"#315 — store the REDACTED request-body snapshot in the audit "+
+			"log (default OFF — only the `request_body_redacted` boolean "+
+			"+ url_path land in the wire shape). Bodies are run through "+
+			"the credential-shape redactor before storage; raw secrets "+
+			"never reach the JSONL even with this flag on. Only relevant "+
+			"in `--mode mitm`.")
+	cmd.Flags().StringVar(&profileRulesFile, "profile-rules-file", "",
+		"#315 — path to a JSON file with profile-deny rules. Each rule "+
+			"matches an outbound request by host (exact + leading "+
+			"wildcard), method, path (exact / prefix / regex), and "+
+			"query_params. Only evaluated in `--mode mitm` (CONNECT-only "+
+			"mode lacks the visibility for path/method predicates).")
+	// #314 / §A12 — deny_hosts flags. `--deny-host` is repeatable;
+	// `--deny-hosts-file` reads a newline-delimited or YAML-list-style
+	// file. Both feed the same compiled rule list (union). See
+	// internal/proxy/deny_hosts.go for the supported wildcard shapes +
+	// the parse-time rejections (bare `*` + multi-level wildcards).
+	cmd.Flags().StringArrayVar(&denyHosts, "deny-host", nil,
+		"#314 — block this destination host through gbounce. Repeatable. "+
+			"Exact (`evil.example.com`) or single-leading-wildcard "+
+			"(`*.openai.com`) shapes accepted; `*.openai.com` matches "+
+			"`api.openai.com`, `foo.bar.openai.com`, AND the bare "+
+			"`openai.com`. Bare `*` and multi-level wildcards "+
+			"(`*.foo.*.bar.com`) are rejected at parse time. A match emits "+
+			"verdict=DENY + status_id=4 (Denied) + "+
+			"ext.deny_reason=\"matched deny_hosts: <rule>\" and returns "+
+			"403 to the client.")
+	cmd.Flags().StringVar(&denyHostsFile, "deny-hosts-file", "",
+		"#314 — read deny-host entries from a file (one entry per line; "+
+			"`#`-prefixed comments + blank lines ignored). Accepts the "+
+			"same YAML-list shape the future profile-mode YAML will use "+
+			"(top-level `deny_hosts:` key + `- entry` lines). Union with "+
+			"any `--deny-host` flags.")
 	cmd.Flags().StringVar(&recordSessionsDir, "record-sessions-dir", "",
 		"#285 — per-session NDJSON recording directory. When set, every "+
 			"audit event is also written to {dir}/{agent.session_id}.ndjson "+

@@ -44,27 +44,48 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/trsreagan3/gbounce/internal/audit"
+	"github.com/trsreagan3/gbounce/internal/mitm"
+	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/store"
 )
 
-// Mode is the proxy's operating mode. G-Slice 1 ships only
-// ModeDiscovery; ModeProfile + ModeTap are reserved for G-Slices 2-3.
+// Mode is the proxy's operating mode. G-Slice 1 ships ModeDiscovery
+// (default); #315 / §A13 adds ModeMITM (opt-in TLS interception).
 type Mode string
 
 const (
 	// ModeDiscovery parses + forwards + logs every call. No filtering.
 	// FREE-tier, no license gate.
 	ModeDiscovery Mode = "discovery"
+	// ModeMITM (#315 / §A13) terminates TLS using a CA loaded from
+	// disk + re-encrypts to the upstream. DEFAULT-OFF; operator opts
+	// in via `--mode mitm` after `gbounce ca install`. Per
+	// [[creates-never-mutates]] MITM is additive — CONNECT-mode is
+	// unchanged.
+	ModeMITM Mode = "mitm"
 )
 
 // IsValid returns true if m is one of the known modes.
-func (m Mode) IsValid() bool { return m == ModeDiscovery }
+func (m Mode) IsValid() bool { return m == ModeDiscovery || m == ModeMITM }
+
+// caveatLinkSuffixB8 is the inline help-link appended to the 421
+// "non-CONNECT on CONNECT-only listener" error body so an operator
+// hitting the deny sees the canonical KNOWN-CAVEATS §B8 explanation
+// without grepping. Hand-coded here (not via internal/caveats) to
+// avoid an internal/caveats import + the lint cost of one more
+// inter-package edge for a single constant. Per #304 + per
+// [[security-team-positioning-safety-not-surveillance]]: language is
+// helpful ("here's the doc") not accusatory.
+const caveatLinkSuffixB8 = " (see KNOWN-CAVEATS §B8: " +
+	"https://github.com/trsreagan3/iam-jit/blob/main/docs/" +
+	"KNOWN-CAVEATS.md#b8-gbounce---allow-connect-only-sees-hostport-design)"
 
 // hopByHopHeaders are stripped before forwarding. Lowercase for the
 // case-insensitive comparison. Lifted from RFC 7230 §6.1.
@@ -118,6 +139,31 @@ type Config struct {
 	AuditEventsToken string
 	// Mode: G-Slice 1 only supports ModeDiscovery.
 	Mode Mode
+	// DenyHosts — #314 / §A12. Operator-written deny-list entries
+	// (exact + wildcard). Compiled at NewServer time; a parse error
+	// fails the constructor with a clear message naming the offending
+	// entry. A non-empty list is checked on every CONNECT before the
+	// upstream is dialed; a match emits a verdict=DENY OCSF event
+	// (status_id=4 Denied + ext.deny_reason="matched deny_hosts: <rule>")
+	// and returns 403 to the client. See deny_hosts.go for the
+	// wildcard semantics + the order-of-evaluation rule.
+	DenyHosts []string
+
+	// #315 / §A13 — MITM-mode wiring.
+	//
+	// MITMCertMinter is set when Mode==ModeMITM. NewServer rejects
+	// MITM mode with a nil minter; the CLI layer constructs it after
+	// loading the CA + running the LoadCA permission check.
+	MITMCertMinter *mitm.CertMinter
+	// MITMRules is the compiled profile-rule list (host + method +
+	// path + query-param matching). Empty list = MITM mode with only
+	// URL-level audit visibility.
+	MITMRules []profile.Rule
+	// MITMAuditIncludeBodies opts INTO storing redacted request +
+	// response bodies in the audit log. Default false — only the
+	// redaction MARK + the bool surface so a SIEM can find which
+	// rows had a redacted body.
+	MITMAuditIncludeBodies bool
 }
 
 // Normalize fills sensible defaults + returns the normalized Config.
@@ -170,6 +216,31 @@ type Server struct {
 	// counters
 	totalRequests atomic.Int64
 	totalErrors   atomic.Int64
+	// #308 — bumped each time an inbound X-Agent-Session-Id or
+	// X-Agent-Name header fails validation. Surfaces via /healthz so
+	// an operator can spot agent-config drift (e.g. somebody set the
+	// header to a shell-injection payload).
+	totalAgentHeadersRejected atomic.Int64
+	// #314 — compiled deny_hosts rules. Built at NewServer time from
+	// cfg.DenyHosts. Empty slice when no deny entries were configured;
+	// MatchDenyHosts returns nil cheaply in that case so the CONNECT
+	// hot path stays the same shape it had pre-#314.
+	denyHosts []DenyHostRule
+	// #314 — bumped each time a CONNECT is denied by a deny_hosts
+	// rule. Surfaces via /healthz so an operator can see deny-rule
+	// activity without grepping the audit log.
+	totalDenyHostMatches atomic.Int64
+
+	// #315 / §A13 — MITM-mode state. nil minter = MITM disabled.
+	mitmMinter             *mitm.CertMinter
+	mitmRules              []profile.Rule
+	mitmAuditIncludeBodies bool
+	// #315 — bumped each time a MITM-intercepted request was denied
+	// by a profile rule.
+	totalMITMDenies atomic.Int64
+	// #315 — bumped each time an upstream TLS handshake fails inside
+	// MITM mode (most commonly = upstream pins certs).
+	totalMITMUpstreamHandshakeFailures atomic.Int64
 }
 
 // NewServer builds a Server from the given Config + Store. Caller
@@ -198,17 +269,37 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 		up = u
 	}
 	if !cfg.Mode.IsValid() {
-		return nil, fmt.Errorf("gbounce: invalid mode %q (G-Slice 1 supports only %q)", cfg.Mode, ModeDiscovery)
+		return nil, fmt.Errorf("gbounce: invalid mode %q (supported: %q, %q)", cfg.Mode, ModeDiscovery, ModeMITM)
+	}
+	// #315 / §A13 — MITM mode requires a loaded CA + the LoadCA
+	// permission check (see internal/mitm) to have already passed.
+	// NewServer refuses MITM mode with a nil minter so programmatic
+	// callers can't bypass the CA gate.
+	if cfg.Mode == ModeMITM && cfg.MITMCertMinter == nil {
+		return nil, fmt.Errorf("gbounce: --mode mitm requires a CA — run `gbounce ca install` first")
+	}
+
+	// #314 — compile deny_hosts rules up-front so any parse error fails
+	// the constructor with a clear message naming the offending entry.
+	// Empty cfg.DenyHosts produces a nil rules slice + the CONNECT hot
+	// path's MatchDenyHosts returns nil cheaply.
+	denyRules, err := ParseDenyHosts(cfg.DenyHosts)
+	if err != nil {
+		return nil, fmt.Errorf("gbounce: %w", err)
 	}
 
 	timeout := time.Duration(cfg.ForwardTimeoutSeconds) * time.Second
 
 	s := &Server{
-		cfg:         cfg,
-		store:       st,
-		log:         lw,
-		recorder:    sr,
-		upstreamURL: up,
+		cfg:                    cfg,
+		store:                  st,
+		log:                    lw,
+		recorder:               sr,
+		upstreamURL:            up,
+		denyHosts:              denyRules,
+		mitmMinter:             cfg.MITMCertMinter,
+		mitmRules:              cfg.MITMRules,
+		mitmAuditIncludeBodies: cfg.MITMAuditIncludeBodies,
 		client: &http.Client{
 			Timeout: timeout,
 			// Don't follow redirects — surface the upstream's
@@ -363,8 +454,16 @@ func (s *Server) ServeListeners(ctx context.Context, proxyL, mgmtL net.Listener)
 // handle is the proxy's catch-all HTTP handler. Routes CONNECT to
 // the tunnel handler (when enabled) and everything else to the
 // forward handler.
+//
+// #315 — when the proxy runs in ModeMITM, CONNECT verbs route to
+// handleMITMConnect (TLS terminate + decrypt + audit + re-encrypt).
+// The default ModeDiscovery shape is unchanged.
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
+		if s.cfg.Mode == ModeMITM {
+			s.handleMITMConnect(w, r)
+			return
+		}
 		s.handleConnect(w, r)
 		return
 	}
@@ -463,6 +562,31 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.record(r, startedAt, http.StatusBadRequest, 0)
 		return
 	}
+	// #314 — deny_hosts evaluation runs BEFORE the dial so a matched
+	// host never causes an outbound TCP connection. Match against the
+	// host portion only (port-agnostic; operators write
+	// `evil.example.com` and expect every port to be denied). Per the
+	// docstring on deny_hosts.go: deny_hosts WINS over any future
+	// allow_hosts list.
+	if len(s.denyHosts) > 0 {
+		denyHost, _ := splitHostPortStr(target)
+		if denyHost == "" {
+			denyHost = target
+		}
+		if rule := MatchDenyHosts(s.denyHosts, denyHost); rule != nil {
+			s.totalDenyHostMatches.Add(1)
+			reason := fmt.Sprintf("matched deny_hosts: %s", rule.Raw)
+			// 403 Forbidden so the verdict word matches the audit event
+			// + ReconstructOverridesFromRow can distinguish deny_hosts
+			// (403) from "non-CONNECT on CONNECT-only listener" (421).
+			s.recordDeny(r, startedAt, http.StatusForbidden, reason)
+			http.Error(w,
+				"gbounce: CONNECT denied by deny_hosts rule: "+rule.Raw,
+				http.StatusForbidden)
+			s.totalErrors.Add(1)
+			return
+		}
+	}
 	upstream, err := net.DialTimeout("tcp", target,
 		time.Duration(s.cfg.ForwardTimeoutSeconds)*time.Second)
 	if err != nil {
@@ -530,6 +654,19 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		"allow_connect":  s.cfg.AllowConnect,
 		"total_requests": s.totalRequests.Load(),
 		"total_errors":   s.totalErrors.Load(),
+		// #308 — invalid X-Agent-* header counter so operators see
+		// agent-config drift in liveness probes.
+		"total_agent_headers_rejected": s.totalAgentHeadersRejected.Load(),
+		// #314 — deny_hosts match counter so operators see deny-rule
+		// activity from /healthz without grepping the audit log.
+		"total_deny_host_matches": s.totalDenyHostMatches.Load(),
+		"deny_hosts_count":        len(s.denyHosts),
+		// #315 / §A13 — MITM-mode counters.
+		"mitm_enabled":                           s.cfg.Mode == ModeMITM,
+		"mitm_rules_count":                       len(s.mitmRules),
+		"mitm_audit_include_bodies":              s.mitmAuditIncludeBodies,
+		"total_mitm_denies":                      s.totalMITMDenies.Load(),
+		"total_mitm_upstream_handshake_failures": s.totalMITMUpstreamHandshakeFailures.Load(),
 	}
 	if s.log != nil {
 		body["audit_log_path"] = s.log.Path()
@@ -605,13 +742,23 @@ func (s *Server) recordFailedConnect(r *http.Request, startedAt time.Time, dialE
 // captured from r.URL.Path so IMDS probes (which set the path to
 // `/latest/meta-data/...`) are visible in the audit row.
 func (s *Server) recordDeny(r *http.Request, startedAt time.Time, httpStatus int, reason string) {
-	s.recordWith(r, startedAt, httpStatus, 0, recordOverrides{
+	ov := recordOverrides{
 		Verdict:  "DENY",
 		StatusID: audit.StatusDenied,
 		ExtraExt: map[string]any{
 			"deny_reason": reason,
 		},
-	})
+	}
+	// #314 — pin ActivityConnect on a denied CONNECT so a SIEM filter
+	// on `activity_id=6` finds every tunnel-establishment outcome
+	// regardless of verdict (success / failure / denied). The pre-#314
+	// recordDeny call site (#305's non-CONNECT-on-CONNECT-only path)
+	// keeps the default method-derived activity since the rejected
+	// verb is NOT CONNECT.
+	if strings.EqualFold(r.Method, http.MethodConnect) {
+		ov.ActivityID = audit.ActivityConnect
+	}
+	s.recordWith(r, startedAt, httpStatus, 0, ov)
 }
 
 // record builds + persists an OCSF event for the request/response
@@ -696,6 +843,35 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 	if ov.Verdict != "" {
 		verdict = ov.Verdict
 	}
+	// #308 — agent identity captured from the inbound headers BEFORE
+	// the persistent row is built so the SQLite-backed reconstruction
+	// (HTTP /audit/events + `gbounce audit tail`) carries the same
+	// agent.name / agent.session_id as the JSONL log. Validation
+	// happens here (rejects shell-injection chars + over-length
+	// inputs); an invalid header is treated as if it were absent and a
+	// stderr line surfaces the rejection so an operator debugging
+	// "why is my session id missing?" sees it. Per
+	// [[security-team-positioning-safety-not-surveillance]] we never
+	// fabricate values — when detection fails the event surfaces as
+	// anonymous so the operator knows attribution is missing.
+	rawSessionID := r.Header.Get("X-Agent-Session-Id")
+	rawAgentName := r.Header.Get("X-Agent-Name")
+	agentSessionIDValidated := ""
+	agentNameValidated := ""
+	if rawSessionID != "" {
+		if audit.IsValidSessionID(rawSessionID) {
+			agentSessionIDValidated = rawSessionID
+		} else {
+			s.logAgentHeaderRejected("X-Agent-Session-Id", rawSessionID)
+		}
+	}
+	if rawAgentName != "" {
+		if audit.IsValidAgentName(rawAgentName) {
+			agentNameValidated = rawAgentName
+		} else {
+			s.logAgentHeaderRejected("X-Agent-Name", rawAgentName)
+		}
+	}
 	row := store.DecisionRow{
 		At:             startedAt.UTC(),
 		Method:         r.Method,
@@ -711,6 +887,11 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 		Verdict:        verdict,
 		Mode:           string(s.cfg.Mode),
 		Enforced:       false,
+		// #308 — persisted agent identity feeds the cross-bouncer
+		// audit-query filter; reconstruction in audit_events.go +
+		// cli.go reads these columns back into the OCSF builder.
+		AgentName:      agentNameValidated,
+		AgentSessionID: agentSessionIDValidated,
 	}
 	if r.Method == http.MethodConnect {
 		// For CONNECT, the path field carries the tunnel target so the
@@ -731,8 +912,10 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 		// curl / unknown caller). When a client (Claude Code, Cursor,
 		// custom agent) sets these headers, the event routes into the
 		// matching per-session NDJSON file.
-		sid := r.Header.Get("X-Agent-Session-Id")
-		agentName := r.Header.Get("X-Agent-Name")
+		// #308 — use the VALIDATED agent fields so the OCSF builder
+		// emits the canonical `unmapped.iam_jit.agent.{name,session_id,
+		// detected_from}` block + the legacy flat ext keys the
+		// SessionRecorder reads stay correct.
 		ev := audit.FromRequest(audit.RequestInput{
 			At:                 row.At,
 			DecisionID:         decisionID,
@@ -747,8 +930,8 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 			HTTPStatus:         row.HTTPStatus,
 			ResponseSize:       row.ResponseSize,
 			LatencyMS:          row.LatencyMS,
-			AgentSessionID:     sid,
-			AgentName:          agentName,
+			AgentSessionID:     agentSessionIDValidated,
+			AgentName:          agentNameValidated,
 			Verdict:            row.Verdict,
 			ActivityIDOverride: ov.ActivityID,
 			StatusIDOverride:   ov.StatusID,
@@ -765,6 +948,41 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 			s.recorder.Record(ev)
 		}
 	}
+}
+
+// logAgentHeaderRejected emits one stderr line + bumps the rejected-
+// header counter when an inbound X-Agent-* header fails validation
+// (#308). Bounded log shape: header name + truncated raw value (first
+// 32 chars, single-quoted) — prevents a malicious agent from filling
+// the operator's terminal with junk. The decision still gets audited
+// (under name="anonymous") so the rejection isn't invisible; this log
+// line is the side-channel debug aid.
+//
+// Per [[security-team-positioning-safety-not-surveillance]]: surfacing
+// the rejection is SAFETY (operator sees attribution gap); the
+// truncation is privacy-shaped (we don't echo arbitrary unbounded
+// header bodies into the log). Control characters are replaced with
+// '?' so an attacker who embeds an escape sequence can't reposition
+// the cursor in an attached terminal.
+func (s *Server) logAgentHeaderRejected(headerName, rawValue string) {
+	s.totalAgentHeadersRejected.Add(1)
+	truncated := rawValue
+	if len(truncated) > 32 {
+		truncated = truncated[:32] + "..."
+	}
+	clean := make([]byte, 0, len(truncated))
+	for i := 0; i < len(truncated); i++ {
+		c := truncated[i]
+		if c < 0x20 || c > 0x7e {
+			clean = append(clean, '?')
+		} else {
+			clean = append(clean, c)
+		}
+	}
+	fmt.Fprintf(os.Stderr,
+		"gbounce: rejected invalid %s header (value=%q) — request will be audited as anonymous\n",
+		headerName, string(clean),
+	)
 }
 
 // singleJoiningSlash joins a + b ensuring exactly one slash sits
