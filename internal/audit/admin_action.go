@@ -84,6 +84,26 @@ const (
 	// entity). Severity is High because a restore touches every row
 	// of state — a security team should review every restore.
 	AdminActionBackupRestore AdminAction = "backup.restore"
+
+	// AdminActionDynamicDenyReloaded — #324d. The dynamic-deny YAML
+	// at `~/.iam-jit/dynamic-denies.yaml` (or the path passed via
+	// `--dynamic-denies-path`) was reloaded by the in-process
+	// fsnotify watcher OR the POST /admin/dynamic-denies/reload mgmt
+	// endpoint. The reload reason
+	// (`unmapped.iam_jit.ext.dynamic_deny_reload_reason`) distinguishes
+	// `file_created` / `file_modified` / `file_removed` /
+	// `reload_requested` so a SIEM dashboard can split filesystem-
+	// triggered reloads from operator-pushed ones. Severity
+	// Informational (routine audit trail). Activity Other.
+	AdminActionDynamicDenyReloaded AdminAction = "dynamic_deny.reloaded"
+
+	// AdminActionDynamicDenyParseError — #324d. A reload attempt
+	// failed YAML parse / schema validation. The previous snapshot is
+	// retained in memory (fail-CLOSED per
+	// [[ibounce-honest-positioning]]). Surfaced so an operator who
+	// installed an invalid file sees it immediately rather than
+	// "silently 0 rules applied."
+	AdminActionDynamicDenyParseError AdminAction = "dynamic_deny.parse_error"
 )
 
 // AdminActionActivityID maps an action to its OCSF activity_id (class

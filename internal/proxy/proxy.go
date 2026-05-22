@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"github.com/trsreagan3/gbounce/internal/audit"
+	"github.com/trsreagan3/gbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/gbounce/internal/mitm"
 	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/store"
@@ -149,6 +150,14 @@ type Config struct {
 	// wildcard semantics + the order-of-evaluation rule.
 	DenyHosts []string
 
+	// #324d — Dynamic-deny watcher. When non-nil, the proxy unions
+	// entries from `~/.iam-jit/dynamic-denies.yaml` with the static
+	// DenyHosts list above. Source attribution (`ext.deny_source` +
+	// `ext.dynamic_deny_rule_id`) lands on every deny audit event so
+	// a SIEM analyst sees which surface fired. Nil = pre-#324d shape
+	// (static rules only).
+	DynamicDenyWatcher *dynamicdeny.Watcher
+
 	// #315 / §A13 — MITM-mode wiring.
 	//
 	// MITMCertMinter is set when Mode==ModeMITM. NewServer rejects
@@ -238,6 +247,21 @@ type Server struct {
 	// activity without grepping the audit log.
 	totalDenyHostMatches atomic.Int64
 
+	// #324d — dynamic-deny watcher. Pulls hot-reloadable entries from
+	// the cross-product YAML; the matcher unions these with the static
+	// list above. Nil disables the channel.
+	dynamicDeny *dynamicdeny.Watcher
+	// #324d — bumped each time a dynamic-deny rule fires. Surfaces via
+	// /healthz so an operator sees activity. Independent counter from
+	// the static-deny counter so a SIEM dashboard can split the two.
+	totalDynamicDenyMatches atomic.Int64
+	// #324d — bumped each time the dynamic-deny YAML file reloads
+	// (either via the watcher or the mgmt-port reload endpoint).
+	totalDynamicDenyReloads atomic.Int64
+	// #324d — bumped each time a dynamic-deny reload attempt failed
+	// parse / schema validation. Surfaces via /healthz.
+	totalDynamicDenyParseErrors atomic.Int64
+
 	// #315 / §A13 — MITM-mode state. nil minter = MITM disabled.
 	mitmMinter             *mitm.CertMinter
 	mitmRules              []profile.Rule
@@ -304,6 +328,7 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 		recorder:               sr,
 		upstreamURL:            up,
 		denyHosts:              denyRules,
+		dynamicDeny:            cfg.DynamicDenyWatcher,
 		mitmMinter:             cfg.MITMCertMinter,
 		mitmRules:              cfg.MITMRules,
 		mitmAuditIncludeBodies: cfg.MITMAuditIncludeBodies,
@@ -346,6 +371,17 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 	// in parallel against each reachable bouncer to produce a single
 	// merged stream.
 	mgmtMux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken))
+	// #324d — POST /admin/dynamic-denies/reload triggers an immediate
+	// reload of the dynamic-deny YAML from disk. Useful for the
+	// cross-bouncer fan-out CLI (#324e), which will write the YAML
+	// + then call POST on each Bounce product's mgmt port so the
+	// operator gets a confirmed "rules are live on bouncer X" reply.
+	// 200 with a small JSON payload on success; 4xx with a structured
+	// error on parse / schema failure. Reuses the same loopback /
+	// bearer-token gating as /audit/events since the endpoint
+	// indirectly exposes a manifest-shape view of the active rules.
+	mgmtMux.HandleFunc("/admin/dynamic-denies/reload", s.dynamicDenyReloadHandler(cfg.AuditEventsToken))
+
 	// #298 — GET /suite serves the cross-product Bounce-suite link
 	// page. Per [[unified-ui-link-page]] this is signage + status
 	// pills, not an aggregator. Each card is just an anchor to the
@@ -588,24 +624,38 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.record(r, startedAt, http.StatusBadRequest, 0)
 		return
 	}
-	// #314 — deny_hosts evaluation runs BEFORE the dial so a matched
-	// host never causes an outbound TCP connection. Match against the
-	// host portion only (port-agnostic; operators write
-	// `evil.example.com` and expect every port to be denied). Per the
-	// docstring on deny_hosts.go: deny_hosts WINS over any future
-	// allow_hosts list.
-	if len(s.denyHosts) > 0 {
+	// #314 + #324d — deny_hosts evaluation runs BEFORE the dial so a
+	// matched host never causes an outbound TCP connection. Union the
+	// static rule list with any dynamic entries pulled from the
+	// hot-reloadable YAML file. Match against the host portion only
+	// (port-agnostic; operators write `evil.example.com` and expect
+	// every port to be denied). Per the docstring on deny_hosts.go:
+	// deny_hosts WINS over any future allow_hosts list.
+	effective, _ := s.effectiveDenyRules()
+	if len(effective) > 0 {
 		denyHost, _ := splitHostPortStr(target)
 		if denyHost == "" {
 			denyHost = target
 		}
-		if rule := MatchDenyHosts(s.denyHosts, denyHost); rule != nil {
-			s.totalDenyHostMatches.Add(1)
+		if rule := MatchDenyHosts(effective, denyHost); rule != nil {
+			if rule.Source == DenySourceDynamic {
+				s.totalDynamicDenyMatches.Add(1)
+			} else {
+				s.totalDenyHostMatches.Add(1)
+			}
 			reason := fmt.Sprintf("matched deny_hosts: %s", rule.Raw)
+			if rule.Source == DenySourceDynamic && rule.DynamicDenyRuleID != "" {
+				// Surface the rule id verbatim in the operator-facing
+				// reason so a 403 body alone names the rule. Audit-
+				// event has the structured field; this is the human-
+				// readable echo.
+				reason = fmt.Sprintf("matched dynamic-deny rule %s (%s)",
+					rule.DynamicDenyRuleID, rule.Raw)
+			}
 			// 403 Forbidden so the verdict word matches the audit event
 			// + ReconstructOverridesFromRow can distinguish deny_hosts
 			// (403) from "non-CONNECT on CONNECT-only listener" (421).
-			s.recordDeny(r, startedAt, http.StatusForbidden, reason)
+			s.recordDenyWithSource(r, startedAt, http.StatusForbidden, reason, rule)
 			http.Error(w,
 				"gbounce: CONNECT denied by deny_hosts rule: "+rule.Raw,
 				http.StatusForbidden)
@@ -687,6 +737,19 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 		// activity from /healthz without grepping the audit log.
 		"total_deny_host_matches": s.totalDenyHostMatches.Load(),
 		"deny_hosts_count":        len(s.denyHosts),
+		// #324d — dynamic-deny counters. Independent of the static-
+		// deny pair above so a SIEM dashboard can split the two. When
+		// the watcher is disabled all of these stay zero; pre-existing
+		// /healthz consumers see the new keys as "0" rather than
+		// "missing field" so a JSON-decode against an older schema
+		// doesn't break.
+		"dynamic_denies_enabled":           s.dynamicDeny != nil,
+		"dynamic_denies_count":             s.dynamicDenyActiveCount(),
+		"dynamic_denies_globs_count":       s.dynamicDenyGlobCount(),
+		"dynamic_denies_path":              s.dynamicDenyPath(),
+		"total_dynamic_deny_matches":       s.totalDynamicDenyMatches.Load(),
+		"total_dynamic_deny_reloads":       s.totalDynamicDenyReloads.Load(),
+		"total_dynamic_deny_parse_errors":  s.totalDynamicDenyParseErrors.Load(),
 		// #315 / §A13 — MITM-mode counters.
 		"mitm_enabled":                           s.cfg.Mode == ModeMITM,
 		"mitm_rules_count":                       len(s.mitmRules),
@@ -785,6 +848,138 @@ func (s *Server) recordDeny(r *http.Request, startedAt time.Time, httpStatus int
 		ov.ActivityID = audit.ActivityConnect
 	}
 	s.recordWith(r, startedAt, httpStatus, 0, ov)
+}
+
+// recordDenyWithSource is the #324d entrypoint: same as recordDeny but
+// also threads the matched rule's Source + DynamicDenyRuleID into the
+// audit ext map so a SIEM analyst can answer "static or dynamic?" +
+// "which dynamic rule?" without grepping the config files. Static
+// matches land with `ext.deny_source="static"` + no rule id; dynamic
+// matches land with `ext.deny_source="dynamic"` +
+// `ext.dynamic_deny_rule_id="dd_..."`.
+//
+// Same shape as the cross-product design doc's
+// `dynamic_deny.rule_fired` event — except it's NOT a separate event,
+// it's an EXTRA FIELD on the verdict event, per the design doc's
+// "emitted as part of the verdict OCSF event (NOT separately)" note.
+func (s *Server) recordDenyWithSource(r *http.Request, startedAt time.Time, httpStatus int, reason string, rule *DenyHostRule) {
+	extra := map[string]any{
+		"deny_reason": reason,
+	}
+	if rule != nil {
+		// Default to "static" when the matched rule pre-dates #324d's
+		// Source field (defensive; ParseDenyHosts now pins Source for
+		// every produced rule, but a third-party constructor might
+		// pass a bare DenyHostRule literal).
+		src := rule.Source
+		if src == "" {
+			src = DenySourceStatic
+		}
+		extra["deny_source"] = src
+		if rule.DynamicDenyRuleID != "" {
+			extra["dynamic_deny_rule_id"] = rule.DynamicDenyRuleID
+		}
+	}
+	ov := recordOverrides{
+		Verdict:  "DENY",
+		StatusID: audit.StatusDenied,
+		ExtraExt: extra,
+	}
+	if strings.EqualFold(r.Method, http.MethodConnect) {
+		ov.ActivityID = audit.ActivityConnect
+	}
+	s.recordWith(r, startedAt, httpStatus, 0, ov)
+}
+
+// dynamicDenyActiveCount returns the number of rules currently in the
+// dynamic-deny watcher's snapshot (post-filter, gbounce-applicable
+// rules only). Used by /healthz + the mgmt-port reload endpoint.
+func (s *Server) dynamicDenyActiveCount() int {
+	if s.dynamicDeny == nil {
+		return 0
+	}
+	snap := s.dynamicDeny.Snapshot()
+	if snap == nil {
+		return 0
+	}
+	return len(snap.Rules)
+}
+
+// dynamicDenyGlobCount returns the number of compiled deny globs the
+// dynamic-deny snapshot contributes to the matcher (sum over each
+// rule's Targets list).
+func (s *Server) dynamicDenyGlobCount() int {
+	if s.dynamicDeny == nil {
+		return 0
+	}
+	snap := s.dynamicDeny.Snapshot()
+	if snap == nil {
+		return 0
+	}
+	n := 0
+	for _, r := range snap.Rules {
+		n += len(r.Targets)
+	}
+	return n
+}
+
+// dynamicDenyPath returns the on-disk path the watcher consults, or
+// "" when the watcher is disabled.
+func (s *Server) dynamicDenyPath() string {
+	if s.dynamicDeny == nil {
+		return ""
+	}
+	return s.dynamicDeny.Path()
+}
+
+// BumpDynamicDenyReload + BumpDynamicDenyParseError are exposed for
+// the CLI layer's emit-func wiring. The CLI installs an emit callback
+// on the watcher that bumps these counters + tees the OCSF admin-action
+// event into the audit-log sink. Methods (not direct atomic access)
+// so the counters can move out of Server in a future refactor without
+// breaking the call site.
+func (s *Server) BumpDynamicDenyReload()     { s.totalDynamicDenyReloads.Add(1) }
+func (s *Server) BumpDynamicDenyParseError() { s.totalDynamicDenyParseErrors.Add(1) }
+
+// effectiveDenyRules returns the union of static + dynamic deny rules
+// the matcher should evaluate against on each CONNECT. Returns the
+// dynamic-only rule count as the second value so callers (e.g.
+// /healthz) can surface "dynamic count" separately from "total
+// effective." Empty when no rules of either kind are configured.
+//
+// Dynamic-side parse errors are surfaced through the watcher's
+// fail-CLOSED retain-previous semantic (see internal/dynamicdeny);
+// this method never re-parses, just consumes the watcher's already-
+// validated snapshot.
+func (s *Server) effectiveDenyRules() ([]DenyHostRule, int) {
+	if s.dynamicDeny == nil {
+		return s.denyHosts, 0
+	}
+	snap := s.dynamicDeny.Snapshot()
+	if snap == nil || len(snap.Rules) == 0 {
+		return s.denyHosts, 0
+	}
+	// Build dynamic rules from the snapshot. Bad globs are skipped (a
+	// future hardening pass could route these into the parse_error
+	// admin-action channel; for #324d the loader already validates
+	// the YAML shape — bad globs at the matcher layer would surface
+	// only if an operator wrote `*.foo.*.bar` and the loader chose
+	// not to reject it. Today the loader is shape-only; reject the
+	// rule here so a single bad glob doesn't take down the proxy.
+	out := make([]DenyHostRule, 0, len(s.denyHosts)+len(snap.Rules))
+	out = append(out, s.denyHosts...)
+	dynCount := 0
+	for _, rule := range snap.Rules {
+		for _, glob := range rule.Targets {
+			compiled, err := ParseDynamicDenyHost(glob, rule.ID)
+			if err != nil {
+				continue
+			}
+			out = append(out, compiled)
+			dynCount++
+		}
+	}
+	return out, dynCount
 }
 
 // record builds + persists an OCSF event for the request/response

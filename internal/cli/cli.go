@@ -28,6 +28,7 @@ import (
 
 	"github.com/trsreagan3/gbounce/internal/audit"
 	"github.com/trsreagan3/gbounce/internal/caveats"
+	"github.com/trsreagan3/gbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/gbounce/internal/mitm"
 	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/proxy"
@@ -188,6 +189,14 @@ func newRunCmd() *cobra.Command {
 		// parse-time rejection rules.
 		denyHosts     []string
 		denyHostsFile string
+		// #324d — dynamic-deny YAML path. Operator override of the
+		// default `~/.iam-jit/dynamic-denies.yaml`. Empty string falls
+		// back to the default. Per [[cross-product-agent-parity]] the
+		// flag shape is identical on the other Bounce products. When
+		// the file is absent at startup the watcher waits for it to
+		// appear — startup is NOT an error condition.
+		dynamicDeniesPath    string
+		disableDynamicDenies bool
 		// #317 — cloud-neutral S3-compatible NDJSON object-storage
 		// sink. All fields OFF by default. Per [[self-host-zero-
 		// billing-dependency]] the bucket is operator-owned. Per
@@ -469,6 +478,40 @@ so liveness probes never touch the proxy data path.`,
 				}
 			}
 
+			// #324d — dynamic-deny watcher. Constructed BEFORE
+			// proxy.NewServer so the watcher's initial in-memory
+			// snapshot is the one the proxy sees on its first request.
+			// Default path is `~/.iam-jit/dynamic-denies.yaml`; the
+			// `--dynamic-denies-path PATH` flag overrides; the
+			// `--disable-dynamic-denies` flag turns the channel off
+			// entirely (the watcher goroutine never starts; matcher
+			// returns the pre-#324d static-only result).
+			var ddWatcher *dynamicdeny.Watcher
+			var ddBannerLine string
+			if !disableDynamicDenies {
+				ddPath := dynamicDeniesPath
+				if ddPath == "" {
+					ddPath = dynamicdeny.ResolveDefaultPath()
+				}
+				if ddPath != "" {
+					// emitFunc is wired AFTER NewServer below so we can
+					// reference the Server's counter-bump methods +
+					// audit-log sink. For now construct with nil; the
+					// post-NewServer step reassigns.
+					w, loadErr := dynamicdeny.NewWatcher(ddPath, nil)
+					if loadErr != nil {
+						// The watcher object is still returned so the
+						// banner reports "0 rules (parse error)"; the
+						// watcher goroutine won't start until Start() is
+						// called, but its snapshot is already empty.
+						fmt.Fprintf(cmd.ErrOrStderr(),
+							"gbounce: dynamic-denies: initial load of %q failed: %v\n",
+							ddPath, loadErr)
+					}
+					ddWatcher = w
+				}
+			}
+
 			cfg := proxy.Config{
 				Host:                   host,
 				Port:                   port,
@@ -485,11 +528,68 @@ so liveness probes never touch the proxy data path.`,
 				MITMRules:              mitmRules,
 				MITMAuditIncludeBodies: auditLogIncludeBodies,
 				DenyHosts:              denyHostsMerged,
+				DynamicDenyWatcher:     ddWatcher,
 			}
 			srv, err := proxy.NewServer(cfg, st, lw, sr)
 			if err != nil {
 				return err
 			}
+			// #324d — wire the watcher's emit callback now that the
+			// Server exists. Each reload bumps the matching counter +
+			// tees an OCSF admin-action event into the audit log so a
+			// SIEM dashboard sees activity.
+			if ddWatcher != nil {
+				ddWatcher.SetStderr(cmd.ErrOrStderr())
+				logCh := lw
+				emit := func(reason dynamicdeny.ReloadReason, rs *dynamicdeny.RuleSet, parseErr error) {
+					switch reason {
+					case dynamicdeny.ReasonParseError:
+						srv.BumpDynamicDenyParseError()
+					default:
+						srv.BumpDynamicDenyReload()
+					}
+					action := audit.AdminActionDynamicDenyReloaded
+					if reason == dynamicdeny.ReasonParseError {
+						action = audit.AdminActionDynamicDenyParseError
+					}
+					extra := map[string]any{
+						"dynamic_deny_reload_reason": string(reason),
+					}
+					if rs != nil {
+						extra["dynamic_denies_count"] = len(rs.Rules)
+						extra["dynamic_denies_path"] = rs.SourcePath
+					}
+					if parseErr != nil {
+						extra["dynamic_deny_parse_error"] = parseErr.Error()
+					}
+					audit.EmitAdminAction(ctx, logCh, audit.AdminActionInput{
+						Action:     action,
+						Source:     audit.AdminActionSourceCLI,
+						EntityKind: "dynamic_denies_file",
+						EntityName: ddWatcher.Path(),
+						ExtraExt:   extra,
+					})
+				}
+				ddWatcher.SetStderr(cmd.ErrOrStderr())
+				// Reassign the emit callback by reconstructing — the
+				// Watcher struct only exposes SetStderr; constructor
+				// took nil. Use the unexported field swap via the
+				// dedicated helper to keep the API minimal.
+				ddWatcher.SetEmitFunc(emit)
+				if startErr := ddWatcher.Start(ctx); startErr != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"gbounce: dynamic-denies: watcher failed to start: %v\n", startErr)
+				}
+				snap := ddWatcher.Snapshot()
+				ruleCount := 0
+				if snap != nil {
+					ruleCount = len(snap.Rules)
+				}
+				ddBannerLine = fmt.Sprintf(
+					"dynamic-denies: %d rules loaded from %s (%d applied to gbounce; watching for changes)",
+					ruleCount, ddWatcher.Path(), ruleCount)
+			}
+			_ = ddBannerLine
 			// #317 — cloud-neutral S3-compat NDJSON object-storage sink.
 			// Default OFF; only constructed when --audit-object-storage-
 			// bucket is set. Start() probes the bucket (HeadBucket) so
@@ -542,6 +642,13 @@ so liveness probes never touch the proxy data path.`,
 				"gbounce listening on %s (mgmt %s); upstream=%q allow_connect=%v audit_log=%q\n",
 				srv.Addr(), srv.MgmtAddr(),
 				upstreamURL, allowConnect, auditLogPath)
+			// #324d — dynamic-deny banner. One line per [[cross-product-
+			// agent-parity]]; identical shape on the other Bounce
+			// products. Quiet when --disable-dynamic-denies or when the
+			// path can't be resolved (Watcher is nil).
+			if ddBannerLine != "" {
+				fmt.Fprintln(cmd.OutOrStdout(), ddBannerLine)
+			}
 			// #254 — preset-derivation banner sits AFTER the standard
 			// startup line so the operator immediately sees which
 			// settings came from the preset (vs. their own flags / env).
@@ -644,6 +751,31 @@ so liveness probes never touch the proxy data path.`,
 			"same YAML-list shape the future profile-mode YAML will use "+
 			"(top-level `deny_hosts:` key + `- entry` lines). Union with "+
 			"any `--deny-host` flags.")
+	// #324d — dynamic-deny YAML path. Default ~/.iam-jit/dynamic-denies.yaml
+	// (resolved via os.UserHomeDir; honors IAM_JIT_DYNAMIC_DENIES_PATH
+	// env var). Per [[cross-product-agent-parity]] the flag name +
+	// default is identical on the other Bounce products. When the file
+	// is absent at startup the watcher waits for it to appear — startup
+	// is NOT an error condition (an operator who hasn't installed any
+	// dynamic denies still wants the proxy to start cleanly).
+	cmd.Flags().StringVar(&dynamicDeniesPath, "dynamic-denies-path", "",
+		"#324d — path to the dynamic-deny YAML file. Default "+
+			"~/.iam-jit/dynamic-denies.yaml (honors "+
+			"$IAM_JIT_DYNAMIC_DENIES_PATH). The file is watched via "+
+			"fsnotify (fsevents on macOS, inotify on Linux); rules apply "+
+			"to gbounce immediately on file change. Rules that don't "+
+			"target gbounce (per the rule's `applied_to` list) are "+
+			"silently skipped — a single shared file fans out across the "+
+			"Bounce suite. POST /admin/dynamic-denies/reload on the mgmt "+
+			"port triggers an immediate reload for cross-bouncer fan-out "+
+			"orchestration (#324e). Parse errors retain the previous "+
+			"in-memory snapshot + emit an admin-action OCSF event.")
+	cmd.Flags().BoolVar(&disableDynamicDenies, "disable-dynamic-denies", false,
+		"#324d — turn the dynamic-deny watcher off entirely. The proxy "+
+			"falls back to the pre-#324d static-only `--deny-host` / "+
+			"`--deny-hosts-file` shape. Useful for environments where "+
+			"the operator hasn't installed the cross-product CLI yet + "+
+			"the watcher's stat()ing of an absent file is undesirable.")
 	cmd.Flags().StringVar(&recordSessionsDir, "record-sessions-dir", "",
 		"#285 — per-session NDJSON recording directory. When set, every "+
 			"audit event is also written to {dir}/{agent.session_id}.ndjson "+

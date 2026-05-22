@@ -64,6 +64,13 @@ import (
 // DenyHostRule is one compiled deny-list entry. The Raw field is the
 // operator-written form (kept so the deny_reason audit event reports
 // what the operator actually wrote, not a normalized internal shape).
+//
+// #324d — Source + DynamicDenyRuleID distinguish static
+// (`--deny-host` / `--deny-hosts-file`) entries from dynamic entries
+// pulled from `~/.iam-jit/dynamic-denies.yaml`. The match-time audit
+// event surfaces both fields so a SIEM analyst can answer "which
+// dynamic-deny rule fired?" + "did the static deny do its job today?"
+// without grepping the config file.
 type DenyHostRule struct {
 	// Raw is the operator-written entry (preserved for the audit
 	// `deny_reason` field so SIEM rules can pivot on the EXACT string
@@ -79,7 +86,24 @@ type DenyHostRule struct {
 	// isWildcard is true for wildcard rules (`*.example.com`), false
 	// for exact rules.
 	isWildcard bool
+	// Source is "static" for `--deny-host` + `--deny-hosts-file`
+	// entries, "dynamic" for entries loaded from the dynamic-denies
+	// YAML file. Empty defaults to "static" so the pre-#324d call
+	// sites stay legal.
+	Source string
+	// DynamicDenyRuleID is the originating rule id (`dd_<ULID>`) for
+	// dynamic entries. Empty for static entries. Surfaces in the deny
+	// audit event under `ext.dynamic_deny_rule_id`.
+	DynamicDenyRuleID string
 }
+
+// DenySourceStatic + DenySourceDynamic are the canonical Source enum
+// values surfaced on the deny audit event under
+// `ext.deny_source`. Operators query SIEMs for these strings.
+const (
+	DenySourceStatic  = "static"
+	DenySourceDynamic = "dynamic"
+)
 
 // String returns the operator-written entry. Implements fmt.Stringer
 // so a deny rule renders cleanly in error messages + the deny_reason
@@ -187,6 +211,10 @@ func validateHostLiteral(s string) error {
 // the first error keeps startup behavior deterministic (the operator
 // fixes one entry at a time rather than guessing which of many
 // reported errors they need to fix first).
+//
+// All produced rules carry Source="static" — the #314 static-deny
+// shape. Callers that build dynamic rules (#324d) use
+// ParseDynamicDenyHost to set Source + DynamicDenyRuleID.
 func ParseDenyHosts(raws []string) ([]DenyHostRule, error) {
 	if len(raws) == 0 {
 		return nil, nil
@@ -203,9 +231,27 @@ func ParseDenyHosts(raws []string) ([]DenyHostRule, error) {
 		if err != nil {
 			return nil, err
 		}
+		rule.Source = DenySourceStatic
 		out = append(out, rule)
 	}
 	return out, nil
+}
+
+// ParseDynamicDenyHost compiles a single operator-written entry whose
+// source is the dynamic-denies YAML (#324d). Mirrors ParseDenyHost
+// shape; the produced rule carries Source="dynamic" + the originating
+// rule id so the deny audit event can surface both. A parse error is
+// returned with the same shape as ParseDenyHost — callers in #324d
+// drop the offending rule + emit a `dynamic_deny.parse_error`
+// admin-action event.
+func ParseDynamicDenyHost(raw, ruleID string) (DenyHostRule, error) {
+	r, err := ParseDenyHost(raw)
+	if err != nil {
+		return DenyHostRule{}, err
+	}
+	r.Source = DenySourceDynamic
+	r.DynamicDenyRuleID = ruleID
+	return r, nil
 }
 
 // Match returns the matching DenyHostRule for the given host (case-

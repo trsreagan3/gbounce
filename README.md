@@ -329,6 +329,62 @@ without grepping the audit log.
 A host in both deny + allow is denied (safer-by-default; an operator
 who wrote a deny rule meant it). G-Slice 2 ships the allow side.
 
+### Dynamic deny rules (#324d — cross-product hot-reload)
+
+Static `--deny-host` flags are great for stable operator-set rules.
+For **incident-time deny ergonomics** ("Claude, make sure nothing
+touches prod for 3h"), gbounce also consumes
+`~/.iam-jit/dynamic-denies.yaml` — a cross-product file shared with
+ibounce, kbouncer, and dbounce. Rules in the file are hot-reloaded on
+disk change (fsevents on macOS, inotify on Linux); rules whose
+`applied_to` list does NOT include `gbounce` are silently skipped, so
+ONE file fans out across the Bounce suite without operators picking
+which proxy to call.
+
+```sh
+# Optional override; default is ~/.iam-jit/dynamic-denies.yaml.
+gbounce run --allow-connect --port 8080 \
+            --dynamic-denies-path ~/.iam-jit/dynamic-denies.yaml
+```
+
+Startup banner reports the loaded count:
+
+```
+dynamic-denies: 2 rules loaded from ~/.iam-jit/dynamic-denies.yaml (2 applied to gbounce; watching for changes)
+```
+
+On match: the verdict OCSF event carries
+`unmapped.iam_jit.ext.deny_source="dynamic"` +
+`unmapped.iam_jit.ext.dynamic_deny_rule_id="dd_..."` so a SIEM
+distinguishes static from dynamic + names the originating rule.
+
+`POST /admin/dynamic-denies/reload` on the mgmt port triggers an
+immediate reload from disk — useful for the cross-bouncer fan-out
+CLI (#324e), which writes the YAML then POSTs each Bounce product's
+mgmt port to confirm rules are live.
+
+The canonical cross-product design lives at
+[`iam-roles/docs/DYNAMIC-DENY-RULES.md`](https://github.com/trsreagan3/iam-jit/blob/main/docs/DYNAMIC-DENY-RULES.md);
+the on-disk schema at
+[`iam-roles/docs/schemas/dynamic-denies-v1.json`](https://github.com/trsreagan3/iam-jit/blob/main/docs/schemas/dynamic-denies-v1.json).
+The headline operator-facing CLI (`iam-jit deny add | list | remove |
+show`) lands in #324e; this slice (#324d) ships the gbounce
+consumer + manual / agent-driven YAML editing works today.
+
+Honest caveats:
+
+- **The watcher is bypassable.** Per `[[ibounce-honest-positioning]]`:
+  an operator who controls the agent's network can route around
+  gbounce. The dynamic-deny rules add ergonomics + audit-trail
+  visibility; the defense-in-depth half (recommender embedding the
+  same denies as explicit `Deny` statements on JIT-issued roles)
+  ships in #324f.
+- **Fail-CLOSED on parse error.** A YAML typo retains the previous
+  in-memory snapshot — gbounce does NOT silently fall back to "0
+  rules applied" when an operator's file fails to validate. The
+  failure surfaces in `/healthz` (`total_dynamic_deny_parse_errors`)
+  + as a `dynamic_deny.parse_error` admin-action OCSF event.
+
 ### Security-team observation preset
 
 ```sh

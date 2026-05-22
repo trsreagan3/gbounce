@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/trsreagan3/gbounce/internal/audit"
+	"github.com/trsreagan3/gbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/gbounce/internal/store"
 )
 
@@ -335,6 +336,297 @@ func TestDenyHosts_CLIAndProfileMerge(t *testing.T) {
 		if got != http.StatusForbidden {
 			t.Errorf("CONNECT %s through merged deny list → %d; want 403", host, got)
 		}
+	}
+}
+
+// startDenyHostsProxyWithDynamic is the #324d variant of
+// startDenyHostsProxy — also wires a dynamicdeny.Watcher backed by the
+// given on-disk YAML path so the matcher consults BOTH the static
+// rule list + the dynamic file. Mirrors the existing proxy harness
+// shape exactly so the new tests read like the older ones.
+func startDenyHostsProxyWithDynamic(t *testing.T, denyHosts []string, ddPath string) (proxyAddr, logPath string, st *store.Store, healthURL string, w *dynamicdeny.Watcher) {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	st = s
+	t.Cleanup(func() { _ = s.Close() })
+
+	logPath = filepath.Join(dir, "audit.jsonl")
+	lw, err := audit.NewLogWriter(context.Background(), audit.LogWriterOptions{Path: logPath, Fsync: true})
+	if err != nil {
+		t.Fatalf("NewLogWriter: %v", err)
+	}
+	t.Cleanup(func() { lw.Close() })
+
+	dw, err := dynamicdeny.NewWatcher(ddPath, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	dw.SetDebouncePeriod(20 * time.Millisecond)
+	w = dw
+	if err := dw.Start(context.Background()); err != nil {
+		t.Fatalf("watcher.Start: %v", err)
+	}
+	t.Cleanup(func() { dw.Stop() })
+
+	cfg := Config{
+		Host:                  "127.0.0.1",
+		Port:                  0,
+		MgmtHost:              "127.0.0.1",
+		MgmtPort:              0,
+		AllowConnect:          true,
+		ForwardTimeoutSeconds: 2,
+		DenyHosts:             denyHosts,
+		DynamicDenyWatcher:    dw,
+	}
+	srv, err := NewServer(cfg, s, lw, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	proxyL, _ := net.Listen("tcp", "127.0.0.1:0")
+	mgmtL, _ := net.Listen("tcp", "127.0.0.1:0")
+	srv.SetAddrs(proxyL.Addr().String(), mgmtL.Addr().String())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = srv.ServeListeners(ctx, proxyL, mgmtL) }()
+	t.Cleanup(func() {
+		cancel()
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	healthURL = "http://" + mgmtL.Addr().String() + "/healthz"
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(healthURL)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return proxyL.Addr().String(), logPath, st, healthURL, w
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("proxy never became healthy")
+	return
+}
+
+const ddTestRuleID = "dd_01HZ8VKJ6Y2BJTPVZ3PNX97A2C"
+
+// writeDynamicDeniesYAML writes the canonical single-rule shape with
+// the given rule id + target into the given path. 0o600 perms match
+// the cross-product file-on-disk requirement.
+func writeDynamicDeniesYAML(t *testing.T, path, ruleID, target string) {
+	t.Helper()
+	body := strings.Join([]string{
+		`schema_version: "1.0"`,
+		`denies:`,
+		`  - id: ` + ruleID,
+		`    targets: ["` + target + `"]`,
+		`    reason: "test deny"`,
+		`    duration: "1h"`,
+		`    added_by: "tester@local"`,
+		`    added_at: "` + time.Now().UTC().Format(time.RFC3339) + `"`,
+		`    applied_to: [gbounce]`,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+func TestDenyHosts_StaticAndDynamicUnion(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	writeDynamicDeniesYAML(t, ddPath, ddTestRuleID, "*.anthropic.com")
+
+	// Static rule from CLI flags; dynamic rule from the YAML.
+	proxyAddr, _, _, _, _ := startDenyHostsProxyWithDynamic(t,
+		[]string{"static-only.example.com"}, ddPath)
+
+	// Static rule still fires.
+	if got := connectThroughProxy(t, proxyAddr, "static-only.example.com:443"); got != http.StatusForbidden {
+		t.Errorf("static rule CONNECT static-only.example.com → %d; want 403", got)
+	}
+	// Dynamic rule fires.
+	if got := connectThroughProxy(t, proxyAddr, "api.anthropic.com:443"); got != http.StatusForbidden {
+		t.Errorf("dynamic rule CONNECT api.anthropic.com → %d; want 403", got)
+	}
+}
+
+func TestDenyHosts_DynamicMatchEmitsRuleId(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	writeDynamicDeniesYAML(t, ddPath, ddTestRuleID, "*.anthropic.com")
+
+	proxyAddr, logPath, _, _, _ := startDenyHostsProxyWithDynamic(t, nil, ddPath)
+	if got := connectThroughProxy(t, proxyAddr, "api.anthropic.com:443"); got != http.StatusForbidden {
+		t.Fatalf("CONNECT api.anthropic.com → %d; want 403", got)
+	}
+
+	// Read the JSONL audit log + find the most recent DENY event.
+	time.Sleep(120 * time.Millisecond)
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open audit log: %v", err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var events []audit.Event
+	for sc.Scan() {
+		var ev audit.Event
+		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		events = append(events, ev)
+	}
+	if len(events) == 0 {
+		t.Fatal("no audit events")
+	}
+	// Find the first DENY event.
+	var denyEv *audit.Event
+	for i := range events {
+		if events[i].Unmapped.IAMJIT.Verdict == "DENY" {
+			denyEv = &events[i]
+			break
+		}
+	}
+	if denyEv == nil {
+		t.Fatal("no DENY event")
+	}
+	ext := denyEv.Unmapped.IAMJIT.Ext
+	source, _ := ext["deny_source"].(string)
+	if source != "dynamic" {
+		t.Errorf("ext.deny_source = %q; want dynamic", source)
+	}
+	ruleID, _ := ext["dynamic_deny_rule_id"].(string)
+	if ruleID != ddTestRuleID {
+		t.Errorf("ext.dynamic_deny_rule_id = %q; want %q", ruleID, ddTestRuleID)
+	}
+}
+
+func TestDenyHosts_AuditDistinguishesSource(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	writeDynamicDeniesYAML(t, ddPath, ddTestRuleID, "*.anthropic.com")
+
+	proxyAddr, logPath, _, _, _ := startDenyHostsProxyWithDynamic(t,
+		[]string{"static.example.com"}, ddPath)
+
+	// Static deny.
+	if got := connectThroughProxy(t, proxyAddr, "static.example.com:443"); got != http.StatusForbidden {
+		t.Fatalf("static CONNECT → %d; want 403", got)
+	}
+	// Dynamic deny.
+	if got := connectThroughProxy(t, proxyAddr, "api.anthropic.com:443"); got != http.StatusForbidden {
+		t.Fatalf("dynamic CONNECT → %d; want 403", got)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open audit log: %v", err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var sources []string
+	for sc.Scan() {
+		var ev audit.Event
+		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if ev.Unmapped.IAMJIT.Verdict != "DENY" {
+			continue
+		}
+		src, _ := ev.Unmapped.IAMJIT.Ext["deny_source"].(string)
+		sources = append(sources, src)
+	}
+	if len(sources) != 2 {
+		t.Fatalf("DENY count = %d; want 2", len(sources))
+	}
+	// Order: first call was static, second was dynamic.
+	if sources[0] != "static" || sources[1] != "dynamic" {
+		t.Errorf("deny_source ordering = %v; want [static, dynamic]", sources)
+	}
+}
+
+func TestDenyHosts_ReloadEndpointAddsRule(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	// Start with the file ABSENT — watcher waits for it.
+	proxyAddr, _, _, healthURL, _ := startDenyHostsProxyWithDynamic(t, nil, ddPath)
+
+	// Pre-write: CONNECT to api.openai.com should NOT be 403 (no rule
+	// matches yet).
+	if got := connectThroughProxy(t, proxyAddr, "api.openai.com:443"); got == http.StatusForbidden {
+		t.Errorf("pre-rule CONNECT → 403; want NOT 403")
+	}
+
+	// Write the YAML; either the fsnotify watcher catches it OR we
+	// trigger the reload endpoint manually.
+	writeDynamicDeniesYAML(t, ddPath, ddTestRuleID, "*.openai.com")
+
+	// Hit the reload endpoint directly to force the matcher to pick
+	// up the new file regardless of fsnotify timing.
+	mgmtAddr := strings.TrimPrefix(strings.TrimSuffix(healthURL, "/healthz"), "http://")
+	reloadURL := "http://" + mgmtAddr + "/admin/dynamic-denies/reload"
+	resp, err := http.Post(reloadURL, "application/json", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("POST reload: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("reload status = %d; want 200", resp.StatusCode)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	if reloaded, _ := body["reloaded"].(bool); !reloaded {
+		t.Errorf("body[reloaded] = %v; want true", body["reloaded"])
+	}
+	if applied, _ := body["rules_applied_to_gbounce"].(float64); applied != 1 {
+		t.Errorf("body[rules_applied_to_gbounce] = %v; want 1", body["rules_applied_to_gbounce"])
+	}
+
+	// Now CONNECT should 403.
+	if got := connectThroughProxy(t, proxyAddr, "api.openai.com:443"); got != http.StatusForbidden {
+		t.Errorf("post-reload CONNECT api.openai.com → %d; want 403", got)
+	}
+}
+
+func TestDenyHosts_HealthzSurfacesDynamicCounters(t *testing.T) {
+	dir := t.TempDir()
+	ddPath := filepath.Join(dir, "dd.yaml")
+	writeDynamicDeniesYAML(t, ddPath, ddTestRuleID, "*.anthropic.com")
+
+	proxyAddr, _, _, healthURL, _ := startDenyHostsProxyWithDynamic(t, nil, ddPath)
+
+	resp, _ := http.Get(healthURL)
+	var body map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	_ = resp.Body.Close()
+	if enabled, _ := body["dynamic_denies_enabled"].(bool); !enabled {
+		t.Errorf("dynamic_denies_enabled = %v; want true", body["dynamic_denies_enabled"])
+	}
+	if count, _ := body["dynamic_denies_count"].(float64); count != 1 {
+		t.Errorf("dynamic_denies_count = %v; want 1", body["dynamic_denies_count"])
+	}
+	if path, _ := body["dynamic_denies_path"].(string); path != ddPath {
+		t.Errorf("dynamic_denies_path = %q; want %q", path, ddPath)
+	}
+
+	// Trigger a dynamic deny.
+	_ = connectThroughProxy(t, proxyAddr, "api.anthropic.com:443")
+	time.Sleep(80 * time.Millisecond)
+
+	resp, _ = http.Get(healthURL)
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	_ = resp.Body.Close()
+	if matches, _ := body["total_dynamic_deny_matches"].(float64); matches != 1 {
+		t.Errorf("total_dynamic_deny_matches = %v; want 1", body["total_dynamic_deny_matches"])
 	}
 }
 

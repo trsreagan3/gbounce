@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **#324d — dynamic-deny YAML watcher + matcher extension + mgmt-port reload endpoint** (2026-05-22) —
+  gbounce now consumes the cross-product
+  `~/.iam-jit/dynamic-denies.yaml` file. The on-disk shape + cross-bouncer
+  resolver semantics live in the canonical design doc at
+  `iam-roles/docs/DYNAMIC-DENY-RULES.md`; the JSON Schema lives at
+  `iam-roles/docs/schemas/dynamic-denies-v1.json`. This slice ships the
+  gbounce consumer (#324d only — sibling slices #324a-c cover ibounce
+  + kbouncer + dbounce; #324e ships the unified CLI + MCP fan-out;
+  #324f embeds the same denies into JIT-issued roles).
+
+  Surface:
+
+  - New package `internal/dynamicdeny` — loader + watcher. The loader
+    validates the YAML against the v1.0 schema shape (rule-id pattern,
+    duration grammar, applied-to bouncer enum, duplicate-id rejection,
+    product-magic discriminator) + filters down to rules whose
+    `applied_to` list includes `"gbounce"`. Per
+    `[[ibounce-honest-positioning]]` the loader rejects malformed YAML
+    rather than silently dropping rules.
+  - fsnotify-driven watcher (`fsevents` on macOS, `inotify` on Linux).
+    Watches the parent directory so atomic-rename writes (`write-tmp
+    + rename onto live path`) are caught. Rapid sequential writes are
+    coalesced with a 100ms debounce quiet-period; the final reload
+    fires only after writes settle.
+  - Parse errors on reload RETAIN the previous in-memory snapshot
+    (fail-CLOSED per `[[ibounce-honest-positioning]]`) + emit a
+    `dynamic_deny.parse_error` admin-action OCSF event so a SIEM
+    surfaces the bad-file event without an operator having to grep.
+  - The proxy's `/internal/proxy/deny_hosts.go` matcher unions static
+    `--deny-host` entries with the watcher's dynamic entries. Each
+    compiled rule carries a `Source` field (`"static"` or `"dynamic"`)
+    + a `DynamicDenyRuleID` field; the deny audit event surfaces both
+    under `unmapped.iam_jit.ext.deny_source` +
+    `unmapped.iam_jit.ext.dynamic_deny_rule_id` so an analyst can
+    pivot on either.
+  - `/healthz` now reports `dynamic_denies_enabled`,
+    `dynamic_denies_count`, `dynamic_denies_globs_count`,
+    `dynamic_denies_path`, `total_dynamic_deny_matches`,
+    `total_dynamic_deny_reloads`, and
+    `total_dynamic_deny_parse_errors`. Counter naming mirrors the
+    existing `total_deny_host_matches` shape.
+  - New flag `gbounce run --dynamic-denies-path PATH` (default
+    `~/.iam-jit/dynamic-denies.yaml`, also honors
+    `$IAM_JIT_DYNAMIC_DENIES_PATH`). Companion flag
+    `--disable-dynamic-denies` turns the channel off for operators who
+    haven't installed the cross-product CLI yet.
+  - Startup banner emits one line per `[[cross-product-agent-parity]]`:
+    `dynamic-denies: N rules loaded from PATH (M applied to gbounce;
+    watching for changes)`.
+  - New endpoint `POST /admin/dynamic-denies/reload` on the mgmt port
+    (8769 default). Triggers an immediate reload from disk + returns
+    `{"reloaded":true,"rules_count":N,"rules_applied_to_gbounce":M,
+    "path":"..."}`. Parse errors return 422 with the structured
+    error. Useful for the cross-bouncer fan-out CLI (#324e), which
+    will write the YAML then POST to each Bounce product's mgmt port
+    to confirm the rules are live.
+  - When matched, dynamic-deny rules emit the SAME OCSF wire shape as
+    static deny_hosts matches — the verdict event carries the extra
+    `deny_source` + `dynamic_deny_rule_id` fields per the canonical
+    design doc's "emitted as part of the verdict OCSF event (NOT
+    separately)" note.
+  - New admin-action constants `audit.AdminActionDynamicDenyReloaded`
+    + `audit.AdminActionDynamicDenyParseError`. The CLI wires an
+    emit-callback on the watcher that tees a `dynamic_deny.reloaded`
+    OR `dynamic_deny.parse_error` admin-action event with
+    `unmapped.iam_jit.ext.dynamic_deny_reload_reason ∈ {file_created,
+    file_modified, file_removed, reload_requested, parse_error}` per
+    the canonical design doc.
+
+  Tests:
+
+  - `internal/dynamicdeny/loader_test.go` — 13 tests covering
+    `LoadsValidYAML`, `LoadFile_MissingFileIsNotAnError`, schema
+    violations (missing `schema_version`, bad rule id, bad duration,
+    unknown bouncer name, duplicate rule id, wrong product magic),
+    filter behavior (`FiltersNonGbounceTargets` — ARN-only + k8s-only
+    rules skipped; URL + RDS-endpoint rules kept), expired-rule
+    filter, and the JSON / YAML round-trip shape.
+  - `internal/dynamicdeny/watcher_test.go` — 6 tests covering
+    `DetectsFileCreation`, `DetectsFileModification`,
+    `DebouncesRapidWrites`, `RetainsRulesOnParseError`, `ReloadNow`
+    (mgmt-port reload semantics), and the empty-path no-op shape.
+  - `internal/proxy/deny_hosts_test.go` — 5 new tests covering
+    `StaticAndDynamicUnion` (both rule kinds fire),
+    `DynamicMatchEmitsRuleId` (OCSF ext fields), `AuditDistinguishesSource`
+    (static + dynamic land with distinct `deny_source`),
+    `ReloadEndpointAddsRule` (POST /admin/dynamic-denies/reload
+    end-to-end), and `HealthzSurfacesDynamicCounters` (every new
+    /healthz field is populated).
+  - 24 new tests total; existing #314 + #305 + #303 deny-hosts
+    regression suite continues to pass unchanged.
+
+  New runtime dependency: `github.com/fsnotify/fsnotify v1.7.0` (one
+  module — already a transitive dep of common Go ecosystem packages;
+  same library kbouncer + dbounce will adopt for their #324b + #324c
+  slices per `[[cross-product-agent-parity]]`).
+
+  Per `[[creates-never-mutates]]`: this slice is additive — when the
+  watcher is disabled (no path configured, file absent, or
+  `--disable-dynamic-denies` set) the proxy's matcher behavior is
+  byte-identical to the pre-#324d shape. Existing static
+  `--deny-host` + `--deny-hosts-file` operators see zero change.
+
+  Per `[[scorer-is-ground-truth]]`: deny always wins; static and
+  dynamic entries are evaluated against the same match grammar
+  (`*.example.com` semantics match the existing #314 wildcard
+  shape). Per `[[deliberate-feature-completion]]`: this slice
+  complete = loader + watcher + matcher extension + tests +
+  mgmt-port endpoint + CHANGELOG + README link.
+
+  See `iam-roles/docs/DYNAMIC-DENY-RULES.md` for the cross-bouncer
+  design + `iam-roles/docs/tasks/324-dynamic-deny-rules.md` for the
+  per-slice tracking.
+
 ### Changed
 
 - **§A21 / [[discovery-first-default]] — gbounce is the discovery-first reference; no code change** (2026-05-22) —
