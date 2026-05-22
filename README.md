@@ -106,11 +106,14 @@ single upstream service don't want a wide-open tunnel.
   HTTP method classification (GET→Read, POST→Create, PUT/PATCH→Update,
   DELETE→Delete). HTTP semantics are inherently loose; downstream
   tooling can re-classify from the raw `method` + `path` fields.
-- **TLS passthrough only** in G-Slice 1. MITM with a local CA is a
-  potential future option but is explicitly out of scope for the
-  initial release.
-- **No request body inspection.** Bodies stream through; only metadata
-  is recorded.
+- **TLS passthrough by default.** Optional MITM mode (`--mode mitm`)
+  ships v1.0 with `gbounce ca install` + a local CA you add to your
+  OS trust store. MITM gives URL paths, methods, and body-redacted
+  audit visibility at the cost of breaking cert-pinning SDKs. See
+  [docs/MITM-MODE.md](docs/MITM-MODE.md) for the honest trade-offs.
+- **No request body inspection by default.** Bodies stream through;
+  only metadata is recorded. In MITM mode bodies are run through the
+  credential-shape redactor before any audit field is built.
 
 ## Install
 
@@ -177,6 +180,51 @@ gbounce run --allow-connect --port 8080
 
 (G-Slice 1 ships discovery mode only. Both shapes observe + audit; no
 filtering / enforcement yet — that ships in G-Slice 2.)
+
+### Mode C — MITM (`--mode mitm`) — #315 / §A13 (OPT-IN)
+
+When compliance or incident-response needs URL-level visibility into
+HTTPS traffic, gbounce can terminate the TLS tunnel using a locally-
+generated CA + re-encrypt to the real upstream.
+
+```sh
+# One-time: generate the CA + add it to your OS trust store.
+gbounce ca install
+
+# Start the proxy in MITM mode.
+gbounce run --mode mitm --port 8080 \
+            --audit-log-path ~/.gbounce/audit.jsonl
+
+# Point the agent at the proxy.
+export HTTPS_PROXY=http://127.0.0.1:8080
+export HTTP_PROXY=http://127.0.0.1:8080
+export NO_PROXY=localhost,127.0.0.1
+```
+
+What you get in the audit log under `unmapped.iam_jit.ext`:
+
+- `url_path` — the actual path the agent hit (e.g. `/v1/chat/completions`).
+- `request_method` — the HTTP verb.
+- `request_body_redacted` — true when the body was redacted
+  (default-on). Body bytes are NOT stored unless you pass
+  `--audit-log-include-bodies`; even then, credentials are
+  redacted before storage.
+- `url_query` — the query string, with credential-shape params
+  (`secret`, `api_key`, `token`, …) replaced by the sentinel
+  `***REDACTED-CREDENTIAL***`.
+- `response_status` — the upstream's HTTP status.
+
+Honest trade-offs (per `[[ibounce-honest-positioning]]`):
+
+- Cert-pinning SDKs (most modern AWS SDKs, banking SDKs, some
+  mobile SDKs) WILL break. Flip those clients back to
+  `--mode discovery --allow-connect`.
+- The CA install step adds friction. Locked-down corporate
+  laptops may forbid adding a custom CA at all.
+- Latency overhead: ~5-15% per call (cold cache); <1 ms on hot
+  cache (per-host leaf certs are cached LRU-bounded at 1024).
+
+Full reference: [docs/MITM-MODE.md](docs/MITM-MODE.md).
 
 ### Homebrew
 

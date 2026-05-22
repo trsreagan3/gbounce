@@ -440,6 +440,7 @@ so liveness probes never touch the proxy data path.`,
 			for _, line := range caveats.BannerLines(caveats.Trigger{
 				DiscoveryMode: cfg.Mode == proxy.ModeDiscovery,
 				AllowConnect:  allowConnect,
+				MITMMode:      cfg.Mode == proxy.ModeMITM,
 			}) {
 				fmt.Fprintln(cmd.OutOrStdout(), line)
 			}

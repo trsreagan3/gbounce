@@ -74,14 +74,20 @@ var All = []Entry{
 		ID:     "B8",
 		Anchor: "b8-gbounce---allow-connect-only-sees-hostport-design",
 		BannerLine: "  caveat: HTTPS CONNECT tunnels show host:port only " +
-			"(no MITM); see KNOWN-CAVEATS §B8",
-		DoctorBlurb: "HTTPS through gbounce shows `CONNECT host:443` only. " +
-			"The TLS tunnel is spliced blindly (no MITM), so URL paths + " +
-			"request bodies are NOT visible in the audit log. This is the " +
-			"deliberate honest-positioning trade-off per " +
-			"[[ibounce-honest-positioning]] — more privacy + deployability " +
-			"at the cost of URL-level audit visibility. For URL-level " +
-			"visibility on plain HTTP, use `--upstream` rewrite mode.",
+			"(no MITM); see KNOWN-CAVEATS §B8. " +
+			"Run `gbounce ca install` + `gbounce run --mode mitm` (#315) " +
+			"to opt into URL-level visibility.",
+		DoctorBlurb: "HTTPS through gbounce shows `CONNECT host:443` only " +
+			"in the default discovery mode. The TLS tunnel is spliced " +
+			"blindly (no MITM), so URL paths + request bodies are NOT " +
+			"visible in the audit log. This is the deliberate honest-" +
+			"positioning trade-off per [[ibounce-honest-positioning]] " +
+			"— more privacy + deployability at the cost of URL-level " +
+			"audit visibility. For URL-level visibility, opt INTO MITM " +
+			"mode (#315 / §A13): run `gbounce ca install` to generate " +
+			"a local CA, add it to your OS trust store, then start the " +
+			"proxy with `--mode mitm`. Cert-pinning SDKs will break " +
+			"under MITM — flip those back to discovery mode.",
 	},
 	{
 		ID:     "B9",
@@ -164,6 +170,10 @@ type Trigger struct {
 	// AllowConnect is true when `--allow-connect` is set. Triggers B8
 	// (HTTPS CONNECT visibility limit).
 	AllowConnect bool
+	// #315 / §A13 — MITMMode is true when `--mode mitm` is set.
+	// Triggers the MITM-mode honest-positioning banner (cert-pinning
+	// SDKs break + bodies are redacted by default).
+	MITMMode bool
 }
 
 // BannerLines returns the per-line banner output for the matched
@@ -181,6 +191,13 @@ func BannerLines(t Trigger) []string {
 		if e := ByID("B9"); e != nil && e.BannerLine != "" {
 			out = append(out, e.BannerLine)
 		}
+	}
+	if t.MITMMode {
+		out = append(out,
+			"  #315 / §A13 — MITM mode is ACTIVE: TLS intercepted via the local CA, "+
+				"bodies redacted by default. Cert-pinning SDKs (some AWS SDKs, banking "+
+				"SDKs, mobile SDKs) WILL break; flip those clients back to "+
+				"`--mode discovery --allow-connect`. See docs/MITM-MODE.md.")
 	}
 	return out
 }

@@ -762,3 +762,177 @@ func TestProxy_DNSFailureCONNECTLogged(t *testing.T) {
 		t.Errorf("dst_endpoint = %+v; want bad hostname captured", ev.DstEndpoint)
 	}
 }
+
+// TestProxy_AgentHeadersThreadedIntoOCSF is the #308 happy-path
+// regression: an inbound request that carries X-Agent-Session-Id +
+// X-Agent-Name MUST surface those values under
+// unmapped.iam_jit.agent.{name,session_id} in the resulting OCSF
+// event so cross-bouncer audit queries (`iam-jit audit query
+// --filter unmapped.iam_jit.agent.session_id=...`) resolve gbounce
+// events the same way they resolve ibounce/kbounce/dbounce events.
+// Per [[agent-identity-in-audit]] (#266) every Bounce product
+// carries the identical agent block shape.
+func TestProxy_AgentHeadersThreadedIntoOCSF(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	proxyURL, _, _, logPath := startTestProxy(t, upstream, true, false)
+	req, _ := http.NewRequest("GET", proxyURL+"/v1/users/42", nil)
+	const wantSession = "01ABCDEFGHIJKLMNOPQRSTUVWX"
+	const wantAgent = "claude-code"
+	req.Header.Set("X-Agent-Session-Id", wantSession)
+	req.Header.Set("X-Agent-Name", wantAgent)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	time.Sleep(150 * time.Millisecond)
+	events := readAuditEvents(t, logPath)
+	if len(events) == 0 {
+		t.Fatal("audit log empty")
+	}
+	ev := events[0]
+	if ev.Unmapped.IAMJIT.Agent == nil {
+		t.Fatalf("unmapped.iam_jit.agent missing; want populated block")
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.Name; got != wantAgent {
+		t.Errorf("agent.name = %q; want %q", got, wantAgent)
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.SessionID; got != wantSession {
+		t.Errorf("agent.session_id = %q; want %q", got, wantSession)
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.DetectedFrom; got != audit.DetectionSourceHTTPHeader {
+		t.Errorf("agent.detected_from = %q; want %q", got, audit.DetectionSourceHTTPHeader)
+	}
+	// The legacy flat ext keys also stay populated so the
+	// per-session NDJSON recorder (#285) routes events unchanged.
+	if got, _ := ev.Unmapped.IAMJIT.Ext[audit.AgentSessionIDExtKey].(string); got != wantSession {
+		t.Errorf("ext.%s = %q; want %q (recorder uses this key)",
+			audit.AgentSessionIDExtKey, got, wantSession)
+	}
+}
+
+// TestProxy_NoAgentHeadersGracefulFallback is the #308 fallback
+// regression: a request with NO X-Agent-* headers (raw curl / a
+// script that doesn't know about the attribution convention) MUST
+// still emit a populated agent block — name="anonymous",
+// session_id="" (omitted by the JSON encoder), detected_from=
+// "unknown". This makes "unattributed traffic" a first-class
+// filterable signal rather than an absence the operator has to grep
+// for missing fields to find. Per
+// [[security-team-positioning-safety-not-surveillance]] we never
+// fabricate a name; "anonymous" is the honest sentinel.
+func TestProxy_NoAgentHeadersGracefulFallback(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	proxyURL, _, _, logPath := startTestProxy(t, upstream, true, false)
+	resp, err := http.Get(proxyURL + "/v1/anon")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	time.Sleep(150 * time.Millisecond)
+	events := readAuditEvents(t, logPath)
+	if len(events) == 0 {
+		t.Fatal("audit log empty")
+	}
+	ev := events[0]
+	if ev.Unmapped.IAMJIT.Agent == nil {
+		t.Fatalf("unmapped.iam_jit.agent should be populated even on anonymous traffic")
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.Name; got != audit.AgentNameAnonymous {
+		t.Errorf("agent.name = %q; want %q", got, audit.AgentNameAnonymous)
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.SessionID; got != "" {
+		t.Errorf("agent.session_id = %q; want empty (no header → no fabrication)", got)
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.DetectedFrom; got != audit.DetectionSourceUnknown {
+		t.Errorf("agent.detected_from = %q; want %q", got, audit.DetectionSourceUnknown)
+	}
+	// Recorder-keyed flat ext fields stay absent — the session recorder
+	// drops events without a valid session_id (`raw curl` has none).
+	if _, ok := ev.Unmapped.IAMJIT.Ext[audit.AgentSessionIDExtKey]; ok {
+		t.Errorf("ext.%s should be absent on anonymous traffic", audit.AgentSessionIDExtKey)
+	}
+}
+
+// TestProxy_InvalidAgentHeaders_Rejected is the #308 hardening
+// regression: a request that sets X-Agent-Session-Id or X-Agent-Name
+// to a value that fails validation (shell-injection chars, control
+// characters, > max length) MUST be audited as anonymous (the
+// invalid value is NOT stamped into the OCSF event) AND the
+// rejection MUST surface via /healthz's
+// total_agent_headers_rejected counter so an operator debugging
+// drift sees the bad header. Per [[creates-never-mutates]] the
+// request itself is NOT rejected at the proxy layer — gbounce is a
+// transparent observer; it audits + records but doesn't drop the
+// request on a bad attribution header alone.
+func TestProxy_InvalidAgentHeaders_Rejected(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	proxyURL, healthURL, _, logPath := startTestProxy(t, upstream, true, false)
+	req, _ := http.NewRequest("GET", proxyURL+"/v1/inject", nil)
+	// Shell-injection payload: backticks + dollar-sign + newline. Per
+	// the documented validation rules (alphanumeric + dot + underscore
+	// + dash; max 64 chars) every one of these gets rejected.
+	req.Header.Set("X-Agent-Session-Id", "abc`whoami`")
+	req.Header.Set("X-Agent-Name", "evil; rm -rf /")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("upstream status = %d; the bad header MUST NOT block the request itself", resp.StatusCode)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	events := readAuditEvents(t, logPath)
+	if len(events) == 0 {
+		t.Fatal("audit log empty")
+	}
+	ev := events[0]
+	if ev.Unmapped.IAMJIT.Agent == nil {
+		t.Fatal("unmapped.iam_jit.agent should still be populated")
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.Name; got != audit.AgentNameAnonymous {
+		t.Errorf("agent.name = %q; want %q (invalid header → anonymous, never the injected value)",
+			got, audit.AgentNameAnonymous)
+	}
+	if got := ev.Unmapped.IAMJIT.Agent.SessionID; got != "" {
+		t.Errorf("agent.session_id = %q; want empty (invalid header → omitted, never the injected value)", got)
+	}
+	// Spot check the injected payload never made it into the ext map either.
+	for k, v := range ev.Unmapped.IAMJIT.Ext {
+		if s, ok := v.(string); ok && (strings.Contains(s, "whoami") || strings.Contains(s, "rm -rf")) {
+			t.Errorf("ext[%s] = %q; injected payload leaked into the audit event", k, s)
+		}
+	}
+
+	// /healthz surfaces the rejection counter.
+	hresp, err := http.Get(healthURL)
+	if err != nil {
+		t.Fatalf("healthz Get: %v", err)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(hresp.Body).Decode(&body)
+	_ = hresp.Body.Close()
+	rejected, ok := body["total_agent_headers_rejected"].(float64)
+	if !ok {
+		t.Fatalf("/healthz body missing total_agent_headers_rejected: %#v", body)
+	}
+	if rejected < 2 {
+		t.Errorf("total_agent_headers_rejected = %v; want >= 2 (one per bad header on the single request)", rejected)
+	}
+}
