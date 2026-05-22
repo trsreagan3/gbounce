@@ -958,3 +958,79 @@ func TestProxy_InvalidAgentHeaders_Rejected(t *testing.T) {
 		t.Errorf("total_agent_headers_rejected = %v; want >= 2 (one per bad header on the single request)", rejected)
 	}
 }
+
+// TestAgentHeaderRejection_320_StructuredBreadcrumb is the §A18
+// regression guard: when an inbound X-Agent-* header fails
+// validation the audit event MUST carry a structured
+// `agent_header_rejection` breadcrumb under
+// unmapped.iam_jit.ext with the bounded enum reason + the rejected
+// value's length (never the raw value itself). Pre-§A18 the only
+// breadcrumb was the §A17 string `agent_rejected_reason` which
+// lumped charset + length failures together — SOC analysts couldn't
+// distinguish "agent SDK shell-injection-shaped payload" from
+// "agent picked overly-verbose canonical name."
+func TestAgentHeaderRejection_320_StructuredBreadcrumb(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	proxyURL, _, _, logPath := startTestProxy(t, upstream, true, false)
+	req, _ := http.NewRequest("GET", proxyURL+"/v1/inject", nil)
+	// Charset failure on name (shell chars); length failure on session id (>128).
+	req.Header.Set("X-Agent-Name", "evil; rm -rf /")
+	req.Header.Set("X-Agent-Session-Id", strings.Repeat("a", 200))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	time.Sleep(150 * time.Millisecond)
+	events := readAuditEvents(t, logPath)
+	if len(events) == 0 {
+		t.Fatal("audit log empty")
+	}
+	ev := events[0]
+	raw, ok := ev.Unmapped.IAMJIT.Ext["agent_header_rejection"]
+	if !ok {
+		t.Fatal("ext.agent_header_rejection missing — §A18 regression: structured breadcrumb must land alongside the §A17 string")
+	}
+	// Both failed → expect a list of breadcrumbs.
+	bs, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("ext.agent_header_rejection = %T; want []any (both headers failed)", raw)
+	}
+	if len(bs) != 2 {
+		t.Fatalf("got %d breadcrumbs; want 2", len(bs))
+	}
+	fields := map[string]bool{}
+	for _, b := range bs {
+		m, ok := b.(map[string]any)
+		if !ok {
+			t.Fatalf("breadcrumb entry %T not a map", b)
+		}
+		field, _ := m["field"].(string)
+		reason, _ := m["reason"].(string)
+		length, _ := m["value_redacted_length"].(float64)
+		if length == 0 {
+			t.Errorf("breadcrumb %v: value_redacted_length missing or zero", m)
+		}
+		for _, v := range m {
+			s, _ := v.(string)
+			if strings.Contains(s, "whoami") || strings.Contains(s, "rm -rf") {
+				t.Errorf("breadcrumb leaked raw value: %v", m)
+			}
+		}
+		fields[field] = true
+		switch reason {
+		case "invalid_name_charset", "invalid_name_length",
+			"invalid_session_id_format", "invalid_session_id_length":
+		default:
+			t.Errorf("breadcrumb reason %q not in bounded enum", reason)
+		}
+	}
+	if !fields["X-Agent-Name"] || !fields["X-Agent-Session-Id"] {
+		t.Errorf("expected breadcrumbs for both headers; got %v", fields)
+	}
+}

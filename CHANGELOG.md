@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **#320 / §A18 — `audit.BuildAgentHeaderRejectionBreadcrumb` helper + structured rejection breadcrumb test** (2026-05-22) —
+  closes the build-gap left by the #319 / §A17 / F-308-1 commit
+  (the proxy.go call sites referenced
+  `audit.BuildAgentHeaderRejectionBreadcrumb` +
+  `audit.AgentNameField` + `audit.AgentSessionIDField` +
+  `audit.ClassifyAgentNameRejection` +
+  `audit.ClassifyAgentSessionIDRejection` but the helper file was
+  never committed). Lands `internal/audit/agent_header_rejection.go`
+  with the cross-product bounded enum (`invalid_name_charset` /
+  `invalid_name_length` / `invalid_session_id_format` /
+  `invalid_session_id_length` / dbounce-only
+  `application_name_unparseable`) + the breadcrumb-build helper.
+  Per `[[cross-product-agent-parity]]` the constants + classifier
+  match dbounce's + kbouncer's + ibounce's byte-for-byte. New
+  regression test
+  `TestAgentHeaderRejection_320_StructuredBreadcrumb` in
+  `internal/proxy/proxy_test.go` exercises both-headers-rejected
+  shape (list of breadcrumbs) + asserts the raw value never leaks.
+
 - **#298 — Bounce-suite link page at `GET /suite`** (2026-05-22) —
   ships the cross-product deployment-status landing page hosted on
   `gbounce`'s mgmt port (8769 by default). Per
