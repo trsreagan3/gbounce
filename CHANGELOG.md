@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **#298 — Bounce-suite link page at `GET /suite`** (2026-05-22) —
+  ships the cross-product deployment-status landing page hosted on
+  `gbounce`'s mgmt port (8769 by default). Per
+  `[[unified-ui-link-page]]` this is signage + status pills, NOT an
+  aggregator: each card is just an anchor to that bouncer's own
+  mgmt-port UI, with a pill computed from a client-side parallel
+  `/healthz` fetch every 5 s.
+  - No backend aggregator service; no CORS plumbing; vanilla JS
+    (no React/Vue/Svelte) embedded as a Go string constant for
+    auditability + bundle-freeness.
+  - Default mgmt-port wiring (ibounce 8767, kbouncer 8766,
+    dbounce 8768, gbounce 8769) baked into the page; operator
+    overrides land in `localStorage` under the
+    `bounce.suite.ports` key via a "configure ports" modal.
+  - Footer carries the cross-bouncer investigation CLI
+    (`iam-jit audit query --filter agent.session_id=<UUID>`) with
+    a one-click copy button.
+  - Honest positioning per `[[ibounce-honest-positioning]]`: copy
+    says "navigate to your bouncers" — NEVER "single pane of
+    glass." Title is "Bounce suite - deployment status" per
+    `[[security-team-positioning-safety-not-surveillance]]`.
+  - Bouncers stay autonomous per
+    `[[four-products-one-brand]]`: the suite page works even when
+    half the deployment is unreachable (those cards show gray
+    "unreachable" pills; the page itself never depends on any
+    bouncer being up).
+  - New `internal/proxy/suite_handler.go` +
+    `internal/proxy/suite_handler_test.go`; cross-repo integration
+    test at iam-roles `tests/integration/test_suite_page.py`
+    (Playwright-optional, skips gracefully).
+
 - **#317 / §A15 — cloud-neutral S3-compatible NDJSON object-storage sink** (2026-05-22) —
   closes the headline cloud-neutrality gap surfaced by founder
   direction 2026-05-22: bouncers other than ibounce are

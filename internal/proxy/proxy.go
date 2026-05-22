@@ -346,6 +346,15 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 	// in parallel against each reachable bouncer to produce a single
 	// merged stream.
 	mgmtMux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken))
+	// #298 — GET /suite serves the cross-product Bounce-suite link
+	// page. Per [[unified-ui-link-page]] this is signage + status
+	// pills, not an aggregator. Each card is just an anchor to the
+	// matching bouncer's own mgmt-port UI; client-side JS does
+	// parallel /healthz polling for the pills. No backend coupling.
+	// Registered BEFORE the "/" catch-all so ServeMux's longest-prefix
+	// match routes /suite here instead of the live audit UI's
+	// 404-on-non-root path.
+	mgmtMux.HandleFunc("/suite", suiteUIHandler())
 	// #272 — GET / serves the minimal live audit-stream web UI on
 	// the same mgmt port as /healthz + /audit/events. The page polls
 	// /audit/events every 2 s. Same auth model as /audit/events:

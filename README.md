@@ -394,6 +394,54 @@ ship the same flag set + grammar.
 The same OCSF shape is emitted by every product in the Bounce suite,
 so a SIEM ingest auto-categorizes the events without per-product glue.
 
+## Suite dashboard
+
+When you run more than one Bounce product on the same host, `gbounce`
+serves a cross-product link page at `http://127.0.0.1:8769/suite`. It
+shows a status pill per bouncer (healthy / degraded / critical /
+unreachable) and an "open ui" anchor to each bouncer's own mgmt-port
+UI.
+
+The page is intentionally a **link page**, not a single-pane-of-glass
+aggregator. Per [`[[unified-ui-link-page]]`](https://github.com/trsreagan3/iam-roles/blob/main/docs/DESIGN-DECISIONS.md):
+
+- Each bouncer's own UI keeps the full operator experience (filters,
+  live audit tail, modal config).
+- Status pills are the only synthesis — generated client-side by
+  parallel fetch of each bouncer's `/healthz` every 5 s.
+- Bouncers stay autonomous; the suite page works even when half the
+  deployment is unreachable (those cards just show gray pills).
+- No backend aggregator service. No CORS plumbing. Vanilla JS, no
+  framework, embedded as a Go string constant — auditable + bundle-
+  free.
+
+### Default port wiring
+
+| Product   | Default mgmt port |
+|-----------|-------------------|
+| ibounce   | 8767              |
+| kbouncer  | 8766              |
+| dbounce   | 8768              |
+| gbounce   | 8769              |
+
+### Operator port overrides
+
+If you ran a bouncer on a non-default port (e.g. behind a port
+collision), click "configure ports" on the page and enter the
+overrides. They land in `localStorage` under the key
+`bounce.suite.ports` — no server-side state.
+
+### Footer: cross-bouncer investigation
+
+The footer carries the one-shot CLI for tracing an agent's session
+across every bouncer it touched:
+
+```sh
+iam-jit audit query --filter agent.session_id=<UUID>
+```
+
+One-click copy ships with the page.
+
 ## License
 
 Apache-2.0.
