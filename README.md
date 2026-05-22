@@ -185,6 +185,15 @@ gbounce run --upstream https://api.target.com \
 Point Fluent Bit / Vector / logrotate at the file. gbounce does not
 rotate the file itself.
 
+For the full "where do my audit logs go in production" decision tree
+(JSONL / webhook + presets / Security Lake / Lambda → S3 / GCP / Azure
+/ CI runners / Enterprise fan-out) see the cross-product runbook in
+the iam-roles repo:
+[docs/PRODUCTION-LOG-STORAGE.md](https://github.com/trsreagan3/iam-roles/blob/main/docs/PRODUCTION-LOG-STORAGE.md).
+gbounce's webhook + Security Lake export channels ship in G-Slice 6
+(post-launch); in G-Slice 1 use JSONL + Vector / Fluent Bit as
+described above.
+
 ### Security-team observation preset
 
 ```sh
