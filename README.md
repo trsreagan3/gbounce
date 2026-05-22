@@ -138,6 +138,22 @@ relay them, so off-loopback binds are an opt-in choice.)
 go install github.com/trsreagan3/gbounce/cmd/gbounce@latest
 ```
 
+### After upgrade: `gbounce profile doctor` (cross-product parity)
+
+For cross-product CLI parity with ibounce / kbouncer / dbounce,
+gbounce ships `gbounce profile doctor`. v1.0 reports "current"
+(gbounce doesn't manage a profiles.yaml — rules are explicit-file
+via `--profile-rules-file`); G-Slice 2 will populate the catalog
+when gbounce gains a YAML profiles surface. Run it after any upgrade
+to confirm the no-op posture:
+
+```sh
+gbounce profile doctor          # v1.0: reports current + Notes line
+```
+
+See [docs/PROFILE-UPGRADE.md](../iam-roles/docs/PROFILE-UPGRADE.md)
+for the full cross-product runbook (task #321 / KNOWN-CAVEATS §A19).
+
 ## First run
 
 `gbounce run` refuses to start unless you pick one of two modes; the

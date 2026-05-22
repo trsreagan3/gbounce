@@ -112,6 +112,11 @@ func newRootCmd() *cobra.Command {
 	// (ibounce / kbounce / dbounce); the cross-product runbook at
 	// iam-roles/docs/LOG-RETENTION.md applies to all.
 	root.AddCommand(newLogsCmd())
+	// #321 / §A19 — `gbounce profile doctor` for cross-product CLI
+	// parity. v1.0: reports current (no shipped defaults). G-Slice 2
+	// will populate the catalog when gbounce gains a YAML profiles
+	// surface. Per [[cross-product-agent-parity]].
+	root.AddCommand(newProfileCmd())
 	return root
 }
 

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **#321 / §A19 — `gbounce profile doctor` cross-product CLI parity** (2026-05-22) —
+  Surfaces the `<product> profile doctor` subcommand on gbounce per
+  [[cross-product-agent-parity]] so orchestrators can run it against
+  any Bounce product uniformly. gbounce v1.0 doesn't ship a default
+  profiles.yaml — profile rules are explicit-file via
+  `--profile-rules-file` (JSON) or `--deny-host` / `--deny-hosts-file`
+  (newline / YAML list) — so the doctor reports "current" + a Notes
+  line explaining the architectural difference. G-Slice 2 will
+  populate the catalog when gbounce gains a YAML profiles surface;
+  this slice wires the SURFACE so older installs surface missing
+  safety floors the same way dbounce / kbouncer / ibounce do today.
+  New files: `internal/profile/doctor.go`, `internal/profile/doctor_test.go`,
+  `internal/cli/profile.go`. Same `--apply` / `--acknowledge` /
+  `--check` / `--json` / `--diff` flag shape as siblings — all no-op
+  in v1.0 but contract-stable for v1.1. 5 regression tests cover the
+  no-op posture + the architectural-honesty Notes line.
+
 - **#320 / §A18 — `audit.BuildAgentHeaderRejectionBreadcrumb` helper + structured rejection breadcrumb test** (2026-05-22) —
   closes the build-gap left by the #319 / §A17 / F-308-1 commit
   (the proxy.go call sites referenced
