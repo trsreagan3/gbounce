@@ -204,7 +204,14 @@ type Server struct {
 	// inside Record so disk failures never propagate the proxy hot
 	// path; same shape as the kbouncer + dbounce wiring.
 	recorder *audit.SessionRecorder
-	httpSrv  *http.Server
+	// #317 — optional cloud-neutral S3-compat NDJSON object-storage
+	// writer. Nil disables the channel. When wired, every audit
+	// event is also buffered + finalized into the operator-owned
+	// bucket per the Hive-partitioned NDJSON.gz layout. Per
+	// [[self-host-zero-billing-dependency]] the destination is
+	// operator-owned; iam-jit-the-company never receives the data.
+	objectStorage *audit.ObjectStorageWriter
+	httpSrv       *http.Server
 	mgmtSrv  *http.Server
 	// upstreamURL is the parsed cfg.UpstreamURL, kept as *url.URL so
 	// each request avoids re-parsing.
@@ -357,6 +364,16 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 }
 
 // Addr returns the proxy's bind address.
+// SetObjectStorageWriter installs the #317 cloud-neutral S3-compat
+// NDJSON object-storage writer. Pass nil to clear. The writer must
+// already be Start()-ed before installation so the first event's
+// buffer doesn't no-op. Goes through this method instead of being
+// a constructor arg to keep NewServer's signature stable across
+// product slices.
+func (s *Server) SetObjectStorageWriter(w *audit.ObjectStorageWriter) {
+	s.objectStorage = w
+}
+
 func (s *Server) Addr() string { return s.httpSrv.Addr }
 
 // MgmtAddr returns the management server's bind address.
@@ -858,11 +875,42 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 	rawAgentName := r.Header.Get("X-Agent-Name")
 	agentSessionIDValidated := ""
 	agentNameValidated := ""
+	// #319 / §A17 (F-308-1) — record which header tripped validation so
+	// the audit event surfaces an `unmapped.iam_jit.agent.rejected_reason`
+	// breadcrumb. Without this an operator who sees "anonymous" rows can't
+	// tell whether the client never sent a header or sent an invalid one;
+	// the /healthz counter `total_agent_headers_rejected` was the only
+	// existing signal, which is too coarse for "which agent's collector is
+	// misconfigured?" investigation. Reasons are bounded enum strings
+	// (NEVER include the raw header value here — that lives only in the
+	// truncated-stderr line emitted by logAgentHeaderRejected so a
+	// malicious agent can't fill the audit log with junk).
+	//
+	// #320 / §A18 ADDITIVE upgrade: the §A17 string lumped charset +
+	// length failures together — SOC analysts couldn't distinguish
+	// "agent SDK sending shell-injection-shaped payloads" from
+	// "agent picked an overly-verbose canonical name." The new
+	// `agent_header_rejection` breadcrumb splits these into a bounded
+	// enum (invalid_name_charset / invalid_name_length /
+	// invalid_session_id_format / invalid_session_id_length) AND
+	// records the rejected value's LENGTH (never the value itself)
+	// for safe forensics. Same shape across all four Bounce products
+	// per [[cross-product-agent-parity]]. The §A17 string stays for
+	// backward compat — additive per [[creates-never-mutates]].
+	var agentRejectedReasons []string
+	var agentRejectionBreadcrumbs []map[string]any
 	if rawSessionID != "" {
 		if audit.IsValidSessionID(rawSessionID) {
 			agentSessionIDValidated = rawSessionID
 		} else {
 			s.logAgentHeaderRejected("X-Agent-Session-Id", rawSessionID)
+			agentRejectedReasons = append(agentRejectedReasons, "session_id:invalid_charset_or_length")
+			agentRejectionBreadcrumbs = append(agentRejectionBreadcrumbs,
+				audit.BuildAgentHeaderRejectionBreadcrumb(
+					audit.AgentSessionIDField,
+					audit.ClassifyAgentSessionIDRejection(rawSessionID),
+					len(rawSessionID),
+				))
 		}
 	}
 	if rawAgentName != "" {
@@ -870,6 +918,13 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 			agentNameValidated = rawAgentName
 		} else {
 			s.logAgentHeaderRejected("X-Agent-Name", rawAgentName)
+			agentRejectedReasons = append(agentRejectedReasons, "agent_name:invalid_charset_or_length")
+			agentRejectionBreadcrumbs = append(agentRejectionBreadcrumbs,
+				audit.BuildAgentHeaderRejectionBreadcrumb(
+					audit.AgentNameField,
+					audit.ClassifyAgentNameRejection(rawAgentName),
+					len(rawAgentName),
+				))
 		}
 	}
 	row := store.DecisionRow{
@@ -916,6 +971,46 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 		// emits the canonical `unmapped.iam_jit.agent.{name,session_id,
 		// detected_from}` block + the legacy flat ext keys the
 		// SessionRecorder reads stay correct.
+		// #319 / §A17 (F-308-1) — merge agent-header rejection reasons
+		// into the OCSF ExtraExt map so they land at
+		// `unmapped.iam_jit.agent.rejected_reason` for SIEM query.
+		extraExt := ov.ExtraExt
+		if len(agentRejectedReasons) > 0 {
+			if extraExt == nil {
+				extraExt = map[string]any{}
+			}
+			// Reuse the existing reason if the caller already set one
+			// (defensive — no current caller does, but keep additive
+			// behavior so a future caller can attach extra context).
+			if existing, ok := extraExt["agent_rejected_reason"]; ok {
+				extraExt["agent_rejected_reason"] = fmt.Sprintf(
+					"%v;%s", existing, strings.Join(agentRejectedReasons, ";"))
+			} else {
+				extraExt["agent_rejected_reason"] = strings.Join(agentRejectedReasons, ";")
+			}
+		}
+		// #320 / §A18: structured rejection breadcrumb under the same
+		// ExtraExt map. Lands at `unmapped.iam_jit.ext.agent_header_rejection`
+		// — single map when one header failed, list of maps when both
+		// failed. Per [[cross-product-agent-parity]] the shape is the
+		// same in ibounce / kbouncer / dbounce.
+		if len(agentRejectionBreadcrumbs) > 0 {
+			if extraExt == nil {
+				extraExt = map[string]any{}
+			}
+			if len(agentRejectionBreadcrumbs) == 1 {
+				extraExt["agent_header_rejection"] = agentRejectionBreadcrumbs[0]
+			} else {
+				// Convert to []any for the OCSF wire shape (the Ext map's
+				// type is map[string]any; nested untyped slices serialize
+				// cleanly to JSON arrays).
+				bs := make([]any, 0, len(agentRejectionBreadcrumbs))
+				for _, b := range agentRejectionBreadcrumbs {
+					bs = append(bs, b)
+				}
+				extraExt["agent_header_rejection"] = bs
+			}
+		}
 		ev := audit.FromRequest(audit.RequestInput{
 			At:                 row.At,
 			DecisionID:         decisionID,
@@ -935,7 +1030,7 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 			Verdict:            row.Verdict,
 			ActivityIDOverride: ov.ActivityID,
 			StatusIDOverride:   ov.StatusID,
-			ExtraExt:           ov.ExtraExt,
+			ExtraExt:           extraExt,
 		})
 		if s.log != nil {
 			_ = s.log.Write(r.Context(), ev)
@@ -946,6 +1041,13 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 		// recording dir can't stall the proxy).
 		if s.recorder != nil {
 			s.recorder.Record(ev)
+		}
+		// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
+		// Synchronous in-memory append; the background rotator handles
+		// finalize uploads. Fail-soft so an unreachable bucket never
+		// blocks the proxy hot path.
+		if s.objectStorage != nil {
+			s.objectStorage.Write(r.Context(), ev)
 		}
 	}
 }

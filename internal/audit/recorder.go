@@ -55,6 +55,20 @@ var sessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func IsValidSessionID(s string) bool { return sessionIDRe.MatchString(s) }
 
+// agentNameRe matches the canonical X-Agent-Name validation rule shared
+// across the four Bounce products (gbounce / kbounce / dbounce /
+// ibounce) per [[cross-product-agent-parity]]. The 1-64 char window +
+// `[A-Za-z0-9._-]` charset is the cross-product covenant; sibling
+// implementations (kbouncer/internal/audit/agent_context.go,
+// dbounce/internal/audit/agent_context.go, ibounce's
+// `is_valid_agent_name`) assert the exact same shape.
+var agentNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// IsValidAgentName returns true when s matches the canonical
+// X-Agent-Name validation rule. Empty strings return false so callers
+// can shortcut on the empty-header case without a second check.
+func IsValidAgentName(s string) bool { return agentNameRe.MatchString(s) }
+
 // ExtractSessionID pulls the agent.session_id out of an Event. For
 // gbounce we read from `unmapped.iam_jit.ext[agent_session_id]`
 // (see the package doc comment for the migration plan to a dedicated

@@ -9,6 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **#317 / §A15 — cloud-neutral S3-compatible NDJSON object-storage sink** (2026-05-22) —
+  closes the headline cloud-neutrality gap surfaced by founder
+  direction 2026-05-22: bouncers other than ibounce are
+  cloud-neutral; the AWS-only Security Lake adapter (#258) alone
+  doesn't serve operators on GCS / Azure Blob / MinIO / R2 / B2 /
+  DigitalOcean Spaces. gbounce ships the new sink alongside the
+  existing JSONL audit-log path per [[creates-never-mutates]]
+  (additive composition).
+  - `gbounce run --audit-object-storage-endpoint URL
+    --audit-object-storage-bucket NAME
+    --audit-object-storage-prefix PREFIX
+    --audit-object-storage-region REGION
+    --audit-object-storage-credentials-file PATH
+    --audit-object-storage-rotation-minutes N
+    --audit-object-storage-max-size-mb N
+    --audit-object-storage-instance-id ID` — generic S3-compat
+    sink. Per [[cross-product-agent-parity]] the flag shape is
+    identical on ibounce + kbouncer + dbounce.
+  - New package symbols: `audit.ObjectStorageWriter` +
+    `audit.ObjectStorageCredentials` +
+    `audit.LoadObjectStorageCredentials` +
+    `audit.NewObjectStorageWriter` +
+    `audit.ObjectStorageStatus` +
+    `audit.ObjectStorageDefaultRotationMinutes` +
+    `audit.ObjectStorageDefaultMaxSizeMB` +
+    `audit.ObjectStorageDefaultRegion` +
+    `audit.ErrObjectStorageNoCredentials` +
+    `audit.ErrObjectStorageBucketUnreachable`.
+  - Output layout: NDJSON (one OCSF event per line),
+    gzip-compressed, Hive-partitioned at
+    `{prefix}/year=YYYY/month=MM/day=DD/hour=HH/gbounce-{instance_id}-{timestamp}.jsonl.gz`.
+    Athena / BigQuery / Spark / Trino auto-discover the partitions;
+    SIEM collectors `LIST + GET` against the prefix.
+  - Additive `proxy.Server.SetObjectStorageWriter()` method; the
+    three audit-emit sites (`proxy.go:record`,
+    `mitm_handler.go:recordMITMRequest`,
+    `mitm_handler.go:recordMITMDeny`,
+    `mitm_handler.go:recordMITMHandshakeFailure`) fan events to the
+    writer alongside the existing `log` (JSONL) + `recorder` (NDJSON
+    per-session) channels.
+  - Per [[self-host-zero-billing-dependency]]: destination is
+    operator-owned (operator creates the bucket; gbounce never
+    creates buckets). Per [[don't-tailor-to-lighthouse]]: generic
+    S3-compat (AWS S3 native + GCS interop + Azure Blob S3-compat
+    layer + MinIO + R2 + B2 + DigitalOcean Spaces).
+  - Adds the `github.com/aws/aws-sdk-go-v2` + `service/s3` +
+    `config` + `credentials` + `aws` + `service/sts` packages to
+    gbounce's dependency graph. Previously gbounce had no AWS SDK
+    dependency; the new sink is the first AWS-SDK-dependent
+    feature. Per [[deliberate-feature-completion]] kept narrow to
+    just the four packages the writer needs.
+
+  **Regression tests:** `internal/audit/object_storage_test.go` —
+  19 tests cover defaults, credentials resolution (env + YAML +
+  INI), partition path format, construction refusal, write/flush
+  happy path, status surface, size-cap synchronous flush,
+  drop-on-buffer-full, write-before-start no-op,
+  close-flushes-pending, put_object failure -> writes_ok=false, and
+  the rotation timer triggering a background flush.
+
+  **Task:** #317 — completed 2026-05-22.
+
+### Fixed
+
+- **#319 / §A17 — UAT findings cluster: cross-product CLI parity + doc-truth-up gaps (gbounce slice)** (2026-05-22) —
+  - **F-311-4 (HIGH)** — added `--audit-log-max-size-mb` + `--audit-log-max-age-days` + `--audit-db-retention-days` flags on `gbounce run` with matching `GBOUNCE_AUDIT_LOG_MAX_SIZE_MB` / `_MAX_AGE_DAYS` / `_DB_RETENTION_DAYS` env-var overrides. Sentinel -1 = "use audit-pkg default (LOG-RETENTION.md spec)"; 0 = "operator explicitly disabled trigger." Writer-level rotation hook deferred per the LOG-RETENTION.md parity-matrix gbounce-deferred row; the flags are accepted + surfaced via the resolved-value path so the cross-product CLI contract holds.
+  - **F-311-1 (MED)** — `gbounce logs archive` now errors loudly when the target directory contains zero audit-shaped files (filenames matching `audit*` + suffix `.jsonl{,.gz}` / `.db{,.gz}`) instead of silently producing an empty ~50-byte tar.gz. Error message names the dir + the filename pattern so the operator can fix the misconfiguration in one step.
+  - **F-311-2 (MED)** — `gbounce logs verify` now flips `OK=false` + returns a non-zero exit when `files_checked == 0`, with a stderr message naming the three likely root causes (writer never started / wrong dir / `--audit-log` pointed at a sibling path). JSON output also reflects the corrected `ok=false`. Previously a brand-new install with no audit files would report "OK" — a false positive operators would misread as "audit integrity verified."
+  - **F-304-3 (MED)** — `gbounce doctor --help` Long help now lists both `caveats` AND `logs` subcommands (the `logs` subcommand was wired + functional but only `caveats` was documented in the help text). The `RunE` error message also names both subcommands.
+  - **F-308-1 (MED)** — invalid `X-Agent-Name` / `X-Agent-Session-Id` headers now land in the audit event at `unmapped.iam_jit.ext.agent_rejected_reason` as bounded enum strings (`session_id:invalid_charset_or_length`, `agent_name:invalid_charset_or_length`, semicolon-joined when both fail). Raw header values are NEVER included — the truncated-stderr line emitted by `logAgentHeaderRejected` remains the only place the raw value surfaces, with control-char filtering. Closes the "anonymous rows on every UAT run" investigation gap.
+  - **F-308-1 prerequisite** — added the missing `audit.IsValidAgentName(s string) bool` function in `internal/audit/recorder.go` (the call sites in `proxy.go` + `mitm_handler.go` + `event.go` referenced it but the function was never committed). Regex matches the cross-product canonical `^[A-Za-z0-9._-]{1,64}$` shape so the four Bounce products' agent-name validators stay in lockstep per [[cross-product-agent-parity]].
+  - **#308 store-schema completion** — added `agent_session_id` + `agent_name` columns to the `decisions` table (schema v2, additive `ALTER TABLE ... ADD COLUMN ... DEFAULT ''` migration); plumbed through `DecisionRow` + `RecordDecision` + `scanDecisionRow`. The persisted attribution feeds the cross-bouncer `unmapped.iam_jit.agent.{name, session_id}` filter via `audit/event.go`. Required to unblock the build (the call sites referenced the columns but the schema migration was missing).
+  Regression coverage: `TestLogsArchive_EmptyDir_ErrorsLoudly`, `TestLogsVerify_EmptyDir_ReportsFailure`, `TestDoctorHelp_ListsLogsSubcommand`, `TestRunCmd_RegistersRotationFlags` (new `internal/cli/logs_test.go`) + the `TestProxy_InvalidAgentHeaders_Rejected` regression in `internal/proxy/proxy_test.go` extended with `agent_rejected_reason` ext-key + raw-value-leak assertions.
+
+### Added
+
 - **#315 / §A13 — MITM mode + CA lifecycle subcommands (pre-launch, opt-in)** (2026-05-22) —
   gbounce now ships an opt-in TLS-interception mode that gives URL-level audit visibility (path, method, redacted body snapshot, status). Default behavior is unchanged — `--mode discovery` stays the friction-free CONNECT-tunnel shape per `[[creates-never-mutates]]`. New code surface:
   - `internal/mitm/` — local CA cert generation (ECDSA P-256, 10-year life, common name `iam-jit gbounce local CA` with no operator-identifying info), per-host leaf-cert minting + LRU cache (size 1024), platform-specific OS trust-store install + uninstall instructions, key-permissions invariant (0o600; refuses to load a group/world-readable key), credential-shape header + JSON-body + query-param redactor (the secret never lands in the audit log).

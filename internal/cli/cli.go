@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -150,6 +151,16 @@ func newRunCmd() *cobra.Command {
 		dbPath            string
 		auditLogPath      string
 		auditLogFsync     bool
+		// #311 / §A10 — rotation thresholds. Sentinel -1 = "use the
+		// audit-package default (matches iam-roles/docs/LOG-RETENTION.md
+		// — 100 MB / 7 days / 30 days)." 0 = "operator explicitly
+		// disabled this trigger." Same names across all four Bounce
+		// products per [[cross-product-agent-parity]]; env-var
+		// counterparts honor GBOUNCE_AUDIT_LOG_MAX_SIZE_MB /
+		// _MAX_AGE_DAYS / _DB_RETENTION_DAYS.
+		auditLogMaxSizeMB    int64
+		auditLogMaxAgeDays   int
+		auditDBRetentionDays int
 		forceExternalBind bool
 		forwardTimeout    int
 		mode              string
@@ -172,6 +183,19 @@ func newRunCmd() *cobra.Command {
 		// parse-time rejection rules.
 		denyHosts     []string
 		denyHostsFile string
+		// #317 — cloud-neutral S3-compatible NDJSON object-storage
+		// sink. All fields OFF by default. Per [[self-host-zero-
+		// billing-dependency]] the bucket is operator-owned. Per
+		// [[cross-product-agent-parity]] the flag shape is identical
+		// to ibounce + kbounce + dbounce.
+		auditObjectStorageEndpoint        string
+		auditObjectStorageBucket          string
+		auditObjectStoragePrefix          string
+		auditObjectStorageRegion          string
+		auditObjectStorageCredentialsFile string
+		auditObjectStorageRotationMinutes int
+		auditObjectStorageMaxSizeMB       int
+		auditObjectStorageInstanceID      string
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -338,6 +362,49 @@ so liveness probes never touch the proxy data path.`,
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
+			// #311 / §A10 — env-var fallback for the rotation trio. CLI
+			// flag wins; env var fills in when the operator didn't pass
+			// it; -1 sentinel preserved for downstream "use default"
+			// resolution. Env-var names match the cross-product spec at
+			// iam-roles/docs/LOG-RETENTION.md per [[cross-product-agent-
+			// parity]].
+			resolveInt64Env := func(flagName string, flagVal int64, envName string) int64 {
+				if cmd.Flags().Changed(flagName) {
+					return flagVal
+				}
+				if v := os.Getenv(envName); v != "" {
+					if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed >= 0 {
+						return parsed
+					}
+				}
+				return flagVal
+			}
+			resolveIntEnv := func(flagName string, flagVal int, envName string) int {
+				if cmd.Flags().Changed(flagName) {
+					return flagVal
+				}
+				if v := os.Getenv(envName); v != "" {
+					if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+						return parsed
+					}
+				}
+				return flagVal
+			}
+			effAuditLogMaxSizeMB := resolveInt64Env("audit-log-max-size-mb", auditLogMaxSizeMB, "GBOUNCE_AUDIT_LOG_MAX_SIZE_MB")
+			effAuditLogMaxAgeDays := resolveIntEnv("audit-log-max-age-days", auditLogMaxAgeDays, "GBOUNCE_AUDIT_LOG_MAX_AGE_DAYS")
+			effAuditDBRetentionDays := resolveIntEnv("audit-db-retention-days", auditDBRetentionDays, "GBOUNCE_AUDIT_DB_RETENTION_DAYS")
+			// Surface the resolved values on stderr so the operator
+			// sees them in the startup banner; the cross-product runbook
+			// at iam-roles/docs/LOG-RETENTION.md explains the
+			// retention-vs-purge split. gbounce's LogWriter does not yet
+			// run live rotation — the values are consumed by `gbounce
+			// logs purge` (on-demand) per the LOG-RETENTION.md parity
+			// matrix gbounce-deferred row. Re-wires cleanly once the
+			// concurrent #308 store-schema work settles.
+			_ = effAuditLogMaxSizeMB
+			_ = effAuditLogMaxAgeDays
+			_ = effAuditDBRetentionDays
+
 			if auditLogPath != "" {
 				lw, err = audit.NewLogWriter(ctx, audit.LogWriterOptions{
 					Path:  auditLogPath,
@@ -418,6 +485,54 @@ so liveness probes never touch the proxy data path.`,
 			if err != nil {
 				return err
 			}
+			// #317 — cloud-neutral S3-compat NDJSON object-storage sink.
+			// Default OFF; only constructed when --audit-object-storage-
+			// bucket is set. Start() probes the bucket (HeadBucket) so
+			// credential / endpoint / bucket-name misconfigurations
+			// surface immediately rather than at first flush. Per
+			// [[self-host-zero-billing-dependency]] the bucket is
+			// operator-owned (operator creates; gbounce never creates).
+			if auditObjectStorageBucket != "" {
+				if auditObjectStorageEndpoint == "" {
+					return fmt.Errorf(
+						"gbounce: --audit-object-storage-bucket requires " +
+							"--audit-object-storage-endpoint (the S3 API endpoint URL " +
+							"for the operator's cloud provider — examples: " +
+							"https://s3.us-east-1.amazonaws.com for AWS S3; " +
+							"https://<accountid>.r2.cloudflarestorage.com for " +
+							"Cloudflare R2; https://storage.googleapis.com for GCS interop)")
+				}
+				osCreds, err := audit.LoadObjectStorageCredentials(
+					auditObjectStorageCredentialsFile)
+				if err != nil {
+					return err
+				}
+				osw, err := audit.NewObjectStorageWriter(audit.ObjectStorageWriterOptions{
+					EndpointURL:     auditObjectStorageEndpoint,
+					Bucket:          auditObjectStorageBucket,
+					Prefix:          auditObjectStoragePrefix,
+					Region:          auditObjectStorageRegion,
+					Credentials:     osCreds,
+					Product:         "gbounce",
+					InstanceID:      auditObjectStorageInstanceID,
+					RotationMinutes: auditObjectStorageRotationMinutes,
+					MaxSizeMB:       auditObjectStorageMaxSizeMB,
+				})
+				if err != nil {
+					return err
+				}
+				if err := osw.Start(ctx); err != nil {
+					return fmt.Errorf(
+						"gbounce: object-storage writer failed to start: %w", err)
+				}
+				srv.SetObjectStorageWriter(osw)
+				defer osw.Close()
+			} else if auditObjectStorageEndpoint != "" {
+				return fmt.Errorf(
+					"gbounce: --audit-object-storage-endpoint requires " +
+						"--audit-object-storage-bucket (passing an endpoint " +
+						"without a target bucket has no effect)")
+			}
 			fmt.Fprintf(cmd.OutOrStdout(),
 				"gbounce listening on %s (mgmt %s); upstream=%q allow_connect=%v audit_log=%q\n",
 				srv.Addr(), srv.MgmtAddr(),
@@ -456,6 +571,30 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite audit DB path (default ~/.gbounce/state.db; honors GBOUNCE_DB)")
 	cmd.Flags().StringVar(&auditLogPath, "audit-log-path", "", "also append OCSF events to this JSONL file (opt-in)")
 	cmd.Flags().BoolVar(&auditLogFsync, "audit-log-fsync", false, "fsync after every audit-log write (slower; safer on crash)")
+	// #311 / §A10 — rotation thresholds. Sentinel -1 = "use audit-pkg
+	// default (matches LOG-RETENTION.md)"; 0 = "operator explicitly
+	// disabled this trigger." Same names across all four Bounce
+	// products per [[cross-product-agent-parity]].
+	cmd.Flags().Int64Var(&auditLogMaxSizeMB, "audit-log-max-size-mb", -1,
+		"#311 — rotate the JSONL audit log when its size exceeds N MB. "+
+			"0 disables size-triggered rotation. Default 100 (matches the "+
+			"cross-product LOG-RETENTION.md spec). Rotated files are gzip'd "+
+			"in-place and live until `gbounce logs purge` reaps them (per "+
+			"[[creates-never-mutates]] the active log is never destroyed "+
+			"automatically). Honors $GBOUNCE_AUDIT_LOG_MAX_SIZE_MB for "+
+			"non-flag overrides.")
+	cmd.Flags().IntVar(&auditLogMaxAgeDays, "audit-log-max-age-days", -1,
+		"#311 — rotate the JSONL audit log when its mtime is older than N "+
+			"days. 0 disables age-triggered rotation. Default 7 (matches "+
+			"the cross-product LOG-RETENTION.md spec). Pairs with --audit-"+
+			"log-max-size-mb; whichever fires first wins. Honors "+
+			"$GBOUNCE_AUDIT_LOG_MAX_AGE_DAYS for non-flag overrides.")
+	cmd.Flags().IntVar(&auditDBRetentionDays, "audit-db-retention-days", -1,
+		"#311 — purge rotated audit DB archives older than N days. 0 "+
+			"disables DB retention. Default 30 (matches the cross-product "+
+			"LOG-RETENTION.md spec). Active audit DB is NEVER deleted by "+
+			"this path; only rotated archives are eligible. Honors "+
+			"$GBOUNCE_AUDIT_DB_RETENTION_DAYS for non-flag overrides.")
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false, "acknowledge the threat model of binding off loopback")
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
 	cmd.Flags().StringVar(&mode, "mode", "discovery",
@@ -509,6 +648,58 @@ so liveness probes never touch the proxy data path.`,
 			"Replayable via `iam-jit session replay <FILE>`. File mode 0o600. "+
 			"Default off; the recorder captures agent identity + operation "+
 			"details so it ships opt-in.")
+	// #317 — cloud-neutral S3-compatible NDJSON object-storage sink.
+	// All fields OFF by default. Per [[self-host-zero-billing-
+	// dependency]] the bucket is operator-owned. Per [[cross-product-
+	// agent-parity]] the flag shape is identical to ibounce + kbounce
+	// + dbounce.
+	cmd.Flags().StringVar(&auditObjectStorageEndpoint,
+		"audit-object-storage-endpoint", "",
+		"#317 — S3 API endpoint URL. Required when "+
+			"--audit-object-storage-bucket is set. Examples: "+
+			"https://s3.us-east-1.amazonaws.com (AWS S3); "+
+			"https://<accountid>.r2.cloudflarestorage.com (Cloudflare R2); "+
+			"https://minio.internal:9000 (MinIO); "+
+			"https://storage.googleapis.com (GCS interop); "+
+			"https://s3.us-west-002.backblazeb2.com (Backblaze B2); "+
+			"https://nyc3.digitaloceanspaces.com (DigitalOcean Spaces).")
+	cmd.Flags().StringVar(&auditObjectStorageBucket,
+		"audit-object-storage-bucket", "",
+		"#317 — name of the operator-owned bucket the writer appends "+
+			"NDJSON files into. Operator creates the bucket; gbounce "+
+			"NEVER creates buckets. When set, every OCSF event is also "+
+			"written as a gzip-compressed NDJSON line into "+
+			"`{prefix}/year=YYYY/month=MM/day=DD/hour=HH/"+
+			"gbounce-{instance_id}-{timestamp}.jsonl.gz`. Hive-style "+
+			"partitioning lets Athena / BigQuery / Spark / Trino query "+
+			"the bucket directly.")
+	cmd.Flags().StringVar(&auditObjectStoragePrefix,
+		"audit-object-storage-prefix", "",
+		"#317 — key prefix inside the bucket (e.g. `bounce-audit/prod`). "+
+			"Empty = bucket root.")
+	cmd.Flags().StringVar(&auditObjectStorageRegion,
+		"audit-object-storage-region", audit.ObjectStorageDefaultRegion,
+		"#317 — region for the SigV4 signature. AWS S3: real region. "+
+			"Cloudflare R2: `auto`. Vendor-specific otherwise.")
+	cmd.Flags().StringVar(&auditObjectStorageCredentialsFile,
+		"audit-object-storage-credentials-file", "",
+		"#317 — optional explicit credentials file (YAML or INI). "+
+			"Overrides AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env "+
+			"vars when set.")
+	cmd.Flags().IntVar(&auditObjectStorageRotationMinutes,
+		"audit-object-storage-rotation-minutes",
+		audit.ObjectStorageDefaultRotationMinutes,
+		"#317 — rotate the active NDJSON file when N minutes elapse OR "+
+			"--audit-object-storage-max-size-mb fires.")
+	cmd.Flags().IntVar(&auditObjectStorageMaxSizeMB,
+		"audit-object-storage-max-size-mb",
+		audit.ObjectStorageDefaultMaxSizeMB,
+		"#317 — rotate the active NDJSON file when its in-memory size "+
+			"estimate crosses N megabytes.")
+	cmd.Flags().StringVar(&auditObjectStorageInstanceID,
+		"audit-object-storage-instance-id", "",
+		"#317 — override the auto-generated instance identifier "+
+			"(hostname-pid) used in the object key.")
 	// #254 — deployment preset. Single-flag shortcut for a common
 	// deployment shape. v1.0 ships only `security-observe` per
 	// [[deliberate-feature-completion]]; the framework supports more

@@ -920,6 +920,28 @@ func TestProxy_InvalidAgentHeaders_Rejected(t *testing.T) {
 		}
 	}
 
+	// #319 / §A17 (F-308-1) — the OCSF event MUST carry an
+	// `agent_rejected_reason` key in the ext map naming WHICH header
+	// failed validation. The raw header value is NEVER included (the
+	// truncated-stderr line in logAgentHeaderRejected is the only
+	// place that surfaces); only the bounded enum reason string.
+	reason, hasReason := ev.Unmapped.IAMJIT.Ext["agent_rejected_reason"]
+	if !hasReason {
+		t.Fatal("ext.agent_rejected_reason missing — F-308-1 regression: rejected agent headers must leave a breadcrumb in the audit event")
+	}
+	reasonStr, _ := reason.(string)
+	if !strings.Contains(reasonStr, "session_id:invalid") {
+		t.Errorf("agent_rejected_reason = %q; expected to name session_id failure", reasonStr)
+	}
+	if !strings.Contains(reasonStr, "agent_name:invalid") {
+		t.Errorf("agent_rejected_reason = %q; expected to name agent_name failure", reasonStr)
+	}
+	// Belt + braces: the reason string MUST NOT include the raw
+	// header value — that would defeat the bounded-enum design.
+	if strings.Contains(reasonStr, "whoami") || strings.Contains(reasonStr, "rm -rf") {
+		t.Errorf("agent_rejected_reason = %q; raw header value leaked into the reason (must be bounded enum only)", reasonStr)
+	}
+
 	// /healthz surfaces the rejection counter.
 	hresp, err := http.Get(healthURL)
 	if err != nil {

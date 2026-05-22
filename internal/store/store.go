@@ -34,13 +34,18 @@ import (
 )
 
 // SchemaVersion is bumped whenever the on-disk schema changes.
+//
+// v2 (#308): added agent_session_id + agent_name columns so the X-Agent-*
+// header attribution lands in the decisions table. Empty string =
+// anonymous; CLI replay matches the OCSF unmapped.iam_jit.agent.{name,
+// session_id} block.
 // Migrations are additive only (CREATE TABLE IF NOT EXISTS + ALTER
 // TABLE ADD COLUMN); no destructive changes once we ship v1.
 //
 // Version log:
 //
 //	1 — initial: decisions table (G-Slice 1)
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // DefaultDBPath returns the path the store opens when no explicit
 // path is supplied. Honors GBOUNCE_DB for tests and CI sandboxes that
@@ -143,6 +148,22 @@ func (s *Store) migrate() error {
 		}
 	}
 
+	// v2 migration: agent attribution columns. ALTER TABLE ADD COLUMN
+	// IF NOT EXISTS is not supported by SQLite, so we check the existing
+	// schema first + skip if the column already exists. Idempotent.
+	for _, col := range []string{"agent_session_id", "agent_name"} {
+		var found int
+		row := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('decisions') WHERE name = ?`, col)
+		if err := row.Scan(&found); err != nil {
+			return fmt.Errorf("gbounce: probe decisions.%s: %w", col, err)
+		}
+		if found == 0 {
+			if _, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE decisions ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, col)); err != nil {
+				return fmt.Errorf("gbounce: migrate: add column %s: %w", col, err)
+			}
+		}
+	}
+
 	// Stamp the schema version. INSERT-or-UPDATE pattern keeps it
 	// idempotent on re-open.
 	var ver int
@@ -187,6 +208,13 @@ type DecisionRow struct {
 	Verdict        string
 	Mode           string
 	Enforced       bool
+	// #308 — agent attribution columns. Both default to "" (anonymous);
+	// the proxy populates them from validated X-Agent-Session-Id +
+	// X-Agent-Name headers. Empty session id + empty name = "anonymous"
+	// in the OCSF unmapped.iam_jit.agent block (see audit/recorder.go +
+	// audit/event.go for the wire shape).
+	AgentSessionID string
+	AgentName      string
 }
 
 // RecordDecision appends one row to the decisions audit log and
@@ -216,13 +244,15 @@ func (s *Store) RecordDecision(d DecisionRow) (int64, error) {
 			upstream_host, upstream_port, upstream_scheme,
 			client_host, client_port,
 			http_status, response_size, latency_ms,
-			decision_verdict, mode_at_decision, enforced
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			decision_verdict, mode_at_decision, enforced,
+			agent_session_id, agent_name
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		atStr, d.Method, d.Path,
 		d.UpstreamHost, d.UpstreamPort, d.UpstreamScheme,
 		d.ClientHost, d.ClientPort,
 		d.HTTPStatus, d.ResponseSize, d.LatencyMS,
 		verdict, mode, enforced,
+		d.AgentSessionID, d.AgentName,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("gbounce: record decision: %w", err)
@@ -259,7 +289,8 @@ func (s *Store) RecentDecisions(limit int) ([]DecisionRow, error) {
 		upstream_host, upstream_port, upstream_scheme,
 		client_host, client_port,
 		http_status, response_size, latency_ms,
-		decision_verdict, mode_at_decision, enforced
+		decision_verdict, mode_at_decision, enforced,
+		agent_session_id, agent_name
 		FROM decisions ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("gbounce: recent decisions query: %w", err)
@@ -293,7 +324,8 @@ func (s *Store) DecisionsAfterID(afterID int64) ([]DecisionRow, int64, error) {
 		upstream_host, upstream_port, upstream_scheme,
 		client_host, client_port,
 		http_status, response_size, latency_ms,
-		decision_verdict, mode_at_decision, enforced
+		decision_verdict, mode_at_decision, enforced,
+		agent_session_id, agent_name
 		FROM decisions WHERE id > ? ORDER BY id ASC`, afterID)
 	if err != nil {
 		return nil, afterID, fmt.Errorf("gbounce: decisions after id query: %w", err)
@@ -348,6 +380,7 @@ func scanDecisionRow(rows *sql.Rows) (DecisionRow, error) {
 		&d.ClientHost, &d.ClientPort,
 		&d.HTTPStatus, &d.ResponseSize, &d.LatencyMS,
 		&d.Verdict, &d.Mode, &enforced,
+		&d.AgentSessionID, &d.AgentName,
 	); err != nil {
 		return DecisionRow{}, fmt.Errorf("gbounce: decision row scan: %w", err)
 	}

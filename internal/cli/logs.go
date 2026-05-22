@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -112,6 +113,42 @@ func newLogsArchiveCmd() *cobra.Command {
 			if err := audit.ArchiveLogs(dir, out, !excludeActive); err != nil {
 				return err
 			}
+			// #319 / §A17 (F-311-1) — the archiver filters to filenames
+			// starting with `audit*` + having an audit suffix. If the
+			// operator pointed --audit-log at a non-conforming filename
+			// (e.g. ~/.gbounce/proxy.jsonl), the tar.gz comes out empty +
+			// the operator never knows. Surface the zero-files case
+			// loudly so silent data loss isn't possible.
+			fi, statErr := os.Stat(out)
+			if statErr == nil {
+				// An "empty" gzip+tar is ~50 bytes (gzip header + empty
+				// tar trailer + gzip trailer). Anything under 256 bytes
+				// is almost certainly empty; we re-inspect via the
+				// audit package's filename-filter to confirm.
+				if fi.Size() < 256 {
+					if entries, _ := os.ReadDir(dir); len(entries) > 0 {
+						matched := 0
+						for _, e := range entries {
+							n := e.Name()
+							if strings.HasPrefix(n, "audit") && (strings.HasSuffix(n, ".jsonl") ||
+								strings.HasSuffix(n, ".jsonl.gz") ||
+								strings.HasSuffix(n, ".db") ||
+								strings.HasSuffix(n, ".db.gz")) {
+								matched++
+							}
+						}
+						if matched == 0 {
+							return fmt.Errorf(
+								"gbounce logs archive: no audit-shaped files matched in %s "+
+									"(filenames must start with 'audit' and end with one of "+
+									".jsonl/.jsonl.gz/.db/.db.gz). The tar.gz at %s is empty; "+
+									"delete it + re-run with --audit-log pointing at a directory "+
+									"that contains a file named audit.jsonl (or similar).",
+								dir, out)
+						}
+					}
+				}
+			}
 			fmt.Fprintln(cmd.OutOrStdout(), out)
 			return nil
 		},
@@ -137,6 +174,22 @@ func newLogsVerifyCmd() *cobra.Command {
 			res, err := audit.VerifyIntegrity(dir)
 			if err != nil {
 				return err
+			}
+			// #319 / §A17 (F-311-2) — zero-files-checked must NOT report
+			// "OK": there's nothing to be OK about. Operators following
+			// the runbook would mis-read it as "audit integrity intact"
+			// when in fact the writer never opened a file. Promote it
+			// to a non-OK return that names the underlying state.
+			if res.FilesChecked == 0 {
+				res.OK = false
+				if asJSON {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(res)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"checked 0 file(s) in %s — no audit files present (writer never "+
+						"started, the dir is wrong, or the operator passed --audit-log "+
+						"to a sibling path).\n", dir)
+				return fmt.Errorf("verify: 0 audit files in %s", dir)
 			}
 			if asJSON {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(res)

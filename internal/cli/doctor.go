@@ -36,14 +36,16 @@ func newDoctorCmd() *cobra.Command {
   caveats   Print the §B entries from KNOWN-CAVEATS.md that apply to
             gbounce (including cross-product entries shared with the
             other Bounce products).
+  logs      Run audit-log integrity + freshness + retention + disk
+            checks (#311). Non-zero exit on any failure.
 
 Sibling Bounce products (ibounce / kbounce / dbounce) ship the same
-` + "`{product} doctor caveats`" + ` subcommand. The full canonical doc
+` + "`{product} doctor`" + ` subcommands. The full canonical doc
 lives at ` + caveats.CanonicalDocURL() + `.`,
 		Args: cobra.NoArgs,
 	}
 	cmd.RunE = func(c *cobra.Command, _ []string) error {
-		return fmt.Errorf("gbounce doctor: subcommand required (try `gbounce doctor caveats`)")
+		return fmt.Errorf("gbounce doctor: subcommand required (try `gbounce doctor caveats` or `gbounce doctor logs`)")
 	}
 	cmd.AddCommand(newDoctorCaveatsCmd())
 	// #311 / §A10 — audit-log integrity / freshness / disk check.
