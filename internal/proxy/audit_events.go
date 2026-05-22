@@ -250,10 +250,27 @@ func applyAuditEventsTimeBounds(events []audit.Event, since, until *time.Time) [
 // Lives in the proxy package so the handler doesn't import cli (which
 // would create an import cycle). Builds the OCSF wire shape the CLI's
 // filter / summary / export pipeline already operates against.
+//
+// #303 + #305 reconstruction: the SQLite store doesn't carry the
+// per-event override fields (activity_id_override, status_id_override,
+// ext.connect_refused, ext.deny_reason) — extending the schema would
+// be a wider blast-radius change. Instead, the deterministic
+// (method, http_status, verdict) triple is enough to recover the
+// override intent for the two cases this audit slice covers:
+//
+//   - method=CONNECT + verdict=ALLOW + http_status=502 → #303 failed
+//     CONNECT (the ONLY path in the proxy that sets BadGateway on the
+//     CONNECT verb is the dial-failure leg; happy-path = 200, other
+//     error legs = 400/405/500).
+//   - verdict=DENY + http_status=421 → #305 non-CONNECT rejected.
+//
+// Both legs also lift the activity_id to ActivityConnect for CONNECT
+// rows so a SIEM filter on activity_id=6 finds tunnel attempts whether
+// they succeeded or failed.
 func rowsToAuditEvents(rows []store.DecisionRow) []audit.Event {
 	out := make([]audit.Event, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, audit.FromRequest(audit.RequestInput{
+		in := audit.RequestInput{
 			At:             r.At,
 			DecisionID:     r.ID,
 			Mode:           r.Mode,
@@ -267,7 +284,15 @@ func rowsToAuditEvents(rows []store.DecisionRow) []audit.Event {
 			HTTPStatus:     r.HTTPStatus,
 			ResponseSize:   r.ResponseSize,
 			LatencyMS:      r.LatencyMS,
-		}))
+			Verdict:        r.Verdict,
+		}
+		// #303 + #305 — recover the override fields from the persistent
+		// (method, http_status, verdict) triple. Shared with the CLI
+		// reconstruction site (cli.rowsToEvents) via the audit package
+		// so the HTTP /audit/events stream + the local `gbounce audit
+		// tail` output surface the same shape.
+		audit.ReconstructOverridesFromRow(&in)
+		out = append(out, audit.FromRequest(in))
 	}
 	return out
 }

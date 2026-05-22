@@ -378,9 +378,14 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 
 	if s.upstreamURL == nil {
-		// CONNECT-only mode: a non-CONNECT verb on the proxy port is a
-		// configuration mismatch. 421 Misdirected Request is the
-		// closest RFC code.
+		// #305 — CONNECT-only mode: a non-CONNECT verb on the proxy port
+		// is a configuration mismatch + a useful attack signal (IMDS
+		// probes ride plain HTTP, not HTTPS). 421 Misdirected Request is
+		// the closest RFC code. Audit the rejection BEFORE writing the
+		// response so the SIEM sees the deny even when the client gives
+		// up on the 421.
+		s.recordDeny(r, startedAt, http.StatusMisdirectedRequest,
+			"non-CONNECT method on CONNECT-only listener")
 		http.Error(w, "gbounce: --upstream not configured; only CONNECT is accepted", http.StatusMisdirectedRequest)
 		s.totalErrors.Add(1)
 		return
@@ -461,9 +466,18 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	upstream, err := net.DialTimeout("tcp", target,
 		time.Duration(s.cfg.ForwardTimeoutSeconds)*time.Second)
 	if err != nil {
+		// #303 — unreachable upstream (DNS failure, connection refused,
+		// host doesn't exist) used to be invisible: the proxy returned
+		// the 502 to the client but never audited the attempt. SSRF
+		// probes against private IPs (169.254.169.254 IMDS, RFC1918) hid
+		// in that gap. Audit the failed CONNECT attempt with
+		// verdict=ALLOW (we INTENDED to allow; the connect failed at
+		// the network layer) + a Failure status + connect_refused/
+		// connect_error ext keys so a SIEM filter on
+		// `activity_id=6 AND status_id=2` finds every failed tunnel.
+		s.recordFailedConnect(r, startedAt, err)
 		http.Error(w, "gbounce: dial upstream: "+err.Error(), http.StatusBadGateway)
 		s.totalErrors.Add(1)
-		s.record(r, startedAt, http.StatusBadGateway, 0)
 		return
 	}
 	hijacker, ok := w.(http.Hijacker)
@@ -530,10 +544,90 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// recordOverrides bundles the per-call audit-event overrides #303 and
+// #305 need without changing the (now stable across the rest of the
+// codebase) record() signature. Zero-value fields fall back to the
+// default behavior — record() with no overrides matches the
+// pre-#303/#305 shape verbatim.
+type recordOverrides struct {
+	// Verdict overrides the default "ALLOW". Used by #305 to emit
+	// "DENY" for explicit policy rejects.
+	Verdict string
+	// ActivityID pins a specific OCSF activity_id; zero falls back to
+	// method-derived. Used by #303 to pin ActivityConnect on a failed
+	// CONNECT (so SIEM filter `activity_id=6` finds it alongside the
+	// happy-path CONNECT entries).
+	ActivityID int
+	// StatusID pins a specific OCSF status_id; zero falls back to
+	// HTTPStatus-derived. Used by #303 (StatusFailure for CONNECT dial
+	// errors) and #305 (StatusDenied for policy rejects).
+	StatusID int
+	// ExtraExt merges into unmapped.iam_jit.ext. Used by #303
+	// (connect_refused, connect_error) and #305 (deny_reason).
+	ExtraExt map[string]any
+}
+
+// recordFailedConnect is the #303 entrypoint: audit a CONNECT attempt
+// whose TCP dial failed. We never sent any HTTP status to the client
+// at this point (the 502 below is the http.Error response; the audit
+// event captures the gbounce-internal decision). The host:port is
+// extracted from r.Host the same way the happy-path CONNECT does so a
+// SIEM pivot on dst_endpoint correlates failures with successes for
+// the same target.
+func (s *Server) recordFailedConnect(r *http.Request, startedAt time.Time, dialErr error) {
+	errStr := ""
+	if dialErr != nil {
+		errStr = dialErr.Error()
+	}
+	// Persist http_status=502 (matches the BadGateway the proxy returned
+	// to the client) so the SQLite-backed reconstruction in
+	// audit.ReconstructOverridesFromRow recognises this row as the
+	// #303 dial-failure shape.
+	s.recordWith(r, startedAt, http.StatusBadGateway, 0, recordOverrides{
+		// We INTENDED to allow this CONNECT — the upstream was simply
+		// unreachable. Verdict stays ALLOW per the spec.
+		Verdict:    "ALLOW",
+		ActivityID: audit.ActivityConnect,
+		StatusID:   audit.StatusFailure,
+		ExtraExt: map[string]any{
+			"connect_refused": true,
+			"connect_error":   errStr,
+		},
+	})
+}
+
+// recordDeny is the #305 entrypoint: audit a request the proxy
+// REJECTED before any forwarding happened (e.g. a non-CONNECT verb on
+// a CONNECT-only listener). The HTTPStatus argument is the status the
+// proxy sent back to the client (421 for the non-CONNECT case); the
+// status_id is pinned to StatusDenied so a SIEM filter on
+// `status_id=4` isolates deny outcomes from generic 4xxs. The path is
+// captured from r.URL.Path so IMDS probes (which set the path to
+// `/latest/meta-data/...`) are visible in the audit row.
+func (s *Server) recordDeny(r *http.Request, startedAt time.Time, httpStatus int, reason string) {
+	s.recordWith(r, startedAt, httpStatus, 0, recordOverrides{
+		Verdict:  "DENY",
+		StatusID: audit.StatusDenied,
+		ExtraExt: map[string]any{
+			"deny_reason": reason,
+		},
+	})
+}
+
 // record builds + persists an OCSF event for the request/response
 // pair. Best-effort: SQLite or JSONL failure logs nothing here (the
 // proxy must keep serving), but they're surfaced via /healthz.
+//
+// Thin wrapper over recordWith with zero-value overrides so the existing
+// happy-path call sites stay unchanged (see #303/#305 commentary above).
 func (s *Server) record(r *http.Request, startedAt time.Time, status int, respSize int64) {
+	s.recordWith(r, startedAt, status, respSize, recordOverrides{})
+}
+
+// recordWith is the shared implementation behind record /
+// recordFailedConnect / recordDeny. Adds the recordOverrides parameter
+// without growing the original record() signature.
+func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, respSize int64, ov recordOverrides) {
 	clientHost, clientPort := splitHostPort(r.RemoteAddr)
 	var (
 		upHost   string
@@ -562,8 +656,46 @@ func (s *Server) record(r *http.Request, startedAt time.Time, status int, respSi
 		} else if upScheme == "http" {
 			upPort = 80
 		}
+	} else {
+		// #305 — non-CONNECT request on a CONNECT-only listener. The
+		// upstreamURL is unset (--upstream not configured) so the branch
+		// above doesn't fire, BUT a plain-HTTP proxy request still
+		// carries the intended target in r.URL.Host (or r.Host as
+		// fallback) + the scheme in r.URL.Scheme. Capture both so an
+		// IMDS probe (`GET http://169.254.169.254/latest/meta-data/`)
+		// shows the dst_endpoint host in the audit row, not a blank
+		// field.
+		host := ""
+		portStr := ""
+		if r.URL != nil && r.URL.Host != "" {
+			host, portStr = splitHostPortStr(r.URL.Host)
+		}
+		if host == "" {
+			host, portStr = splitHostPortStr(r.Host)
+		}
+		upHost = host
+		if p, err := strconv.Atoi(portStr); err == nil {
+			upPort = p
+		}
+		if r.URL != nil {
+			upScheme = r.URL.Scheme
+		}
+		// Default ports when the proxy URL omitted them.
+		if upPort == 0 {
+			if upScheme == "https" {
+				upPort = 443
+			} else if upScheme == "http" {
+				upPort = 80
+			}
+		}
 	}
 
+	// #303 + #305 — verdict can be overridden by the caller. Default
+	// remains "ALLOW" so happy-path call sites are unchanged.
+	verdict := "ALLOW"
+	if ov.Verdict != "" {
+		verdict = ov.Verdict
+	}
 	row := store.DecisionRow{
 		At:             startedAt.UTC(),
 		Method:         r.Method,
@@ -576,7 +708,7 @@ func (s *Server) record(r *http.Request, startedAt time.Time, status int, respSi
 		HTTPStatus:     status,
 		ResponseSize:   respSize,
 		LatencyMS:      time.Since(startedAt).Milliseconds(),
-		Verdict:        "ALLOW",
+		Verdict:        verdict,
 		Mode:           string(s.cfg.Mode),
 		Enforced:       false,
 	}
@@ -602,21 +734,25 @@ func (s *Server) record(r *http.Request, startedAt time.Time, status int, respSi
 		sid := r.Header.Get("X-Agent-Session-Id")
 		agentName := r.Header.Get("X-Agent-Name")
 		ev := audit.FromRequest(audit.RequestInput{
-			At:             row.At,
-			DecisionID:     decisionID,
-			Mode:           row.Mode,
-			Method:         row.Method,
-			Path:           row.Path,
-			UpstreamHost:   row.UpstreamHost,
-			UpstreamPort:   row.UpstreamPort,
-			UpstreamScheme: row.UpstreamScheme,
-			ClientHost:     row.ClientHost,
-			ClientPort:     row.ClientPort,
-			HTTPStatus:     row.HTTPStatus,
-			ResponseSize:   row.ResponseSize,
-			LatencyMS:      row.LatencyMS,
-			AgentSessionID: sid,
-			AgentName:      agentName,
+			At:                 row.At,
+			DecisionID:         decisionID,
+			Mode:               row.Mode,
+			Method:             row.Method,
+			Path:               row.Path,
+			UpstreamHost:       row.UpstreamHost,
+			UpstreamPort:       row.UpstreamPort,
+			UpstreamScheme:     row.UpstreamScheme,
+			ClientHost:         row.ClientHost,
+			ClientPort:         row.ClientPort,
+			HTTPStatus:         row.HTTPStatus,
+			ResponseSize:       row.ResponseSize,
+			LatencyMS:          row.LatencyMS,
+			AgentSessionID:     sid,
+			AgentName:          agentName,
+			Verdict:            row.Verdict,
+			ActivityIDOverride: ov.ActivityID,
+			StatusIDOverride:   ov.StatusID,
+			ExtraExt:           ov.ExtraExt,
 		})
 		if s.log != nil {
 			_ = s.log.Write(r.Context(), ev)

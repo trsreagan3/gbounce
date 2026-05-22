@@ -580,10 +580,17 @@ func runFollowLoop(cmd *cobra.Command, st *store.Store, filters []audit.Filter) 
 
 // rowsToEvents builds an OCSF Event for each row so filter / summary /
 // export logic can work against a single shape regardless of source.
+//
+// #303 + #305: passes through audit.ReconstructOverridesFromRow so the
+// `gbounce audit tail` CLI surface + the proxy's GET /audit/events
+// HTTP endpoint produce IDENTICALLY shaped events (activity_id=Connect
+// on CONNECT rows; status_id=Denied + ext.deny_reason on rejected
+// non-CONNECTs; status_id=Failure + ext.connect_refused on failed
+// CONNECTs).
 func rowsToEvents(rows []store.DecisionRow) []audit.Event {
 	out := make([]audit.Event, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, audit.FromRequest(audit.RequestInput{
+		in := audit.RequestInput{
 			At:             r.At,
 			DecisionID:     r.ID,
 			Mode:           r.Mode,
@@ -597,7 +604,10 @@ func rowsToEvents(rows []store.DecisionRow) []audit.Event {
 			HTTPStatus:     r.HTTPStatus,
 			ResponseSize:   r.ResponseSize,
 			LatencyMS:      r.LatencyMS,
-		}))
+			Verdict:        r.Verdict,
+		}
+		audit.ReconstructOverridesFromRow(&in)
+		out = append(out, audit.FromRequest(in))
 	}
 	return out
 }

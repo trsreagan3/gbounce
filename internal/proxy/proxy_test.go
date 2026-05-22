@@ -483,3 +483,282 @@ func TestLicensedForGbounce(t *testing.T) {
 		t.Error("non-discovery modes should require a license")
 	}
 }
+
+// startConnectOnlyProxy spins a gbounce instance with no --upstream (so
+// non-CONNECT requests get the 421 path that #305 audits) + CONNECT
+// enabled (so #303's failed-dial path is exercisable). Returns proxy
+// address + audit-log path + store handle for assertions.
+//
+// Shared helper between the three #303/#305 regression tests; matches
+// the existing startTestProxy signature shape so the test file stays
+// uniform.
+func startConnectOnlyProxy(t *testing.T) (proxyAddr, logPath string, st *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	st = s
+	t.Cleanup(func() { _ = s.Close() })
+
+	logPath = filepath.Join(dir, "audit.jsonl")
+	lw, err := audit.NewLogWriter(context.Background(), audit.LogWriterOptions{Path: logPath, Fsync: true})
+	if err != nil {
+		t.Fatalf("NewLogWriter: %v", err)
+	}
+	t.Cleanup(func() { lw.Close() })
+
+	cfg := Config{
+		Host:                  "127.0.0.1",
+		Port:                  0,
+		MgmtHost:              "127.0.0.1",
+		MgmtPort:              0,
+		AllowConnect:          true, // #303 needs the CONNECT path live
+		ForwardTimeoutSeconds: 2,
+	}
+	srv, err := NewServer(cfg, s, lw, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	proxyL, _ := net.Listen("tcp", "127.0.0.1:0")
+	mgmtL, _ := net.Listen("tcp", "127.0.0.1:0")
+	srv.SetAddrs(proxyL.Addr().String(), mgmtL.Addr().String())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = srv.ServeListeners(ctx, proxyL, mgmtL) }()
+	t.Cleanup(func() {
+		cancel()
+		time.Sleep(50 * time.Millisecond)
+	})
+
+	healthURL := "http://" + mgmtL.Addr().String() + "/healthz"
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(healthURL)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return proxyL.Addr().String(), logPath, st
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("proxy never became healthy")
+	return
+}
+
+// readAuditEvents drains a JSONL audit-log file into a slice of
+// audit.Event for assertion. Sleeps a beat first to let the
+// async-writer goroutine flush. Shared between the #303/#305 tests.
+func readAuditEvents(t *testing.T, logPath string) []audit.Event {
+	t.Helper()
+	time.Sleep(150 * time.Millisecond)
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open audit log: %v", err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var out []audit.Event
+	for sc.Scan() {
+		var ev audit.Event
+		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
+			t.Fatalf("decode event: %v\nline: %s", err, sc.Text())
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// TestProxy_UnreachableHostCONNECTLogged is the #303 regression: a
+// CONNECT to a host that refuses TCP (we listen on a port then close
+// the listener so the next dial is "connection refused") must land in
+// the audit log with verdict=ALLOW + activity_id=Connect +
+// status_id=Failure + ext.connect_refused=true.
+//
+// Picks an unreachable host by binding a TCP listener, capturing its
+// address, then closing it — guaranteed-refused on every OS without
+// touching 169.254/16 (which some CI environments route weirdly).
+func TestProxy_UnreachableHostCONNECTLogged(t *testing.T) {
+	// Reserve a port then close — the next dial to it is refused.
+	tmpL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tmp: %v", err)
+	}
+	refusedAddr := tmpL.Addr().String()
+	_ = tmpL.Close()
+
+	proxyAddr, logPath, st := startConnectOnlyProxy(t)
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", refusedAddr, refusedAddr)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d; want 502", resp.StatusCode)
+	}
+
+	// SQLite row recorded with the connect-failure HTTPStatus.
+	time.Sleep(80 * time.Millisecond)
+	rows, _ := st.RecentDecisions(10)
+	if len(rows) == 0 {
+		t.Fatal("no decision rows recorded — #303 regression")
+	}
+
+	// OCSF event landed with #303's full extension shape.
+	events := readAuditEvents(t, logPath)
+	if len(events) == 0 {
+		t.Fatal("audit log is empty — #303 regression: failed CONNECT was invisible")
+	}
+	ev := events[0]
+	if ev.ActivityID != audit.ActivityConnect {
+		t.Errorf("activity_id = %d; want %d (Connect)", ev.ActivityID, audit.ActivityConnect)
+	}
+	if ev.StatusID != audit.StatusFailure {
+		t.Errorf("status_id = %d; want %d (Failure)", ev.StatusID, audit.StatusFailure)
+	}
+	if ev.Unmapped.IAMJIT.Verdict != "ALLOW" {
+		t.Errorf("verdict = %q; want ALLOW (intent was to allow, upstream unreachable)", ev.Unmapped.IAMJIT.Verdict)
+	}
+	if ev.Unmapped.IAMJIT.Ext == nil {
+		t.Fatal("ext should be populated")
+	}
+	if ev.Unmapped.IAMJIT.Ext["connect_refused"] != true {
+		t.Errorf("ext.connect_refused = %v; want true", ev.Unmapped.IAMJIT.Ext["connect_refused"])
+	}
+	if s, ok := ev.Unmapped.IAMJIT.Ext["connect_error"].(string); !ok || s == "" {
+		t.Errorf("ext.connect_error = %v; want a non-empty string", ev.Unmapped.IAMJIT.Ext["connect_error"])
+	}
+	// Same host:port extraction as the successful CONNECT path — the
+	// SIEM filter `dst_endpoint.hostname=...` works for both success +
+	// failure.
+	if ev.DstEndpoint == nil || ev.DstEndpoint.Hostname == "" {
+		t.Errorf("dst_endpoint = %+v; want host:port populated", ev.DstEndpoint)
+	}
+}
+
+// TestProxy_NonCONNECTRequestLogged is the #305 regression: a plain
+// GET sent through the proxy port on a CONNECT-only listener must
+// return 421 AND land in the audit log with verdict=DENY +
+// status_id=Denied + ext.deny_reason. IMDS attacks (which ride plain
+// HTTP, not HTTPS) become visible.
+func TestProxy_NonCONNECTRequestLogged(t *testing.T) {
+	proxyAddr, logPath, st := startConnectOnlyProxy(t)
+
+	// Send a proxy-style GET request: the client's proxy code puts the
+	// full URL on the request-target line + the destination in Host.
+	// `169.254.169.254` is the canonical IMDS endpoint; useful to
+	// confirm the host shows up in the audit row (the attack visibility
+	// is the whole point of #305).
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET http://169.254.169.254/latest/meta-data/iam/security-credentials/ HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusMisdirectedRequest {
+		t.Errorf("status = %d; want 421", resp.StatusCode)
+	}
+
+	// SQLite row recorded with verdict=DENY.
+	time.Sleep(80 * time.Millisecond)
+	rows, _ := st.RecentDecisions(10)
+	if len(rows) == 0 {
+		t.Fatal("no decision rows recorded — #305 regression")
+	}
+	if rows[0].Verdict != "DENY" {
+		t.Errorf("row.Verdict = %q; want DENY", rows[0].Verdict)
+	}
+	if rows[0].UpstreamHost != "169.254.169.254" {
+		t.Errorf("row.UpstreamHost = %q; want 169.254.169.254 (IMDS visibility)", rows[0].UpstreamHost)
+	}
+
+	// OCSF event landed with #305's full extension shape.
+	events := readAuditEvents(t, logPath)
+	if len(events) == 0 {
+		t.Fatal("audit log is empty — #305 regression: rejected non-CONNECT was invisible")
+	}
+	ev := events[0]
+	if ev.StatusID != audit.StatusDenied {
+		t.Errorf("status_id = %d; want %d (Denied)", ev.StatusID, audit.StatusDenied)
+	}
+	if ev.Unmapped.IAMJIT.Verdict != "DENY" {
+		t.Errorf("verdict = %q; want DENY", ev.Unmapped.IAMJIT.Verdict)
+	}
+	if ev.Unmapped.IAMJIT.Ext == nil {
+		t.Fatal("ext should be populated")
+	}
+	reason, _ := ev.Unmapped.IAMJIT.Ext["deny_reason"].(string)
+	if reason != "non-CONNECT method on CONNECT-only listener" {
+		t.Errorf("ext.deny_reason = %q; want non-CONNECT-on-CONNECT-only message", reason)
+	}
+	// Method + path captured pre-TLS — agent operator can see what was
+	// probed even though the response was rejected.
+	if !strings.HasPrefix(ev.API.Operation, "GET ") {
+		t.Errorf("api.operation = %q; want GET …", ev.API.Operation)
+	}
+	if !strings.Contains(ev.API.Operation, "/latest/meta-data") {
+		t.Errorf("api.operation = %q; want path captured", ev.API.Operation)
+	}
+}
+
+// TestProxy_DNSFailureCONNECTLogged is the #303 regression on the DNS-
+// failure leg: a CONNECT to a non-resolvable hostname must still land
+// in the audit log with verdict=ALLOW + status_id=Failure +
+// ext.connect_refused=true. SSRF probes that use opaque hostnames
+// (vs. raw IPs) take this leg.
+func TestProxy_DNSFailureCONNECTLogged(t *testing.T) {
+	proxyAddr, logPath, _ := startConnectOnlyProxy(t)
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	// `.invalid` is the RFC 6761 reserved TLD that DNS resolvers MUST
+	// fail to resolve — guaranteed DNS-error path without depending on
+	// network state.
+	const badHost = "definitely-does-not-exist-x9q7.invalid:443"
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", badHost, badHost)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("CONNECT status = %d; want 502", resp.StatusCode)
+	}
+
+	events := readAuditEvents(t, logPath)
+	if len(events) == 0 {
+		t.Fatal("audit log is empty — #303 DNS-failure regression: failed CONNECT was invisible")
+	}
+	ev := events[0]
+	if ev.ActivityID != audit.ActivityConnect {
+		t.Errorf("activity_id = %d; want %d (Connect)", ev.ActivityID, audit.ActivityConnect)
+	}
+	if ev.StatusID != audit.StatusFailure {
+		t.Errorf("status_id = %d; want %d (Failure)", ev.StatusID, audit.StatusFailure)
+	}
+	if ev.Unmapped.IAMJIT.Ext == nil || ev.Unmapped.IAMJIT.Ext["connect_refused"] != true {
+		t.Errorf("ext.connect_refused = %v; want true", ev.Unmapped.IAMJIT.Ext)
+	}
+	if ev.DstEndpoint == nil || ev.DstEndpoint.Hostname != "definitely-does-not-exist-x9q7.invalid" {
+		t.Errorf("dst_endpoint = %+v; want bad hostname captured", ev.DstEndpoint)
+	}
+}

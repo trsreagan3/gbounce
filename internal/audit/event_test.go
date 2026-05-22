@@ -203,6 +203,79 @@ func TestSetBuildVersion(t *testing.T) {
 	}
 }
 
+// TestReconstructOverridesFromRow covers the #303 + #305 SQLite-back
+// reconstruction logic the proxy + CLI share. Three legs:
+//
+//   - CONNECT + 502 + ALLOW → #303 dial-failure shape (activity_id=
+//     Connect, status_id=Failure, ext.connect_refused=true)
+//   - any verdict=DENY → #305 explicit reject (status_id=Denied,
+//     ext.deny_reason set)
+//   - happy-path (no override conditions) → fields unchanged
+func TestReconstructOverridesFromRow(t *testing.T) {
+	t.Run("connect failure 303", func(t *testing.T) {
+		in := RequestInput{Method: "CONNECT", HTTPStatus: 502, Verdict: "ALLOW"}
+		ReconstructOverridesFromRow(&in)
+		if in.ActivityIDOverride != ActivityConnect {
+			t.Errorf("ActivityIDOverride = %d; want ActivityConnect", in.ActivityIDOverride)
+		}
+		if in.StatusIDOverride != StatusFailure {
+			t.Errorf("StatusIDOverride = %d; want StatusFailure", in.StatusIDOverride)
+		}
+		if in.ExtraExt["connect_refused"] != true {
+			t.Errorf("ExtraExt.connect_refused = %v; want true", in.ExtraExt["connect_refused"])
+		}
+	})
+	t.Run("deny 305", func(t *testing.T) {
+		in := RequestInput{Method: "GET", HTTPStatus: 421, Verdict: "DENY"}
+		ReconstructOverridesFromRow(&in)
+		if in.StatusIDOverride != StatusDenied {
+			t.Errorf("StatusIDOverride = %d; want StatusDenied", in.StatusIDOverride)
+		}
+		got, _ := in.ExtraExt["deny_reason"].(string)
+		if got != "non-CONNECT method on CONNECT-only listener" {
+			t.Errorf("ExtraExt.deny_reason = %q", got)
+		}
+	})
+	t.Run("connect success — only activity_id lifted", func(t *testing.T) {
+		in := RequestInput{Method: "CONNECT", HTTPStatus: 200, Verdict: "ALLOW"}
+		ReconstructOverridesFromRow(&in)
+		if in.ActivityIDOverride != ActivityConnect {
+			t.Errorf("ActivityIDOverride should be ActivityConnect even on success; got %d", in.ActivityIDOverride)
+		}
+		if in.StatusIDOverride != 0 {
+			t.Errorf("StatusIDOverride should stay 0 on success; got %d", in.StatusIDOverride)
+		}
+		if in.ExtraExt != nil {
+			t.Errorf("ExtraExt should stay nil on success; got %+v", in.ExtraExt)
+		}
+	})
+	t.Run("happy-path GET — no overrides", func(t *testing.T) {
+		in := RequestInput{Method: "GET", HTTPStatus: 200, Verdict: "ALLOW"}
+		ReconstructOverridesFromRow(&in)
+		if in.ActivityIDOverride != 0 || in.StatusIDOverride != 0 || in.ExtraExt != nil {
+			t.Errorf("happy-path GET should not produce overrides; got %+v", in)
+		}
+	})
+	t.Run("idempotent — preserves caller-provided ext keys", func(t *testing.T) {
+		in := RequestInput{
+			Method: "CONNECT", HTTPStatus: 502, Verdict: "ALLOW",
+			ExtraExt: map[string]any{"connect_refused": false, "x": "y"},
+		}
+		ReconstructOverridesFromRow(&in)
+		// Caller-provided false stays false — the reconstruction must
+		// not clobber an explicit value.
+		if in.ExtraExt["connect_refused"] != false {
+			t.Errorf("connect_refused should be preserved as false; got %v", in.ExtraExt["connect_refused"])
+		}
+		if in.ExtraExt["x"] != "y" {
+			t.Errorf("unrelated ext keys should be preserved; got %v", in.ExtraExt["x"])
+		}
+	})
+	t.Run("nil safe", func(t *testing.T) {
+		ReconstructOverridesFromRow(nil) // must not panic
+	})
+}
+
 func TestLooksLikeIP(t *testing.T) {
 	cases := map[string]bool{
 		"127.0.0.1":    true,

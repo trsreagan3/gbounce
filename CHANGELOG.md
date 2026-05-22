@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Failed-CONNECT + non-CONNECT requests now audited** (#303 + #305)
+  — two related launch-blocking visibility gaps in `internal/proxy/`:
+  - #303: unreachable-upstream CONNECT attempts (DNS failure,
+    connection refused, host doesn't exist) used to fail silently with
+    a 502 returned to the client but NO audit event recorded. SSRF
+    probes against private IPs (`169.254.169.254` IMDS, RFC1918) were
+    invisible in the audit log. Failed CONNECT events now emit:
+    `activity_id=6 (Connect)`, `status_id=2 (Failure)`,
+    `unmapped.iam_jit.verdict="ALLOW"` (the operator INTENDED to
+    allow; the network refused), `unmapped.iam_jit.ext.connect_refused=true`,
+    `unmapped.iam_jit.ext.connect_error=<dial error string>`. Same
+    `host:port` extraction from the CONNECT request-target as the
+    successful-CONNECT happy path so a SIEM pivot on
+    `dst_endpoint.hostname=...` correlates failures with successes.
+  - #305: plain-HTTP requests on a CONNECT-only listener (`--allow-
+    connect` without `--upstream`) returned `421 Misdirected Request`
+    + silently dropped with no audit event. IMDS attacks (which ride
+    plain HTTP, not HTTPS) were invisible. Rejected non-CONNECT
+    requests now emit: `activity_id` derived from HTTP method,
+    `status_id=4 (Denied)`, `unmapped.iam_jit.verdict="DENY"`,
+    `unmapped.iam_jit.ext.deny_reason="non-CONNECT method on CONNECT-
+    only listener"`. Method + host + path captured pre-TLS so IMDS
+    probes show their `/latest/meta-data/...` target in the audit row.
+  - New OCSF constants in `internal/audit/event.go`: `ActivityConnect=6`
+    (gbounce extension for CONNECT) + `StatusDenied=4` (gbounce
+    extension for policy denials). `RequestInput` gains
+    `Verdict / ActivityIDOverride / StatusIDOverride / ExtraExt`
+    fields for these failure-path call sites without breaking the
+    happy-path call sites.
+  - The SQLite-backed `/audit/events` HTTP endpoint + the local
+    `gbounce audit tail` CLI reconstruct the override fields from the
+    persistent `(method, http_status, verdict)` triple via the new
+    `audit.ReconstructOverridesFromRow` helper — so both surfaces
+    show the same shape as the canonical JSONL audit log.
+  - Three regression tests in `internal/proxy/proxy_test.go`:
+    `TestProxy_UnreachableHostCONNECTLogged`,
+    `TestProxy_NonCONNECTRequestLogged`,
+    `TestProxy_DNSFailureCONNECTLogged`. Plus
+    `TestReconstructOverridesFromRow` (6 sub-tests covering the
+    reconstruction matrix) in `internal/audit/event_test.go`.
+
 ### Added
 
 - **Per-session recording CLI wiring** (#290) — wires the #285

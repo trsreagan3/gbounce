@@ -69,6 +69,16 @@ const (
 	ActivityRead    = 2
 	ActivityUpdate  = 3
 	ActivityDelete  = 4
+	// ActivityConnect is the gbounce-specific extension for the HTTP
+	// CONNECT verb. OCSF v1.1.0's class 6003 enum stops at 4+99; CONNECT
+	// is a transport-establishment action that doesn't map cleanly to
+	// Create/Read/Update/Delete. We reserve activity_id=6 for it so the
+	// SIEM-side pivot can isolate tunnel-establishment events from
+	// payload calls. Used by #303 + the successful-CONNECT happy-path
+	// audit so both the success and the failure carry the same
+	// activity_id (a SIEM filter on `activity_id=6` finds all tunnel
+	// attempts).
+	ActivityConnect = 6
 	ActivityOther   = 99
 )
 
@@ -77,7 +87,15 @@ const (
 	StatusUnknown = 0
 	StatusSuccess = 1
 	StatusFailure = 2
-	StatusOther   = 99
+	// StatusDenied is the gbounce-specific extension for explicit
+	// policy-deny outcomes. OCSF v1.1.0's status_id enum has
+	// Unknown=0/Success=1/Failure=2/Other=99; "Denied" is a verdict-
+	// shaped outcome that's distinct from a generic 4xx failure. Used
+	// by #305 (non-CONNECT on CONNECT-only listener) + reserved for
+	// future profile/tap-mode DENY events. SIEM filter on
+	// `status_id=4` isolates policy denials.
+	StatusDenied = 4
+	StatusOther  = 99
 )
 
 // OCSF severity_id enum (only the values gbounce actually emits).
@@ -225,6 +243,37 @@ type RequestInput struct {
 	// session file (raw curl from a script has no session identity).
 	AgentSessionID string
 	AgentName      string
+
+	// Verdict overrides the default "ALLOW" verdict on the
+	// unmapped.iam_jit extension. Empty → "ALLOW" (the discovery-mode
+	// default). Used by #305 to emit verdict=DENY for explicit policy
+	// rejections (non-CONNECT method on CONNECT-only listener) and by
+	// #303 to emit verdict=ALLOW alongside a failed-CONNECT outcome
+	// (we INTENDED to allow; upstream was unreachable).
+	Verdict string
+
+	// ActivityIDOverride lets the caller pin a specific OCSF activity_id
+	// when method→activity mapping doesn't fit. Used for #303 (CONNECT
+	// failure → ActivityConnect) and reserved for future events whose
+	// activity is determined by context rather than HTTP verb. Zero =
+	// fall back to method-derived activity. The matching activity_name
+	// + type_uid + type_name are recomputed from the override.
+	ActivityIDOverride int
+
+	// StatusIDOverride lets the caller pin a specific OCSF status_id
+	// independent of the HTTP status code mapping. Used for #303
+	// (CONNECT dial failure → StatusFailure, even though we never sent
+	// an HTTP status to the client) and #305 (explicit DENY →
+	// StatusDenied). Zero = fall back to HTTPStatus mapping. The
+	// matching status string is recomputed from the override.
+	StatusIDOverride int
+
+	// ExtraExt fields merge into the unmapped.iam_jit.ext map alongside
+	// the standard http_status / response_size / latency_ms / agent
+	// keys. Used by #303 to record `connect_refused: true` +
+	// `connect_error: <error>`, and by #305 to record `deny_reason`.
+	// Empty map = no extras.
+	ExtraExt map[string]any
 }
 
 // FromRequest builds an OCSF class 6003 (API Activity) Event from a
@@ -258,8 +307,21 @@ func FromRequest(in RequestInput) Event {
 	if activityName == "" {
 		activityName = "unknown"
 	}
+	// #303 — caller may pin a specific activity_id (e.g. ActivityConnect
+	// for a failed CONNECT) when method-derived mapping doesn't fit.
+	if in.ActivityIDOverride != 0 {
+		activityID = in.ActivityIDOverride
+		activityName = activityNameForID(activityID)
+	}
 
 	statusID, status := mapHTTPStatusToOCSF(in.HTTPStatus)
+	// #303 + #305 — caller may pin a specific status_id (Failure on
+	// CONNECT dial error, Denied on policy reject) independent of any
+	// HTTP status code sent to the client.
+	if in.StatusIDOverride != 0 {
+		statusID = in.StatusIDOverride
+		status = statusNameForID(statusID)
+	}
 
 	operation := strings.ToUpper(in.Method)
 	if in.Path != "" {
@@ -312,6 +374,14 @@ func FromRequest(in RequestInput) Event {
 	if in.AgentName != "" {
 		ext[AgentNameExtKey] = in.AgentName
 	}
+	// #303 + #305 — merge caller-supplied extras (connect_refused,
+	// connect_error, deny_reason, …) after the standard keys so the
+	// caller's intent wins on collisions. Keys are documented per-call-
+	// site rather than centralized — the ext map is the OCSF-extension
+	// catch-all by design.
+	for k, v := range in.ExtraExt {
+		ext[k] = v
+	}
 	if len(ext) == 0 {
 		ext = nil
 	}
@@ -319,6 +389,13 @@ func FromRequest(in RequestInput) Event {
 	mode := in.Mode
 	if mode == "" {
 		mode = "discovery"
+	}
+	// #303 + #305 — caller may override the default "ALLOW" verdict
+	// (e.g. "DENY" for explicit policy reject in #305). Empty falls
+	// back to "ALLOW" to preserve the G-Slice 1 discovery-mode default.
+	verdict := in.Verdict
+	if verdict == "" {
+		verdict = "ALLOW"
 	}
 
 	return Event{
@@ -350,7 +427,7 @@ func FromRequest(in RequestInput) Event {
 		Unmapped: OCSFUnmapped{
 			IAMJIT: IAMJITExt{
 				Mode:       mode,
-				Verdict:    "ALLOW",
+				Verdict:    verdict,
 				DecisionID: in.DecisionID,
 				Enforced:   false,
 				Ext:        ext,
@@ -402,7 +479,10 @@ func mapHTTPStatusToOCSF(code int) (int, string) {
 }
 
 // typeNameForActivity returns the OCSF type_name string for the given
-// activity_id. Tracks the OCSF spec's type_name enum verbatim.
+// activity_id. Tracks the OCSF spec's type_name enum verbatim — except
+// for ActivityConnect (6) which is gbounce's CONNECT extension and uses
+// the matching "API Activity: Connect" label so SIEM rendering stays
+// human-readable.
 func typeNameForActivity(activityID int) string {
 	switch activityID {
 	case ActivityCreate:
@@ -413,10 +493,107 @@ func typeNameForActivity(activityID int) string {
 		return "API Activity: Update"
 	case ActivityDelete:
 		return "API Activity: Delete"
+	case ActivityConnect:
+		return "API Activity: Connect"
 	case ActivityOther:
 		return "API Activity: Other"
 	default:
 		return "API Activity: Unknown"
+	}
+}
+
+// activityNameForID returns the lowercase activity_name string for an
+// OCSF activity_id when the caller didn't supply a method (e.g. #303
+// pins ActivityConnect on a failed CONNECT). Tracks the same enum the
+// SIEM-side schema renders.
+func activityNameForID(activityID int) string {
+	switch activityID {
+	case ActivityCreate:
+		return "create"
+	case ActivityRead:
+		return "read"
+	case ActivityUpdate:
+		return "update"
+	case ActivityDelete:
+		return "delete"
+	case ActivityConnect:
+		return "connect"
+	case ActivityOther:
+		return "other"
+	default:
+		return "unknown"
+	}
+}
+
+// ReconstructOverridesFromRow infers the #303 + #305 override fields
+// from the persistent (method, http_status, verdict) signals that the
+// store layer DOES carry. Called by the SQLite-backed reconstruction
+// sites (proxy.rowsToAuditEvents, cli.rowsToEvents) so the
+// /audit/events HTTP endpoint + the `gbounce audit tail` CLI surface
+// the same activity_id / status_id / ext keys as the canonical JSONL
+// audit log (which carries the override fields directly from the
+// proxy hot path).
+//
+// The reconstruction is deterministic for the two cases this slice
+// covers:
+//
+//   - method=CONNECT → activity_id=Connect (success + failure share
+//     one activity pivot)
+//   - method=CONNECT + verdict=ALLOW + http_status=502 → #303 dial
+//     failure: status_id=Failure + ext.connect_refused=true (the full
+//     connect_error string lives in the JSONL log only — the SIEM-side
+//     filter `connect_refused=true` is enough to isolate the case)
+//   - verdict=DENY → #305 explicit reject: status_id=Denied +
+//     ext.deny_reason="non-CONNECT method on CONNECT-only listener"
+//
+// Idempotent: callers that already populated ActivityIDOverride /
+// StatusIDOverride / ExtraExt have those values preserved (the
+// reconstruction only fills zero values).
+func ReconstructOverridesFromRow(in *RequestInput) {
+	if in == nil {
+		return
+	}
+	if strings.EqualFold(in.Method, "CONNECT") && in.ActivityIDOverride == 0 {
+		in.ActivityIDOverride = ActivityConnect
+	}
+	if strings.EqualFold(in.Method, "CONNECT") && in.HTTPStatus == 502 && strings.EqualFold(in.Verdict, "ALLOW") {
+		if in.StatusIDOverride == 0 {
+			in.StatusIDOverride = StatusFailure
+		}
+		if in.ExtraExt == nil {
+			in.ExtraExt = map[string]any{}
+		}
+		if _, ok := in.ExtraExt["connect_refused"]; !ok {
+			in.ExtraExt["connect_refused"] = true
+		}
+	}
+	if strings.EqualFold(in.Verdict, "DENY") {
+		if in.StatusIDOverride == 0 {
+			in.StatusIDOverride = StatusDenied
+		}
+		if in.ExtraExt == nil {
+			in.ExtraExt = map[string]any{}
+		}
+		if _, ok := in.ExtraExt["deny_reason"]; !ok {
+			in.ExtraExt["deny_reason"] = "non-CONNECT method on CONNECT-only listener"
+		}
+	}
+}
+
+// statusNameForID returns the OCSF status enum name for a pinned
+// status_id. Used by #303 + #305 callers that pass StatusIDOverride.
+func statusNameForID(statusID int) string {
+	switch statusID {
+	case StatusSuccess:
+		return "Success"
+	case StatusFailure:
+		return "Failure"
+	case StatusDenied:
+		return "Denied"
+	case StatusOther:
+		return "Other"
+	default:
+		return "Unknown"
 	}
 }
 
