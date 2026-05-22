@@ -106,6 +106,11 @@ func newRootCmd() *cobra.Command {
 	// orchestrators (and the cross-product `iam-jit session replay
 	// <FILE>` CLI) consume any product's recordings uniformly.
 	root.AddCommand(newSessionCmd())
+	// #311 / §A10 — `gbounce logs {purge,archive,verify}` audit-log
+	// retention surface. Ships in lockstep with the sibling products
+	// (ibounce / kbounce / dbounce); the cross-product runbook at
+	// iam-roles/docs/LOG-RETENTION.md applies to all.
+	root.AddCommand(newLogsCmd())
 	return root
 }
 
