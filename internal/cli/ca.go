@@ -84,6 +84,15 @@ func newCAInstallCmd() *cobra.Command {
 			fmt.Fprintf(w, "  subject:      %s\n", info.Subject)
 			fmt.Fprintf(w, "  fingerprint:  %s\n", info.Fingerprint)
 			fmt.Fprintf(w, "  valid until:  %s\n", cert.NotAfter.Format(time.RFC3339))
+			fmt.Fprintln(w, "")
+			fmt.Fprintln(w, "⚠️  BETA — PII / PCI / PHI leak risk:")
+			fmt.Fprintln(w, "  Default redaction strips CREDENTIALS ONLY (Authorization, Cookie,")
+			fmt.Fprintln(w, "  x-api-key, *_token, *_secret). It does NOT strip PII (emails,")
+			fmt.Fprintln(w, "  SSNs, addresses), PCI (PAN, CVV, expiry), or PHI (patient data).")
+			fmt.Fprintln(w, "  For HIPAA / PCI-DSS / GDPR workloads, configure your own redaction")
+			fmt.Fprintln(w, "  policy BEFORE enabling MITM, or keep `--mode discovery` (which")
+			fmt.Fprintln(w, "  never sees bodies). See docs/MITM-MODE.md for the full posture.")
+			fmt.Fprintln(w, "")
 			for _, line := range mitm.PlatformInstallInstructions(paths) {
 				fmt.Fprintln(w, line)
 			}

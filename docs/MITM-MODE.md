@@ -1,6 +1,21 @@
 # MITM mode (`gbounce run --mode mitm`)
 
-**#315 / §A13.** Default-off. Opt-in.
+**#315 / §A13.** **BETA in v1.0.** Default-off. Opt-in.
+
+> **⚠️ BETA — PII / PCI / PHI leak risk.** MITM terminates the TLS
+> tunnel — request and response bodies flow plaintext through
+> gbounce. Default-on redaction strips **credentials only**
+> (Authorization, Cookie, x-api-key, `*_token`, `*_secret`,
+> `password`, `api_key`) — it does **NOT** strip PII (emails, SSNs,
+> addresses), PCI (PAN, CVV, expiry), or PHI (patient names, DOB).
+> Anywhere we persist events leaks the bodies downstream: JSONL log
+> files, SQLite audit DB, HTTPS webhooks (Splunk / Datadog /
+> Sentinel), AWS Security Lake parquet, S3-compat NDJSON sink,
+> diagnostics bundle. For HIPAA / PCI-DSS / GDPR workloads,
+> **configure your own redaction policy before enabling MITM**, or
+> keep gbounce in `--mode discovery` (CONNECT-only; never sees
+> bodies). v1.1 graduation criterion: pluggable PII/PCI redaction
+> packs (regex + structured detectors) ship.
 
 MITM mode terminates the TLS tunnel using a CA-signed leaf cert per
 host, decrypts the HTTPS payload, audits + redacts it, and

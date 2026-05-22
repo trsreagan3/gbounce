@@ -194,10 +194,12 @@ func BannerLines(t Trigger) []string {
 	}
 	if t.MITMMode {
 		out = append(out,
-			"  #315 / §A13 — MITM mode is ACTIVE: TLS intercepted via the local CA, "+
-				"bodies redacted by default. Cert-pinning SDKs (some AWS SDKs, banking "+
-				"SDKs, mobile SDKs) WILL break; flip those clients back to "+
-				"`--mode discovery --allow-connect`. See docs/MITM-MODE.md.")
+			"  #315 / §A13 — MITM mode is ACTIVE [BETA]: TLS intercepted via the local CA, "+
+				"bodies redacted by default. Default redaction strips CREDENTIALS ONLY "+
+				"(Authorization, Cookie, x-api-key, *_token, *_secret) — it does NOT strip "+
+				"PII / PCI / PHI. For HIPAA / PCI-DSS / GDPR workloads, configure your own "+
+				"redaction OR keep `--mode discovery` (never sees bodies). Cert-pinning SDKs "+
+				"WILL break under MITM. See docs/MITM-MODE.md.")
 	}
 	return out
 }
