@@ -357,6 +357,10 @@ func (s *Server) recordMITMRequest(req *http.Request, host string, port int, sta
 		if s.recorder != nil {
 			s.recorder.Record(ev)
 		}
+		// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
+		if s.objectStorage != nil {
+			s.objectStorage.Write(req.Context(), ev)
+		}
 	}
 }
 
@@ -432,6 +436,10 @@ func (s *Server) recordMITMDeny(req *http.Request, host string, port int, starte
 		if s.recorder != nil {
 			s.recorder.Record(ev)
 		}
+		// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
+		if s.objectStorage != nil {
+			s.objectStorage.Write(req.Context(), ev)
+		}
 	}
 }
 
@@ -486,6 +494,10 @@ func (s *Server) recordMITMHandshakeFailure(req *http.Request, host string, port
 			ExtraExt:         extras,
 		})
 		_ = s.log.Write(req.Context(), ev)
+		// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
+		if s.objectStorage != nil {
+			s.objectStorage.Write(req.Context(), ev)
+		}
 	}
 }
 
