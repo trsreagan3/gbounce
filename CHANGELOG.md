@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **§A20 R3-02 — `/audit/events` stripped the agent block from every event** (2026-05-22) —
+  `store.DecisionRow` carried `AgentSessionID` + `AgentName` columns
+  (per the #318 / #320 schema migration; persisted on `RecordDecision`;
+  selected by `RecentDecisions`) — but `internal/proxy/audit_events.go:
+  rowsToAuditEvents` constructed `audit.RequestInput` WITHOUT copying
+  the two fields. Result: GET `/audit/events` returned
+  `{"agent":{"name":"anonymous","detected_from":"unknown"}}` for
+  EVERY event, even when the JSONL log + the in-memory exporter had
+  the correct agent block. Cross-product `iam-jit audit query
+  --filter agent.session_id=<id>` against gbounce missed every event.
+  The CLI mirror `internal/cli/cli.go:rowsToEvents` had the same bug,
+  breaking `gbounce audit tail --export jsonl` symmetrically.
+  Surfaced by UAT round 3
+  (`iam-roles/tests/dogfood/findings-2026-05-22-round-3.md`).
+  Fix: both projection sites now copy `r.AgentSessionID` +
+  `r.AgentName` into the `audit.RequestInput`. Per
+  [[cross-product-agent-parity]]: matches the recipe dbounce +
+  kbouncer already use. `audit.FromRequest` re-validates via
+  `IsValidSessionID` + `IsValidAgentName` + builds the OCSF
+  `unmapped.iam_jit.agent` block — populated when either field is
+  present (with `detected_from="http_header"`), the anonymous
+  fallback otherwise. New regression tests in
+  `internal/proxy/audit_events_test.go`:
+  `TestRowsToAuditEvents_ThreadsAgentFieldsR302` +
+  `TestRowsToAuditEvents_AnonymousWhenNoAgentR302` +
+  `TestAuditEvents_HTTPSurfaceShowsAgentR302` cover the unit-level
+  threading + the HTTP wire-shape end-to-end. iam-roles
+  KNOWN-CAVEATS §A20.
+
 ### Added
 
 - **#321 / §A19 — `gbounce profile doctor` cross-product CLI parity** (2026-05-22) —

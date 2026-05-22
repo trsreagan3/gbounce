@@ -347,3 +347,161 @@ func TestAuditEvents_NonGETMethodRejected(t *testing.T) {
 		t.Errorf("status = %d (want 405)", resp.StatusCode)
 	}
 }
+
+// §A20 (R3-02) — rowsToAuditEvents MUST thread the persisted
+// AgentSessionID + AgentName columns from store.DecisionRow into the
+// audit.RequestInput it builds. Before the fix the agent fields fell
+// on the floor: every event from /audit/events showed
+// `agent.name=anonymous` + `detected_from=unknown` even though the
+// JSONL log + CLI tail had the correct agent block, breaking cross-
+// product `iam-jit audit query --filter agent.session_id=<id>`.
+//
+// Per [[cross-product-agent-parity]] this matches the dbounce + kbouncer
+// recipe: the row carries agent identity; the event must surface it.
+func TestRowsToAuditEvents_ThreadsAgentFieldsR302(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	rows := []store.DecisionRow{
+		{
+			ID:             7,
+			At:             now,
+			Method:         "GET",
+			Path:           "/v1/widgets",
+			UpstreamHost:   "api.example.com",
+			UpstreamPort:   443,
+			UpstreamScheme: "https",
+			HTTPStatus:     200,
+			Verdict:        "ALLOW",
+			Mode:           "enforce",
+			AgentSessionID: "01HXYZ1234567890ABCDEFGHJK",
+			AgentName:      "claude-code",
+		},
+	}
+	evs := rowsToAuditEvents(rows)
+	if len(evs) != 1 {
+		t.Fatalf("got %d events; want 1", len(evs))
+	}
+	agent := evs[0].Unmapped.IAMJIT.Agent
+	if agent == nil {
+		t.Fatalf("agent block is nil; want non-nil with name + session id")
+	}
+	if agent.Name != "claude-code" {
+		t.Errorf("agent.Name = %q; want %q", agent.Name, "claude-code")
+	}
+	if agent.SessionID != "01HXYZ1234567890ABCDEFGHJK" {
+		t.Errorf("agent.SessionID = %q; want %q",
+			agent.SessionID, "01HXYZ1234567890ABCDEFGHJK")
+	}
+	if agent.DetectedFrom != "http_header" {
+		t.Errorf("agent.DetectedFrom = %q; want %q",
+			agent.DetectedFrom, "http_header")
+	}
+}
+
+// §A20 (R3-02) — empty agent fields on the row MUST still surface as
+// the anonymous block (not drop the block entirely). Confirms the
+// fallback path: an unattributed row produces
+// {name:"anonymous", detected_from:"unknown"} so the SIEM operator
+// can query `agent.name=anonymous` to find unattributed traffic.
+func TestRowsToAuditEvents_AnonymousWhenNoAgentR302(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	rows := []store.DecisionRow{
+		{
+			ID:             8,
+			At:             now,
+			Method:         "GET",
+			Path:           "/v1/healthz",
+			UpstreamHost:   "api.example.com",
+			UpstreamPort:   443,
+			UpstreamScheme: "https",
+			HTTPStatus:     200,
+			Verdict:        "ALLOW",
+			Mode:           "enforce",
+			// No agent fields supplied.
+		},
+	}
+	evs := rowsToAuditEvents(rows)
+	if len(evs) != 1 {
+		t.Fatalf("got %d events; want 1", len(evs))
+	}
+	agent := evs[0].Unmapped.IAMJIT.Agent
+	if agent == nil {
+		t.Fatalf("agent block is nil; want non-nil anonymous block")
+	}
+	if agent.Name != "anonymous" {
+		t.Errorf("agent.Name = %q; want %q (anonymous fallback)",
+			agent.Name, "anonymous")
+	}
+	if agent.DetectedFrom != "unknown" {
+		t.Errorf("agent.DetectedFrom = %q; want %q",
+			agent.DetectedFrom, "unknown")
+	}
+}
+
+// §A20 (R3-02) — end-to-end: insert a DecisionRow with agent fields,
+// hit GET /audit/events, parse the NDJSON response, assert the agent
+// block is populated. Catches a refactor where the fields-on-row work
+// but the wire format somehow strips them on the way out.
+func TestAuditEvents_HTTPSurfaceShowsAgentR302(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	row := store.DecisionRow{
+		At:             time.Now().UTC().Add(-30 * time.Second),
+		Method:         "GET",
+		Path:           "/v1/orders",
+		UpstreamHost:   "api.example.com",
+		UpstreamPort:   443,
+		UpstreamScheme: "https",
+		HTTPStatus:     200,
+		Verdict:        "ALLOW",
+		Mode:           "enforce",
+		AgentSessionID: "01HXYZSESSION0000000000000",
+		AgentName:      "agent-r302-test",
+	}
+	if _, err := st.RecordDecision(row); err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+	srv := httptest.NewServer(auditEventsHandler(st, ""))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "?limit=10")
+	if err != nil {
+		t.Fatalf("GET /audit/events: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d (want 200)", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if len(lines) != 1 {
+		t.Fatalf("got %d NDJSON lines; want 1", len(lines))
+	}
+	var ev map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &ev); err != nil {
+		t.Fatalf("decode event: %v\nraw: %s", err, lines[0])
+	}
+	unmapped, _ := ev["unmapped"].(map[string]any)
+	iamjit, _ := unmapped["iam_jit"].(map[string]any)
+	agent, _ := iamjit["agent"].(map[string]any)
+	if agent == nil {
+		t.Fatalf("agent block missing from event; got: %s", lines[0])
+	}
+	if name, _ := agent["name"].(string); name != "agent-r302-test" {
+		t.Errorf("agent.name = %q; want %q", name, "agent-r302-test")
+	}
+	if sid, _ := agent["session_id"].(string); sid != "01HXYZSESSION0000000000000" {
+		t.Errorf("agent.session_id = %q; want %q",
+			sid, "01HXYZSESSION0000000000000")
+	}
+	if df, _ := agent["detected_from"].(string); df != "http_header" {
+		t.Errorf("agent.detected_from = %q; want %q",
+			df, "http_header")
+	}
+}

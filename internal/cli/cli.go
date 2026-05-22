@@ -950,6 +950,15 @@ func rowsToEvents(rows []store.DecisionRow) []audit.Event {
 			ResponseSize:   r.ResponseSize,
 			LatencyMS:      r.LatencyMS,
 			Verdict:        r.Verdict,
+			// #318 / #320 / §A20 (R3-02) — agent identity threading
+			// (CLI mirror of proxy.rowsToAuditEvents). The HTTP
+			// /audit/events handler + the CLI tail/export pipeline
+			// MUST surface the same agent block; missing this on the
+			// CLI side would mean `gbounce audit tail --export jsonl`
+			// also dropped attribution. Per [[cross-product-agent-
+			// parity]] both surfaces ship the same OCSF shape.
+			AgentSessionID: r.AgentSessionID,
+			AgentName:      r.AgentName,
 		}
 		audit.ReconstructOverridesFromRow(&in)
 		out = append(out, audit.FromRequest(in))

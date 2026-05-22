@@ -285,6 +285,25 @@ func rowsToAuditEvents(rows []store.DecisionRow) []audit.Event {
 			ResponseSize:   r.ResponseSize,
 			LatencyMS:      r.LatencyMS,
 			Verdict:        r.Verdict,
+			// #318 / #320 / §A20 (R3-02) — agent identity threading.
+			// The store persists agent_session_id + agent_name on
+			// every decision row (per the #308 schema migration) and
+			// RecentDecisions selects them, but earlier audit_events
+			// builds dropped both on the floor here. Result: every
+			// event from /audit/events showed agent.name=anonymous +
+			// detected_from=unknown — even when the JSONL log + the
+			// CLI tail had the correct agent block. That broke cross-
+			// product `iam-jit audit query --filter agent.session_id=
+			// <id>` against gbounce (the matching events looked
+			// anonymous on the wire).
+			//
+			// audit.FromRequest below re-runs IsValidSessionID +
+			// IsValidAgentName on these values + builds the OCSF
+			// unmapped.iam_jit.agent block; per [[cross-product-
+			// agent-parity]] this matches the dbounce + kbouncer
+			// recipe.
+			AgentSessionID: r.AgentSessionID,
+			AgentName:      r.AgentName,
 		}
 		// #303 + #305 — recover the override fields from the persistent
 		// (method, http_status, verdict) triple. Shared with the CLI
