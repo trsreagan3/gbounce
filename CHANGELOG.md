@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **§A21 / [[discovery-first-default]] — gbounce is the discovery-first reference; no code change** (2026-05-22) —
+  Per the role-effectiveness eval at
+  `iam-roles/tests/dogfood/role-effectiveness-grades.md`, gbounce hit
+  **66.7%** vs the 50% launch bar — the only Bounce product above the
+  bar in v1.0. The shape (default = discovery mode = observe + audit +
+  pass-through; deny_hosts + MITM URL+method are operator-set OPT-IN
+  primitives) became the canonical model the other 3 bouncers flipped
+  to on 2026-05-22 (see iam-roles + kbouncer + dbounce CHANGELOGs).
+  No gbounce code changes were required — `--mode discovery` was already
+  the documented default; `deny_hosts` (#314) + MITM (#315) profile
+  rules are already opt-in.
+
+  Cross-product context: under the pivot all 4 bouncers report
+  `default_mode=discovery|profile` on the headline startup banner per
+  `[[cross-product-agent-parity]]`. gbounce surfaces the canonical
+  shape directly (no `--profile` concept yet in G-Slice 1; G-Slice 2
+  will add YAML profiles + the doctor catalog per #321).
+
+  See iam-roles KNOWN-CAVEATS §A21 + `iam-roles/tests/dogfood/role-effectiveness-grades-post-pivot.md`.
+
 ### Fixed
 
 - **§A20 R3-02 — `/audit/events` stripped the agent block from every event** (2026-05-22) —
