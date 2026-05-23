@@ -11,8 +11,12 @@
 //     had no install path, breaking the launch claim that "the
 //     generator emits a working profile for all 4 bouncers."
 //
-// G-Slice 2 will extend this with list / show once the on-disk
-// profiles surface matures.
+//   - `gbounce profile list` — §A42 (#378): print all profiles in
+//     profiles.yaml + mark which is active. Mirrors kbouncer +
+//     dbounce + ibouncer shape per [[cross-product-agent-parity]].
+//
+//   - `gbounce profile show NAME` — §A42 (#378): print the profile's
+//     fields for inspection. Mirrors siblings' shape.
 
 package cli
 
@@ -67,6 +71,178 @@ func newProfileCmd() *cobra.Command {
 	}
 	cmd.AddCommand(newProfileDoctorCmd())
 	cmd.AddCommand(newProfileInstallCmd())
+	cmd.AddCommand(newProfileListCmd())
+	cmd.AddCommand(newProfileShowCmd())
+	return cmd
+}
+
+// newProfileListCmd implements `gbounce profile list` per #378 / §A42.
+// Symmetric with kbouncer / dbounce / ibouncer per
+// [[cross-product-agent-parity]]. Prints all profiles in profiles.yaml
+// + marks the one named by --profile (or GBOUNCE_PROFILE) as active.
+func newProfileListCmd() *cobra.Command {
+	var (
+		profileName  string
+		profilesPath string
+	)
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List available profiles and show which is active",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if profileName == "" {
+				profileName = os.Getenv("GBOUNCE_PROFILE")
+			}
+			if profilesPath == "" {
+				p, err := profile.DefaultProfilesPath()
+				if err != nil {
+					return err
+				}
+				profilesPath = p
+			}
+			profiles, err := profile.LoadProfiles(profilesPath)
+			if err != nil {
+				return fmt.Errorf("load profiles: %w", err)
+			}
+			active, _ := profiles.Active(profileName)
+			source := "embedded defaults"
+			if profiles.Path != "" {
+				source = profiles.Path
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"gbounce profiles (source: %s)\n", source)
+			if profileName != "" && active == nil {
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"WARNING: requested profile %q is not in this file. "+
+						"`gbounce run --profile %q` would refuse to start.\n",
+					profileName, profileName)
+			}
+			names := profiles.NamesSorted()
+			if len(names) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"  (no profiles installed; use `gbounce profile install --from URL_OR_PATH`)")
+				return nil
+			}
+			for _, name := range names {
+				p := profiles.All[name]
+				marker := "  "
+				if active != nil && p.Name == active.Name && profileName != "" {
+					marker = "* "
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s%-20s %s\n", marker, name, p.Description)
+				if len(p.DenyHosts) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "    deny_hosts:  %s\n", strings.Join(p.DenyHosts, ", "))
+				}
+				if n := len(p.DenyRules); n > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "    deny_rules:  %d\n", n)
+				}
+				if n := len(p.AllowRules); n > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "    allow_rules: %d (round-trip only — not enforced in v1.0)\n", n)
+				}
+				if p.Source != "" && p.Source != "local" {
+					fmt.Fprintf(cmd.OutOrStdout(), "    source:      %s (READ-ONLY)\n", p.Source)
+				}
+			}
+			if profileName == "" {
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"\n(no profile selected; pass --profile NAME or set GBOUNCE_PROFILE)")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&profileName, "profile", "",
+		"Profile to mark as active in the listing. Falls back to GBOUNCE_PROFILE.")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.gbounce/profiles.yaml).")
+	return cmd
+}
+
+// newProfileShowCmd implements `gbounce profile show NAME` per
+// #378 / §A42. Prints the named profile's fields for inspection.
+// Symmetric with kbouncer / dbounce / ibouncer per
+// [[cross-product-agent-parity]].
+func newProfileShowCmd() *cobra.Command {
+	var profilesPath string
+	cmd := &cobra.Command{
+		Use:   "show NAME",
+		Short: "Show full detail for a single profile",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			if profilesPath == "" {
+				p, err := profile.DefaultProfilesPath()
+				if err != nil {
+					return err
+				}
+				profilesPath = p
+			}
+			profiles, err := profile.LoadProfiles(profilesPath)
+			if err != nil {
+				return fmt.Errorf("load profiles: %w", err)
+			}
+			p, err := profiles.Active(name)
+			if err != nil {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"gbounce: profile %q not found (loaded: %s)\n",
+					name, strings.Join(profiles.NamesSorted(), ", "))
+				os.Exit(1)
+			}
+			w := cmd.OutOrStdout()
+			fmt.Fprintf(w, "name:         %s\n", p.Name)
+			if p.Description != "" {
+				fmt.Fprintf(w, "description:  %s\n", p.Description)
+			}
+			source := p.Source
+			if source == "" {
+				source = "local"
+			}
+			fmt.Fprintf(w, "source:       %s\n", source)
+			if len(p.DenyHosts) > 0 {
+				fmt.Fprintln(w, "deny_hosts:")
+				for _, h := range p.DenyHosts {
+					fmt.Fprintf(w, "  - %s\n", h)
+				}
+			}
+			if n := len(p.DenyRules); n > 0 {
+				fmt.Fprintf(w, "deny_rules: %d\n", n)
+				for _, r := range p.DenyRules {
+					line := r.Host
+					if r.PathPrefix != "" {
+						line += " path_prefix=" + r.PathPrefix
+					}
+					if r.Path != "" {
+						line += " path=" + r.Path
+					}
+					if r.PathRegex != "" {
+						line += " path_regex=" + r.PathRegex
+					}
+					switch m := r.Method.(type) {
+					case string:
+						if m != "" {
+							line += " method=" + m
+						}
+					case []string:
+						if len(m) > 0 {
+							line += " methods=" + strings.Join(m, ",")
+						}
+					}
+					if r.Reason != "" {
+						line += " (" + r.Reason + ")"
+					}
+					fmt.Fprintf(w, "  - %s\n", line)
+				}
+			}
+			if n := len(p.AllowRules); n > 0 {
+				fmt.Fprintf(w, "allow_rules: %d (round-trip only — not enforced in v1.0)\n", n)
+				for _, r := range p.AllowRules {
+					fmt.Fprintf(w, "  - %s\n", r.Host)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.gbounce/profiles.yaml).")
 	return cmd
 }
 

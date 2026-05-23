@@ -118,6 +118,9 @@ func newRootCmd() *cobra.Command {
 	// will populate the catalog when gbounce gains a YAML profiles
 	// surface. Per [[cross-product-agent-parity]].
 	root.AddCommand(newProfileCmd())
+	// #363 / §A32 — `gbounce mcp {serve,install-*,show-config,list-tools}`.
+	// Cross-product CLI parity with dbounce / kbouncer / ibounce.
+	root.AddCommand(newMCPCmd())
 	return root
 }
 
@@ -197,6 +200,15 @@ func newRunCmd() *cobra.Command {
 		// appear — startup is NOT an error condition.
 		dynamicDeniesPath    string
 		disableDynamicDenies bool
+		// #376 / §A41 — active profile name. When set, gbounce loads
+		// the profile from --profiles-path (default ~/.gbounce/profiles.yaml)
+		// + unions its deny_hosts with --deny-host / --deny-hosts-file at
+		// runtime. Per [[creates-never-mutates]] the merge is additive:
+		// CLI denies always apply; profile denies stack on top. Symmetric
+		// flag shape with kbouncer / dbounce / ibounce per
+		// [[cross-product-agent-parity]].
+		profileName  string
+		profilesPath string
 		// #317 — cloud-neutral S3-compatible NDJSON object-storage
 		// sink. All fields OFF by default. Per [[self-host-zero-
 		// billing-dependency]] the bucket is operator-owned. Per
@@ -477,6 +489,60 @@ so liveness probes never touch the proxy data path.`,
 					denyHostsMerged = append(denyHostsMerged, r.Raw)
 				}
 			}
+
+			// #376 / §A41 — active-profile resolution + deny_hosts merge.
+			// Precedence: --profile flag > GBOUNCE_PROFILE env var. When
+			// neither is set the profile layer is a no-op; only CLI denies
+			// + dynamic denies apply (the pre-#376 shape). When a profile
+			// is loaded its deny_hosts stack on top of the CLI list (union
+			// semantics; CLI denies always apply). deny_rules from the
+			// profile are surfaced to the MITM-mode rule list (see below).
+			// Per [[v1-scope-bar]] AllowRules are NOT enforced in v1.0 —
+			// they round-trip on disk so a generator-emitted profile
+			// installs cleanly; enforcement waits for #377 in v1.1.
+			activeProfileName := profileName
+			if activeProfileName == "" {
+				activeProfileName = os.Getenv("GBOUNCE_PROFILE")
+			}
+			var activeProfile *profile.Profile
+			if activeProfileName != "" {
+				resolvedProfilesPath := profilesPath
+				if resolvedProfilesPath == "" {
+					p, perr := profile.DefaultProfilesPath()
+					if perr != nil {
+						return fmt.Errorf("--profile %q: resolve profiles path: %w", activeProfileName, perr)
+					}
+					resolvedProfilesPath = p
+				}
+				profiles, perr := profile.LoadProfiles(resolvedProfilesPath)
+				if perr != nil {
+					return fmt.Errorf("--profile %q: load %s: %w", activeProfileName, resolvedProfilesPath, perr)
+				}
+				ap, aerr := profiles.Active(activeProfileName)
+				if aerr != nil {
+					return fmt.Errorf("--profile %q: %w", activeProfileName, aerr)
+				}
+				activeProfile = ap
+				// Union profile.DenyHosts onto the CLI/file list. Profile
+				// hosts go AFTER CLI entries so a CLI deny that's more
+				// specific shadows a profile entry at match time (deny
+				// rules are first-match-wins in proxy/deny_hosts.go).
+				denyHostsMerged = append(denyHostsMerged, ap.DenyHosts...)
+				// Compile profile.DenyRules into proxy/profile.Rule slice
+				// for MITM-mode enforcement. The non-MITM proxy path only
+				// consults deny_hosts; that union above is sufficient for
+				// discovery-mode profile enforcement.
+				if mode == "mitm" {
+					for _, spec := range ap.DenyRules {
+						r, rerr := profile.ParseRule(spec)
+						if rerr != nil {
+							return fmt.Errorf("--profile %q: deny_rules: %w", activeProfileName, rerr)
+						}
+						mitmRules = append(mitmRules, r)
+					}
+				}
+			}
+			_ = activeProfile
 
 			// #324d — dynamic-deny watcher. Constructed BEFORE
 			// proxy.NewServer so the watcher's initial in-memory
@@ -770,6 +836,23 @@ so liveness probes never touch the proxy data path.`,
 			"port triggers an immediate reload for cross-bouncer fan-out "+
 			"orchestration (#324e). Parse errors retain the previous "+
 			"in-memory snapshot + emit an admin-action OCSF event.")
+	// #376 / §A41 — profile activation flags. Symmetric with
+	// kbouncer / dbounce / ibounce per [[cross-product-agent-parity]].
+	// Precedence: --profile flag > GBOUNCE_PROFILE env var. Unset =
+	// no profile loaded; pre-#376 shape preserved.
+	cmd.Flags().StringVar(&profileName, "profile", "",
+		"#376 — active environment profile name (loaded from "+
+			"--profiles-path). When set, the profile's deny_hosts are "+
+			"UNIONED with --deny-host / --deny-hosts-file at runtime so the "+
+			"proxy enforces both. Falls back to GBOUNCE_PROFILE env var. "+
+			"Unset = no profile loaded (pre-#376 shape). Install profiles "+
+			"with `gbounce profile install --from URL_OR_PATH`; list with "+
+			"`gbounce profile list`. AllowRules round-trip but are NOT "+
+			"enforced in v1.0 (queued for #377 in v1.1 per "+
+			"[[v1-scope-bar]]).")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.gbounce/profiles.yaml; honors "+
+			"GBOUNCE_PROFILES_PATH).")
 	cmd.Flags().BoolVar(&disableDynamicDenies, "disable-dynamic-denies", false,
 		"#324d — turn the dynamic-deny watcher off entirely. The proxy "+
 			"falls back to the pre-#324d static-only `--deny-host` / "+
