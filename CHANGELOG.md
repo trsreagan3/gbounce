@@ -31,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **#342 / §A23 — Formal Apache-2.0 LICENSE + NOTICE + README license attribution** (2026-05-23) —
+  gbounce's `LICENSE` file had the canonical Apache-2.0 text but an
+  unfilled `Copyright [yyyy] [name of copyright owner]` boilerplate
+  line; this slice fills it with `Copyright 2026 trsreagan3` (founder
+  direction) and adds a `NOTICE` file with the per-product attribution
+  shape. The README `## License` section (previously a bare
+  `Apache-2.0.` one-liner) now reads `Apache-2.0 — see [LICENSE](./LICENSE).
+  Copyright 2026 trsreagan3.` Same change shipped in iam-roles +
+  kbouncer + dbounce so the Bounce suite presents one coherent license
+  posture per `[[cross-product-agent-parity]]`. Unblocks: Anthropic
+  Cyber Verification Program application + iam-jit-vs-OneCLI
+  competitive-matrix accuracy. Per-source-file SPDX-License-Identifier
+  headers DEFERRED to v1.1 per `[[deliberate-feature-completion]]`.
+
 - **#324d — dynamic-deny YAML watcher + matcher extension + mgmt-port reload endpoint** (2026-05-22) —
   gbounce now consumes the cross-product
   `~/.iam-jit/dynamic-denies.yaml` file. The on-disk shape + cross-bouncer
