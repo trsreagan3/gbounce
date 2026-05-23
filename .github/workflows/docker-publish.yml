@@ -124,6 +124,13 @@ jobs:
           # default), and we never actually forward a request to the
           # placeholder — /healthz is served locally so it answers
           # regardless of upstream reachability.
+          #
+          # --audit-events-token is mandatory when --mgmt-host is non-
+          # loopback (binding 0.0.0.0 inside the container is needed so
+          # the docker bridge can forward host requests in). The smoke
+          # isn't exercising /audit/events; we just need a value that
+          # satisfies the gate. Random hex is fine for a throwaway run.
+          SMOKE_TOKEN="$(openssl rand -hex 16)"
           docker run -d --name gb-smoke \
             -p 18080:8080 \
             -p 18769:8769 \
@@ -135,6 +142,7 @@ jobs:
               --mgmt-host 0.0.0.0 \
               --mgmt-port 8769 \
               --i-know-this-binds-externally \
+              --audit-events-token "${SMOKE_TOKEN}" \
               --upstream https://example.invalid
 
           # Wait for the mgmt port to come up + answer /healthz.
