@@ -56,6 +56,7 @@ import (
 	"github.com/trsreagan3/gbounce/internal/mitm"
 	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/store"
+	"github.com/trsreagan3/gbounce/internal/structureddeny"
 )
 
 // Mode is the proxy's operating mode. G-Slice 1 ships ModeDiscovery
@@ -705,9 +706,11 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 					rule.DynamicDenyRuleID, rule.Raw)
 			}
 			s.recordDenyWithSource(r, startedAt, http.StatusForbidden, reason, rule)
-			http.Error(w,
-				"gbounce: request denied by deny_hosts rule: "+rule.Raw,
-				http.StatusForbidden)
+			// #459 / §A57b — structured-deny wire shape per
+			// [[cross-product-agent-parity]]. Legacy `error` field
+			// preserved for old clients per [[creates-never-mutates]].
+			legacyMsg := "gbounce: request denied by deny_hosts rule: " + rule.Raw
+			writeStructuredDeny403(w, r, rule, legacyMsg, classifyGbounceDenySource(rule))
 			s.totalErrors.Add(1)
 			return
 		}
@@ -817,9 +820,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 			// + ReconstructOverridesFromRow can distinguish deny_hosts
 			// (403) from "non-CONNECT on CONNECT-only listener" (421).
 			s.recordDenyWithSource(r, startedAt, http.StatusForbidden, reason, rule)
-			http.Error(w,
-				"gbounce: CONNECT denied by deny_hosts rule: "+rule.Raw,
-				http.StatusForbidden)
+			// #459 / §A57b — structured-deny wire shape per
+			// [[cross-product-agent-parity]]. The CONNECT path returns
+			// the JSON body BEFORE the tunnel handshake; the client
+			// sees the structured deny exactly like the non-CONNECT
+			// path. Legacy `error` field preserved per
+			// [[creates-never-mutates]].
+			legacyMsg := "gbounce: CONNECT denied by deny_hosts rule: " + rule.Raw
+			writeStructuredDeny403(w, r, rule, legacyMsg, classifyGbounceDenySource(rule))
 			s.totalErrors.Add(1)
 			return
 		}
@@ -1502,4 +1510,128 @@ func LicensedForGbounce(mode Mode) error {
 		return nil
 	}
 	return fmt.Errorf("gbounce: mode %q requires a paid-tier license (see #235 license-file plumbing); falling back to discovery", mode)
+}
+
+// writeStructuredDeny403 emits the gbounce 403 wire body shaped per
+// the canonical structured-deny schema (#459 / §A57b). Mirrors Python
+// ibounce's 403 emit at iam_jit.bouncer.proxy.py:~3060 so an agent
+// receives identical field names regardless of which bouncer caught
+// the request — per [[cross-product-agent-parity]].
+//
+// Per [[creates-never-mutates]] the legacy `error` field is preserved
+// so old grep-on-`error` clients keep working. The structured-deny
+// fields are ADDITIVE.
+//
+// Per [[ambient-value-prop-and-friction-framing]] the wire shape
+// leads with caught_by_bouncer (never "ERROR" / "DENIED" / "BLOCKED").
+//
+// Per [[ibounce-honest-positioning]] the classifier_hook field is set
+// to "go-heuristic-only" so an operator can tell at a glance that
+// this 403 was not classified by the LLM (which Python ibounce can
+// call).
+func writeStructuredDeny403(w http.ResponseWriter, r *http.Request, rule *DenyHostRule, legacyMsg, denySource string) {
+	host := r.Host
+	if r.URL != nil && r.URL.Host != "" {
+		host = r.URL.Host
+	}
+	if host == "" && rule != nil {
+		host = rule.Raw
+	}
+	hostOnly, _ := splitHostPortStr(host)
+	if hostOnly == "" {
+		hostOnly = host
+	}
+
+	action := gbounceStructuredDenyAction(r)
+	resource := hostOnly
+	ruleID := ""
+	if rule != nil {
+		ruleID = rule.DynamicDenyRuleID
+	}
+	deny := structureddeny.Build(structureddeny.BuildOptions{
+		Bouncer:               "gbounce",
+		Action:                action,
+		Resource:              resource,
+		DenyReason:            legacyMsg,
+		DenySource:            denySource,
+		RuleIDIfDynamic:       ruleID,
+		SuggestedAllowCommand: gbounceSuggestedAllowCommand(rule, resource, action, denySource),
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	body := map[string]any{
+		// Legacy keys (preserved per [[creates-never-mutates]] so old
+		// SDK clients + scripts grepping on `error` keep working).
+		"error":           legacyMsg,
+		"decision_verdict": "deny",
+		"decision_reason":  legacyMsg,
+		// #459 — structured-deny additive fields.
+		"caught_by_bouncer":                  deny.CaughtByBouncer,
+		"is_likely_injection_classification": deny.IsLikelyInjectionClassification,
+		"suggested_allow_command":            deny.SuggestedAllowCommand,
+		"recommended_action":                 deny.RecommendedAction,
+		"deny_event_id":                      deny.DenyEventID,
+		"classifier_hook":                    deny.ClassifierHook,
+		"deny_source_classified":             deny.DenySourceClassified,
+		"structured_deny_schema_version":     deny.StructuredDenySchemaVersion,
+	}
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// gbounceStructuredDenyAction builds the gbounce-shaped action
+// "METHOD:/path-prefix" used by the structureddeny heuristic. The
+// path is left intact (not truncated) so destructive-verb path
+// segments like "/users/delete" trip the heuristic.
+func gbounceStructuredDenyAction(r *http.Request) string {
+	method := r.Method
+	if method == "" {
+		method = "GET"
+	}
+	path := ""
+	if r.URL != nil {
+		path = r.URL.Path
+	}
+	if path == "" {
+		path = "/"
+	}
+	return method + ":" + path
+}
+
+// gbounceSuggestedAllowCommand synthesizes a one-line `gbounce profile
+// allow ...` command for the agent to surface to an operator. When the
+// deny is a dynamic-deny rule the command starts with `#` so
+// DeriveRecommendedAction routes to rephrase+retry — dynamic-deny
+// rules aren't allow-able from the CLI; the operator has to edit the
+// YAML.
+func gbounceSuggestedAllowCommand(rule *DenyHostRule, host, action, denySource string) string {
+	if denySource == "dynamic_deny" {
+		ruleID := ""
+		if rule != nil {
+			ruleID = rule.DynamicDenyRuleID
+		}
+		return "# dynamic-deny rule " + ruleID +
+			" — edit the dynamic-deny YAML to allow this; rephrase+retry"
+	}
+	if host == "" {
+		host = "*"
+	}
+	if action == "" {
+		action = "*"
+	}
+	return "gbounce profile allow --target " + host +
+		" --action " + action +
+		" --reason '<why is this safe?>'"
+}
+
+// classifyGbounceDenySource maps a DenyHostRule onto the canonical
+// deny_source enum the structureddeny package understands.
+func classifyGbounceDenySource(rule *DenyHostRule) string {
+	if rule == nil {
+		return "unknown"
+	}
+	if rule.Source == DenySourceDynamic {
+		return "dynamic_deny"
+	}
+	return "deny_hosts"
 }

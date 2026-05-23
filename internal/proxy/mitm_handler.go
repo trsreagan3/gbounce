@@ -17,6 +17,7 @@ package proxy
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -29,6 +30,7 @@ import (
 	"github.com/trsreagan3/gbounce/internal/mitm"
 	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/store"
+	"github.com/trsreagan3/gbounce/internal/structureddeny"
 )
 
 // maxBodySnapshotBytes caps the in-memory request/response body
@@ -193,11 +195,15 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 	if rule := profile.FirstMatch(s.mitmRules, true, host, port, req.Method, req.URL.Path, req.URL.RawQuery); rule != nil {
 		s.totalMITMDenies.Add(1)
 		s.recordMITMDeny(req, host, port, startedAt, rule)
-		body := "gbounce: request denied by profile rule"
+		legacyMsg := "gbounce: request denied by profile rule"
 		if rule.Reason != "" {
-			body += ": " + rule.Reason
+			legacyMsg += ": " + rule.Reason
 		}
-		writeRawHTTPResponse(clientConn, req, http.StatusForbidden, body)
+		// #459 / §A57b — emit the structured-deny JSON body on the
+		// MITM path so the agent sees the same caught_by_bouncer
+		// framing it gets from the non-MITM and CONNECT paths. Per
+		// [[cross-product-agent-parity]].
+		writeRawHTTPStructuredDenyResponse(clientConn, req, host, legacyMsg, "static_profile")
 		return
 	}
 
@@ -549,4 +555,70 @@ func truncErr(err error) string {
 		return s[:256] + "..."
 	}
 	return s
+}
+
+// writeRawHTTPStructuredDenyResponse is the MITM-path equivalent of
+// proxy.go's writeStructuredDeny403 — produces a structured-deny JSON
+// body on the TLS-terminated client conn so the agent sees the same
+// caught_by_bouncer wire shape it gets from the non-MITM and CONNECT
+// paths (#459 / §A57b, [[cross-product-agent-parity]]).
+//
+// Per [[creates-never-mutates]] the legacy `error` field is preserved.
+// Per [[ibounce-honest-positioning]] the classifier_hook field is set
+// to "go-heuristic-only".
+func writeRawHTTPStructuredDenyResponse(w io.Writer, req *http.Request, host, legacyMsg, denySource string) {
+	if w == nil {
+		return
+	}
+	method := req.Method
+	if method == "" {
+		method = "GET"
+	}
+	path := "/"
+	if req.URL != nil && req.URL.Path != "" {
+		path = req.URL.Path
+	}
+	action := method + ":" + path
+	suggested := "gbounce profile allow --target " + host +
+		" --action " + action + " --reason '<why is this safe?>'"
+	deny := structureddeny.Build(structureddeny.BuildOptions{
+		Bouncer:               "gbounce",
+		Action:                action,
+		Resource:              host,
+		DenyReason:            legacyMsg,
+		DenySource:            denySource,
+		SuggestedAllowCommand: suggested,
+	})
+	body := map[string]any{
+		"error":                              legacyMsg,
+		"decision_verdict":                   "deny",
+		"decision_reason":                    legacyMsg,
+		"caught_by_bouncer":                  deny.CaughtByBouncer,
+		"is_likely_injection_classification": deny.IsLikelyInjectionClassification,
+		"suggested_allow_command":            deny.SuggestedAllowCommand,
+		"recommended_action":                 deny.RecommendedAction,
+		"deny_event_id":                      deny.DenyEventID,
+		"classifier_hook":                    deny.ClassifierHook,
+		"deny_source_classified":             deny.DenySourceClassified,
+		"structured_deny_schema_version":     deny.StructuredDenySchemaVersion,
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		// Fallback to the plain text path so we never silently drop
+		// the deny on the wire.
+		writeRawHTTPResponse(w, req, http.StatusForbidden, legacyMsg)
+		return
+	}
+	resp := &http.Response{
+		Status:        fmt.Sprintf("%d %s", http.StatusForbidden, http.StatusText(http.StatusForbidden)),
+		StatusCode:    http.StatusForbidden,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		ContentLength: int64(len(bodyBytes)),
+		Body:          io.NopCloser(strings.NewReader(string(bodyBytes))),
+		Request:       req,
+	}
+	_ = resp.Write(w)
 }
