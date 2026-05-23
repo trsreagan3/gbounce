@@ -1,23 +1,33 @@
 // Cobra `gbounce profile ...` subcommands.
 //
-// v1.0 carries only the `doctor` subcommand per cross-product CLI
-// parity (task #321 / KNOWN-CAVEATS §A19). gbounce doesn't ship a
-// profiles.yaml in v1.0 — profile rules are explicit-file via
-// --profile-rules-file (JSON) — but the doctor surface exists so an
-// orchestrator can run `<product> profile doctor` against any
-// Bounce product without per-product branching. G-Slice 2 will
-// extend this with list / show / install once gbounce gains a YAML
-// profiles surface.
+// v1.0 ships:
+//
+//   - `gbounce profile doctor` — cross-product CLI parity surface
+//     (task #321 / KNOWN-CAVEATS §A19).
+//
+//   - `gbounce profile install` — §A27 (#352): install a YAML profile
+//     bundle emitted by `iam-jit profile generate-from-audit` (or
+//     hand-authored). Pre-§A27 the generator's `gbounce.yaml` slot
+//     had no install path, breaking the launch claim that "the
+//     generator emits a working profile for all 4 bouncers."
+//
+// G-Slice 2 will extend this with list / show once the on-disk
+// profiles surface matures.
 
 package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	neturl "net/url"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/trsreagan3/gbounce/internal/audit"
 	"github.com/trsreagan3/gbounce/internal/profile"
 )
 
@@ -25,21 +35,22 @@ import (
 func newProfileCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "profile",
-		Short: "Manage gbounce profiles (v1.0: doctor only — see G-Slice 2 for list/show/install)",
-		Long: `gbounce v1.0 ships only the ` + "`gbounce profile doctor`" + ` subcommand
-for cross-product CLI parity with ibounce + kbouncer + dbounce.
+		Short: "Manage gbounce profiles (doctor + install)",
+		Long: `gbounce profile management.
 
-gbounce profile rules are loaded via ` + "`--profile-rules-file`" + ` (JSON)
-or ` + "`--deny-host`" + ` / ` + "`--deny-hosts-file`" + ` (newline / YAML list) on
-` + "`gbounce run`" + `, not from a shipped-default profiles.yaml in the
-home directory. There's no shipped-default profile that could
-silently go behind in v1.0 — so ` + "`gbounce profile doctor`" + ` always
-reports "current" + a Notes line explaining the architectural
-difference.
+  gbounce profile doctor    diff installed profile against shipped
+                            defaults (v1.0: no-op — gbounce ships no
+                            defaults yet; surface exists for cross-
+                            product CLI parity with ibounce + kbouncer
+                            + dbounce per [[cross-product-agent-parity]])
 
-G-Slice 2 (queued) will add the YAML profiles surface + the full
-doctor / list / show / install surface in lockstep with the other
-three bouncers.`,
+  gbounce profile install   install profile YAML from a URL / file /
+                            generator-emitted bundle directory.
+                            Accepts the canonical ` + "`profiles:`" + `
+                            shape AND the per-bouncer single-profile
+                            shape (` + "`schema_version` + `profile_name`" + ` +
+                            ` + "`bouncer` + `denies` + `allows`" + `)
+                            emitted by ` + "`iam-jit profile generate-from-audit`" + `.`,
 		Args: cobra.NoArgs,
 	}
 	cmd.RunE = func(c *cobra.Command, args []string) error {
@@ -55,6 +66,7 @@ three bouncers.`,
 		return nil
 	}
 	cmd.AddCommand(newProfileDoctorCmd())
+	cmd.AddCommand(newProfileInstallCmd())
 	return cmd
 }
 
@@ -173,7 +185,7 @@ addition.`,
 		},
 	}
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
-		"Path to profiles.yaml (v1.0: gbounce doesn't ship one; reserved for G-Slice 2).")
+		"Path to profiles.yaml (default: ~/.gbounce/profiles.yaml; honors GBOUNCE_PROFILES_PATH).")
 	cmd.Flags().BoolVar(&apply, "apply", false,
 		"Additively merge missing default fields (v1.0: no-op).")
 	cmd.Flags().BoolVar(&acknowledge, "acknowledge", false,
@@ -186,3 +198,161 @@ addition.`,
 		"Emit machine-readable JSON envelope (matches sibling products).")
 	return cmd
 }
+
+// newProfileInstallCmd implements `gbounce profile install` per
+// §A27 (#352). Symmetric with kbouncer / dbounce / ibouncer `profile
+// install`; same exit-code mapping; same source URL semantics.
+//
+// Exit codes:
+//
+//	0  success
+//	1  payload / fetch problem (malformed YAML, validation error,
+//	   fetch failed) — usually an upstream-curator issue
+//	2  operator-fixable problem (unknown scheme, sha256 mismatch,
+//	   conflict without --force)
+func newProfileInstallCmd() *cobra.Command {
+	var (
+		fromURL        string
+		expectedSHA256 string
+		force          bool
+		timeoutSecs    int
+		profilesPath   string
+		auditLogPath   string
+	)
+	cmd := &cobra.Command{
+		Use:   "install --from URL_OR_PATH [--sha256 HEX] [--force] [--timeout 10]",
+		Short: "Fetch + install profiles from a URL, file, or generator bundle",
+		Long: `Install profiles from any of:
+
+  * an HTTPS URL — preferred + recommended distribution channel
+    (IT teams publish curated profiles at an internal URL, engineers
+    install them on day 1).
+
+      gbounce profile install --from https://internal.example/profiles.yaml
+
+  * an HTTP URL — accepted for local-dev parity with the audit-export
+    HTTP surface. A one-line WARN fires for non-loopback hosts;
+    loopback gets a silent pass.
+
+  * file:///abs/path/...  or a bare local path (relative or absolute)
+    — accepts a single YAML file OR a bundle directory produced by
+    ` + "`iam-jit profile generate-from-audit`" + `; the directory
+    form looks for ` + "`gbounce.yaml`" + ` first then falls back to
+    ` + "`index.yaml`" + ` + the bouncer entry naming gbounce.
+
+      gbounce profile install --from ./profiles/
+
+The source string becomes the ` + "`source`" + ` of each installed
+profile. Profiles with a non-local source are READ-ONLY at the CLI
+surface — engineers cannot edit them to bypass org guardrails (the
+canonical write entry point, UpsertProfile, refuses to overwrite).
+
+Conflict policy: if a profile of the same name already exists,
+install refuses without --force. --force overrides the conflict
+gate but still records the new source.
+
+Generator schema bridge: the generator emits a per-bouncer YAML with
+top-level ` + "`schema_version` + `profile_name` + `bouncer` + `denies` + `allows`" + `
+fields. gbounce's parser accepts BOTH that shape and the canonical
+` + "`profiles:`" + ` shape, mapping ` + "`denies[].target`" + ` (hostname or
+` + "`*.domain`" + `) into ` + "`deny_hosts`" + ` and rules with
+explicit ` + "`actions:` / `target: host/path`" + ` into ` + "`deny_rules`" + `.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts := profile.InstallOptions{
+				From:           fromURL,
+				ExpectedSHA256: expectedSHA256,
+				Force:          force,
+				Timeout:        time.Duration(timeoutSecs) * time.Second,
+				ProfilesPath:   profilesPath,
+			}
+			// Per §A26 mirror: WARN for non-loopback http://. We do
+			// NOT block at the profile package layer (local-dev parity
+			// with the audit-export HTTP surface); the warning surfaces
+			// at the CLI so the operator sees it.
+			if parsed, perr := neturl.Parse(fromURL); perr == nil &&
+				strings.EqualFold(parsed.Scheme, "http") {
+				host := parsed.Hostname()
+				isLoopback := host == "localhost" || host == "127.0.0.1" || host == "::1"
+				if !isLoopback {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"WARN: fetching %q over plaintext HTTP — a network "+
+							"attacker can MITM-substitute a permissive profile. "+
+							"Prefer https:// for IT-distributed profiles. This "+
+							"warning does NOT block the install (per §A26 local-"+
+							"dev parity with audit-export HTTP).\n", fromURL)
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "loading %s ...\n", fromURL)
+			result, err := profile.Install(cmd.Context(), opts)
+			if err != nil {
+				var ie *profile.InstallError
+				if errors.As(err, &ie) {
+					fmt.Fprintln(cmd.ErrOrStderr(), ie.Message)
+					os.Exit(ie.ExitCode)
+				}
+				return err
+			}
+
+			// Admin-action audit event per [[cross-product-agent-parity]]:
+			// kbounce + dbounce + ibouncer emit the same OCSF row on
+			// install. Only fires when --audit-log-path is set (gbounce's
+			// established pattern across backup / config / diagnostics).
+			emitAdminAction(auditLogPath, audit.AdminActionInput{
+				Action:     audit.AdminActionProfileInstall,
+				Actor:      currentActor(),
+				EntityKind: "profile",
+				EntityName: strings.Join(result.InstalledNames, ","),
+				Source:     audit.AdminActionSourceCLI,
+				Before:     nil,
+				After: map[string]any{
+					"installed_profiles": result.InstalledNames,
+					"source":             result.SourceURL,
+					"sha256":             result.SHA256,
+				},
+				ExtraExt: map[string]any{
+					"source":          result.SourceURL,
+					"sha256":          result.SHA256,
+					"sha256_verified": result.SHA256Verified,
+					"installed_count": len(result.InstalledNames),
+					"profiles_path":   result.ProfilesPath,
+				},
+			})
+
+			if result.SHA256Verified {
+				fmt.Fprintf(cmd.OutOrStdout(), "sha256 verified: %s\n", result.SHA256)
+			} else {
+				fmt.Fprintf(cmd.OutOrStdout(), "sha256 (no pin given): %s\n", result.SHA256)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"installed %d profile(s) into %s:\n",
+				len(result.InstalledNames), result.ProfilesPath)
+			for _, name := range result.InstalledNames {
+				fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", name)
+			}
+			fmt.Fprintln(cmd.OutOrStdout())
+			fmt.Fprintln(cmd.OutOrStdout(),
+				"These profiles are READ-ONLY (sourced from URL); "+
+					"edit the upstream YAML + re-install to update.")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&fromURL, "from", "",
+		"URL or local path of a profile YAML / bundle. Required.")
+	_ = cmd.MarkFlagRequired("from")
+	cmd.Flags().StringVar(&expectedSHA256, "sha256", "",
+		"Optional SHA-256 (hex) of the fetched bytes. Mismatch → exit 2.")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"Overwrite existing profiles of the same name.")
+	cmd.Flags().IntVar(&timeoutSecs, "timeout", 10,
+		"HTTPS fetch timeout in seconds.")
+	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
+		"Path to profiles.yaml (default: ~/.gbounce/profiles.yaml; honors GBOUNCE_PROFILES_PATH).")
+	cmd.Flags().StringVar(&auditLogPath, "audit-log-path", "",
+		"Append the admin-action OCSF event to this JSONL audit log. "+
+			"When empty, the install is performed but NOT recorded in the "+
+			"audit-export channel. Point this at the same file the proxy "+
+			"daemon's --audit-log-path uses so all events land in one stream.")
+	return cmd
+}
+

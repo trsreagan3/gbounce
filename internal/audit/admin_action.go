@@ -104,6 +104,16 @@ const (
 	// installed an invalid file sees it immediately rather than
 	// "silently 0 rules applied."
 	AdminActionDynamicDenyParseError AdminAction = "dynamic_deny.parse_error"
+
+	// AdminActionProfileInstall — §A27 (#352). A `gbounce profile
+	// install` succeeded. Carries the source URL / path + the SHA-256
+	// of the fetched bytes + the names of the profiles that were
+	// installed so a SIEM analyst can answer "who installed which
+	// profile from where + when?" without reading the on-disk
+	// profiles.yaml. Mirrors the kbounce + dbounce + ibouncer
+	// constants of the same name. Severity Informational, Activity
+	// Create (the destination's profile-set is enlarged).
+	AdminActionProfileInstall AdminAction = "profile.install"
 )
 
 // AdminActionActivityID maps an action to its OCSF activity_id (class
@@ -112,7 +122,8 @@ const (
 // regardless of which Bounce product fired the event.
 func AdminActionActivityID(a AdminAction) int {
 	switch a {
-	case AdminActionConfigImport:
+	case AdminActionConfigImport, AdminActionProfileInstall:
+		// Install brings new profiles into existence on disk → Create.
 		return ActivityCreate
 	case AdminActionBackupRestore:
 		// Restore wholesale REPLACES the destination DB. CRUD-wise
