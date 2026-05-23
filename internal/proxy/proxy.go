@@ -552,6 +552,62 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #353 / §A28 — deny_hosts evaluation in reverse-proxy mode. Mirrors
+	// handleConnect's pre-dial check shape so a denied host never causes
+	// an outbound upstream request. Match against BOTH the inbound Host
+	// header (what the client targeted) AND the configured upstream host
+	// (what we'd actually dial). This catches:
+	//
+	//   - operators who deny by the requested vhost (`--deny-host evil.com`
+	//     + `curl -H "Host: evil.com" http://proxy/...`)
+	//   - operators who deny by the proxy's upstream destination
+	//     (`--deny-host 169.254.169.254` + `--upstream http://169.254.169.254`)
+	//
+	// Both shapes appeared in the dogfood repro. Port is stripped before
+	// the match — the matcher is port-agnostic per deny_hosts.go.
+	effective, _ := s.effectiveDenyRules()
+	if len(effective) > 0 {
+		// Check the inbound Host header first (the client's intent).
+		candidates := make([]string, 0, 2)
+		if r.Host != "" {
+			h, _ := splitHostPortStr(r.Host)
+			if h == "" {
+				h = r.Host
+			}
+			candidates = append(candidates, h)
+		}
+		// Then the upstream the proxy would dial.
+		if s.upstreamURL.Host != "" {
+			h, _ := splitHostPortStr(s.upstreamURL.Host)
+			if h == "" {
+				h = s.upstreamURL.Host
+			}
+			candidates = append(candidates, h)
+		}
+		for _, denyHost := range candidates {
+			rule := MatchDenyHosts(effective, denyHost)
+			if rule == nil {
+				continue
+			}
+			if rule.Source == DenySourceDynamic {
+				s.totalDynamicDenyMatches.Add(1)
+			} else {
+				s.totalDenyHostMatches.Add(1)
+			}
+			reason := fmt.Sprintf("matched deny_hosts: %s", rule.Raw)
+			if rule.Source == DenySourceDynamic && rule.DynamicDenyRuleID != "" {
+				reason = fmt.Sprintf("matched dynamic-deny rule %s (%s)",
+					rule.DynamicDenyRuleID, rule.Raw)
+			}
+			s.recordDenyWithSource(r, startedAt, http.StatusForbidden, reason, rule)
+			http.Error(w,
+				"gbounce: request denied by deny_hosts rule: "+rule.Raw,
+				http.StatusForbidden)
+			s.totalErrors.Add(1)
+			return
+		}
+	}
+
 	// Rewrite onto the upstream scheme/host. The inbound request's
 	// path + query are preserved verbatim.
 	target := *s.upstreamURL
