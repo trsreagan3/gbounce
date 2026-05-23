@@ -121,6 +121,10 @@ func newRootCmd() *cobra.Command {
 	// #363 / §A32 — `gbounce mcp {serve,install-*,show-config,list-tools}`.
 	// Cross-product CLI parity with dbounce / kbouncer / ibounce.
 	root.AddCommand(newMCPCmd())
+	// #383 / §A42 — `gbounce posture` per-bouncer posture surface.
+	// Cross-product parity per [[cross-product-agent-parity]]; for
+	// the cross-product roll-up use `iam-jit posture` from iam-roles.
+	root.AddCommand(newPostureCmd())
 	return root
 }
 

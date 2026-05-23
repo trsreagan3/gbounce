@@ -45,6 +45,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/trsreagan3/gbounce/internal/dynamicdeny"
+	"github.com/trsreagan3/gbounce/internal/posture"
 	"github.com/trsreagan3/gbounce/internal/profile"
 )
 
@@ -189,8 +190,26 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolDenyAdd(args)
 	case "gbounce_deny_remove":
 		return s.toolDenyRemove(args)
+	case "gbounce_posture":
+		return s.toolPosture(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
+}
+
+// toolPosture surfaces gbounce's local posture (running / mode /
+// profile / HTTP_PROXY wiring / MISCONFIG). Read-only; takes no
+// arguments. Mirrors `gbounce posture --json` CLI shape. #383 / §A42.
+func (s *Server) toolPosture(_ map[string]any) (map[string]any, error) {
+	block := posture.Capture()
+	bs, err := json.Marshal(block)
+	if err != nil {
+		return nil, fmt.Errorf("posture: marshal: %w", err)
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(bs, &out); err != nil {
+		return nil, fmt.Errorf("posture: unmarshal: %w", err)
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------
