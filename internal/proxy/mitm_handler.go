@@ -73,18 +73,35 @@ func (s *Server) handleMITMConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// deny_hosts check — same shape as plain CONNECT. Runs BEFORE the
-	// hijack so a denied target never gets a 200 Connection
-	// established (the agent sees a clean 403).
-	if len(s.denyHosts) > 0 {
+	// deny_hosts check — same shape as plain CONNECT + handleForward.
+	// Runs BEFORE the hijack so a denied target never gets a 200
+	// Connection established (the agent sees a clean 403).
+	//
+	// §A28b (#358) — use s.effectiveDenyRules() so dynamic-deny entries
+	// (#324d) fire in MITM mode too. Pre-fix this called MatchDenyHosts
+	// against s.denyHosts directly, which meant dynamic-deny rules
+	// silently never evaluated for MITM CONNECT requests — only static
+	// `--deny-host` entries did. The audit-event shape matches the other
+	// two handlers (recordDenyWithSource sets ext.deny_source +
+	// ext.dynamic_deny_rule_id when applicable).
+	effective, _ := s.effectiveDenyRules()
+	if len(effective) > 0 {
 		denyHost, _ := splitHostPortStr(target)
 		if denyHost == "" {
 			denyHost = target
 		}
-		if rule := MatchDenyHosts(s.denyHosts, denyHost); rule != nil {
-			s.totalDenyHostMatches.Add(1)
+		if rule := MatchDenyHosts(effective, denyHost); rule != nil {
+			if rule.Source == DenySourceDynamic {
+				s.totalDynamicDenyMatches.Add(1)
+			} else {
+				s.totalDenyHostMatches.Add(1)
+			}
 			reason := fmt.Sprintf("matched deny_hosts: %s", rule.Raw)
-			s.recordDeny(r, startedAt, http.StatusForbidden, reason)
+			if rule.Source == DenySourceDynamic && rule.DynamicDenyRuleID != "" {
+				reason = fmt.Sprintf("matched dynamic-deny rule %s (%s)",
+					rule.DynamicDenyRuleID, rule.Raw)
+			}
+			s.recordDenyWithSource(r, startedAt, http.StatusForbidden, reason, rule)
 			http.Error(w, "gbounce: CONNECT denied by deny_hosts rule: "+rule.Raw,
 				http.StatusForbidden)
 			s.totalErrors.Add(1)
