@@ -185,6 +185,21 @@ type Config struct {
 	// redaction MARK + the bool surface so a SIEM can find which
 	// rows had a redacted body.
 	MITMAuditIncludeBodies bool
+
+	// DiskPressure (#461 / §A63c) is the optional disk-pressure
+	// circuit-breaker state. When non-nil the proxy:
+	//   - surfaces an audit_log block on /healthz with disk usage +
+	//     mode + refuse_requests flag,
+	//   - returns 503 with the #459 structured-deny shape on every
+	//     request when state.RefuseRequests() reports true
+	//     (pause-requests mode at critical / emergency),
+	//   - starts a background periodic goroutine in Serve() that
+	//     ticks every DiskPressureCheckInterval to re-evaluate state
+	//     + emit admin-action disk_pressure.transition OCSF events
+	//     on status changes.
+	// When nil the proxy behavior is byte-identical to the pre-#461
+	// shape per [[creates-never-mutates]].
+	DiskPressure *audit.DiskPressureState
 }
 
 // Normalize fills sensible defaults + returns the normalized Config.
@@ -558,6 +573,10 @@ func (s *Server) Serve(ctx context.Context) error {
 		close(proxyErr)
 	}()
 
+	// #461 / §A63c — start disk-pressure check loop. Goroutine exits
+	// when the Serve context is cancelled.
+	diskStop := s.startDiskPressureLoop(ctx)
+
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -570,12 +589,34 @@ func (s *Server) Serve(ctx context.Context) error {
 		if s.recorder != nil {
 			s.recorder.Stop()
 		}
+		if diskStop != nil {
+			close(diskStop)
+		}
 		return nil
 	case err := <-proxyErr:
+		if diskStop != nil {
+			close(diskStop)
+		}
 		return err
 	case err := <-mgmtErr:
+		if diskStop != nil {
+			close(diskStop)
+		}
 		return err
 	}
+}
+
+// startDiskPressureLoop launches the periodic check goroutine when
+// cfg.DiskPressure is set. Returns the stop channel for cleanup; nil
+// when the subsystem is disabled (so the caller's close path can
+// nil-check uniformly).
+func (s *Server) startDiskPressureLoop(ctx context.Context) chan struct{} {
+	if s == nil || s.cfg.DiskPressure == nil {
+		return nil
+	}
+	stop := make(chan struct{})
+	go audit.RunDiskPressureLoop(ctx, s.cfg.DiskPressure, s.log, stop)
+	return stop
 }
 
 // ServeListeners is a test helper that serves on caller-provided
@@ -598,6 +639,7 @@ func (s *Server) ServeListeners(ctx context.Context, proxyL, mgmtL net.Listener)
 		}
 		close(proxyErr)
 	}()
+	diskStop := s.startDiskPressureLoop(ctx)
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -611,10 +653,19 @@ func (s *Server) ServeListeners(ctx context.Context, proxyL, mgmtL net.Listener)
 		if s.recorder != nil {
 			s.recorder.Stop()
 		}
+		if diskStop != nil {
+			close(diskStop)
+		}
 		return nil
 	case err := <-proxyErr:
+		if diskStop != nil {
+			close(diskStop)
+		}
 		return err
 	case err := <-mgmtErr:
+		if diskStop != nil {
+			close(diskStop)
+		}
 		return err
 	}
 }
@@ -627,6 +678,17 @@ func (s *Server) ServeListeners(ctx context.Context, proxyL, mgmtL net.Listener)
 // handleMITMConnect (TLS terminate + decrypt + audit + re-encrypt).
 // The default ModeDiscovery shape is unchanged.
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
+	// #461 / §A63c — disk-pressure circuit breaker. In pause-requests
+	// mode at critical / emergency the proxy refuses every inbound
+	// request with 503 + the #459 structured-deny body BEFORE
+	// running the forward / connect dispatch. Refusing pre-evaluation
+	// avoids the audit-write race when the disk is already at the
+	// wall. Other modes (rotate-aggressively / archive-and-purge)
+	// never flip refuse_requests so this is a no-op for them.
+	if s.cfg.DiskPressure != nil && s.cfg.DiskPressure.RefuseRequests() {
+		writeDiskPressurePause(w, s.cfg.DiskPressure.Snapshot())
+		return
+	}
 	if r.Method == http.MethodConnect {
 		if s.cfg.Mode == ModeMITM {
 			s.handleMITMConnect(w, r)
@@ -636,6 +698,38 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleForward(w, r)
+}
+
+// writeDiskPressurePause emits the 503 refusal body when the
+// disk-pressure subsystem is in pause-requests mode at critical /
+// emergency. Wire shape mirrors the #459 structured-deny payload so
+// agents grep the same fields they'd see from a routine policy deny.
+func writeDiskPressurePause(w http.ResponseWriter, snap audit.DiskPressureSnapshot) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("x-gbounce-refusal", "disk-pressure-pause")
+	usedPct := 0.0
+	if snap.UsedPct != nil {
+		usedPct = *snap.UsedPct
+	}
+	reason := fmt.Sprintf(audit.PauseRequestsRefusalReasonTemplate, usedPct, snap.CritPct)
+	sd := structureddeny.Build(structureddeny.BuildOptions{
+		Bouncer:    "gbounce",
+		Action:     "disk_pressure.pause",
+		DenyReason: reason,
+		DenySource: "disk_pressure",
+	})
+	body := map[string]any{
+		"status":        "Failure",
+		"message":       reason,
+		"reason":        "ServiceUnavailable",
+		"code":          http.StatusServiceUnavailable,
+		"disk_pressure": snap,
+	}
+	for k, v := range sd.AsMap() {
+		body[k] = v
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // handleForward forwards a non-CONNECT request to the configured
@@ -934,8 +1028,22 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 			body["audit_log_last_error"] = e
 		}
 	}
+	// #461 / §A63c — disk-pressure subsystem snapshot + 503 status
+	// flip in pause-requests at critical / emergency. Per
+	// [[ibounce-honest-positioning]] every state crossing surfaces
+	// here so external monitors (liveness probes, monit) see the
+	// same paused-bouncer signal the request hot path uses.
+	statusCode := http.StatusOK
+	if s.cfg.DiskPressure != nil {
+		snap := s.cfg.DiskPressure.Snapshot()
+		body["audit_log"] = snap
+		if snap.RefuseRequests {
+			body["status"] = "degraded"
+			statusCode = http.StatusServiceUnavailable
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(body)
 }
 

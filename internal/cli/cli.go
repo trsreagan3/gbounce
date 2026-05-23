@@ -177,6 +177,15 @@ func newRunCmd() *cobra.Command {
 		auditLogMaxSizeMB    int64
 		auditLogMaxAgeDays   int
 		auditDBRetentionDays int
+		// #461 / §A63c — disk-pressure circuit breaker flags. gbounce
+		// uses the cross-product compliance-heavy default
+		// (pause-requests). Operators on dev laptops can switch to
+		// rotate-aggressively for liveness-over-retention.
+		diskPressureMode     string
+		diskPressureWarnPct  int
+		diskPressureCritPct  int
+		diskPressureEmergPct int
+		stopOnDiskCritical   bool
 		forceExternalBind bool
 		forwardTimeout    int
 		mode              string
@@ -585,6 +594,27 @@ so liveness probes never touch the proxy data path.`,
 				}
 			}
 
+			// #461 / §A63c — resolve mode + build disk-pressure state.
+			// --stop-on-disk-critical overrides --disk-pressure-mode
+			// (the more conservative choice wins). Empty audit-log-path
+			// makes the state a no-op (Snapshot still surfaces the
+			// mode but RefuseRequests is always false).
+			effectiveDPMode := diskPressureMode
+			if stopOnDiskCritical {
+				effectiveDPMode = audit.DiskPressureModePauseRequests
+			}
+			normalizedDPMode, dpErr := audit.NormalizeDiskPressureMode(effectiveDPMode)
+			if dpErr != nil {
+				return fmt.Errorf("gbounce: --disk-pressure-mode: %w", dpErr)
+			}
+			diskPressureState := audit.NewDiskPressureState(
+				normalizedDPMode,
+				audit.ResolveLogDir(auditLogPath),
+				diskPressureWarnPct,
+				diskPressureCritPct,
+				diskPressureEmergPct,
+			)
+
 			cfg := proxy.Config{
 				Host:                   host,
 				Port:                   port,
@@ -602,6 +632,7 @@ so liveness probes never touch the proxy data path.`,
 				MITMAuditIncludeBodies: auditLogIncludeBodies,
 				DenyHosts:              denyHostsMerged,
 				DynamicDenyWatcher:     ddWatcher,
+				DiskPressure:           diskPressureState,
 			}
 			srv, err := proxy.NewServer(cfg, st, lw, sr)
 			if err != nil {
@@ -780,6 +811,31 @@ so liveness probes never touch the proxy data path.`,
 			"LOG-RETENTION.md spec). Active audit DB is NEVER deleted by "+
 			"this path; only rotated archives are eligible. Honors "+
 			"$GBOUNCE_AUDIT_DB_RETENTION_DAYS for non-flag overrides.")
+	// #461 / §A63c — disk-pressure circuit breaker. Per
+	// [[cross-product-agent-parity]] the flag names match
+	// kbouncer + dbounce + ibounce.
+	cmd.Flags().StringVar(&diskPressureMode, "disk-pressure-mode",
+		audit.DefaultDiskPressureMode,
+		"#461 — disk-pressure response mode. One of: "+
+			"pause-requests (default: refuses new requests with 503 at "+
+			"critical), rotate-aggressively (drops oldest archives at "+
+			"critical), archive-and-purge (drops oldest archives + signals "+
+			"operator-configured object-storage sink should ship before next "+
+			"tick). Cross-product field name matches ibounce + kbouncer + "+
+			"dbounce so a single playbook covers all four.")
+	cmd.Flags().BoolVar(&stopOnDiskCritical, "stop-on-disk-critical", false,
+		"#461 — shorthand for --disk-pressure-mode pause-requests. When "+
+			"both flags are passed pause-requests wins (the more conservative "+
+			"choice).")
+	cmd.Flags().IntVar(&diskPressureWarnPct, "disk-pressure-warn-pct", audit.DefaultDiskWarnPercent,
+		"#461 — disk-usage percent at which the audit_log status flips to "+
+			"degraded (informational; no behavior change). Default 85.")
+	cmd.Flags().IntVar(&diskPressureCritPct, "disk-pressure-crit-pct", audit.DefaultDiskCritPercent,
+		"#461 — disk-usage percent at which the operator-declared mode "+
+			"reacts. Default 95.")
+	cmd.Flags().IntVar(&diskPressureEmergPct, "disk-pressure-emergency-pct", audit.DefaultDiskEmergencyPercent,
+		"#461 — disk-usage percent at which the bouncer surfaces an "+
+			"emergency status. Default 98.")
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false, "acknowledge the threat model of binding off loopback")
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
 	cmd.Flags().StringVar(&mode, "mode", "discovery",

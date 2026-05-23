@@ -114,6 +114,18 @@ const (
 	// constants of the same name. Severity Informational, Activity
 	// Create (the destination's profile-set is enlarged).
 	AdminActionProfileInstall AdminAction = "profile.install"
+
+	// AdminActionDiskPressureTransition — #461 / §A63c. The
+	// disk-pressure subsystem's status crossed a threshold (ok →
+	// degraded, degraded → critical, critical → emergency, or any
+	// reverse transition). Surfaced so a SIEM dashboard can answer
+	// "when did this bouncer cross into critical / emergency /
+	// recover to ok?" from the same event stream that carries proxy
+	// decisions + admin actions. Wire-shape parity with Python
+	// ibounce's iam_jit.bouncer.audit_export.disk_pressure
+	// ADMIN_ACTION_DISK_PRESSURE_TRANSITION per
+	// [[cross-product-agent-parity]].
+	AdminActionDiskPressureTransition AdminAction = "disk_pressure.transition"
 )
 
 // AdminActionActivityID maps an action to its OCSF activity_id (class
