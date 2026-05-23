@@ -92,6 +92,88 @@ jobs:
         run: |
           docker images gbounce:smoke --format '{{.Repository}}:{{.Tag}} {{.Size}}'
 
+      # ---- Real-deploy smoke (§A37) ---------------------------------------
+      # The --version + --help smoke above only proves the binary STARTS.
+      # It would NOT have caught flag-drift like §A33 (Helm chart's
+      # --active-profile vs binary's --profile) if the binary changed.
+      #
+      # This step actually boots gbounce in a container, sends a request
+      # to /healthz on the management port, and asserts the SQLite audit
+      # DB was written to a bind-mounted host directory. If `gbounce run`
+      # rejects a flag, fails to bind, or never opens the store, this
+      # catches it before the multi-arch push.
+      #
+      # Mirrors what an operator does locally — to run the same smoke on
+      # a dev machine: copy the block under "RUN_LOCALLY" comments and
+      # adjust the image tag to ghcr.io/trsreagan3/gbounce:latest.
+      - name: Real-deploy smoke — boot + healthz + audit DB written
+        run: |
+          set -euo pipefail
+          # RUN_LOCALLY: replace ${IMAGE} with ghcr.io/trsreagan3/gbounce:latest
+          IMAGE=gbounce:smoke
+
+          # Host dir that the container's UID 65532 must be able to
+          # write. chown matches the README's "Bind-mounting volumes"
+          # guidance.
+          DATA_DIR="$(mktemp -d)/gbounce"
+          mkdir -p "${DATA_DIR}"
+          sudo chown 65532:65532 "${DATA_DIR}"
+
+          # Boot gbounce in discovery mode against a placeholder upstream.
+          # The /healthz mgmt port lives on a SEPARATE port (8769 by
+          # default), and we never actually forward a request to the
+          # placeholder — /healthz is served locally so it answers
+          # regardless of upstream reachability.
+          docker run -d --name gb-smoke \
+            -p 18080:8080 \
+            -p 18769:8769 \
+            -v "${DATA_DIR}:/home/nonroot/.gbounce" \
+            "${IMAGE}" \
+            run \
+              --host 0.0.0.0 \
+              --port 8080 \
+              --mgmt-host 0.0.0.0 \
+              --mgmt-port 8769 \
+              --i-know-this-binds-externally \
+              --upstream https://example.invalid
+
+          # Wait for the mgmt port to come up + answer /healthz.
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18769/healthz >/dev/null 2>&1; then
+              echo "gbounce /healthz answered after ${i}s"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "gbounce /healthz never answered; container logs:"
+              docker logs gb-smoke || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # /healthz is the canonical readiness check.
+          curl -fsS http://127.0.0.1:18769/healthz | head -c 400
+          echo
+
+          # Assert the SQLite audit DB was opened + written to the
+          # bind-mounted host directory. This is the core §A37 check:
+          # if `gbounce run` accepted the flags but silently never opened
+          # the store, the file won't exist. Existence on disk proves
+          # the binary actually exercised its persistence path.
+          if [ ! -f "${DATA_DIR}/state.db" ]; then
+            echo "FAIL: ${DATA_DIR}/state.db not created — gbounce did not open the audit DB"
+            ls -la "${DATA_DIR}"
+            docker logs gb-smoke || true
+            exit 1
+          fi
+          echo "PASS: state.db created ($(stat -c%s "${DATA_DIR}/state.db") bytes)"
+
+          # Cleanup. `|| true` so a stop failure doesn't mask the
+          # assertion result above.
+          docker stop gb-smoke >/dev/null || true
+          docker rm gb-smoke >/dev/null || true
+          rm -rf "${DATA_DIR}" || sudo rm -rf "${DATA_DIR}" || true
+
       # ---- Multi-arch build + push ----
       - name: Build and push (linux/amd64 + linux/arm64)
         uses: docker/build-push-action@v6

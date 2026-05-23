@@ -132,6 +132,85 @@ docker run --rm -p 8080:8080 -p 8769:8769 \
 off loopback: gbounce forwards inbound bearer tokens long enough to
 relay them, so off-loopback binds are an opt-in choice.)
 
+#### Bind-mounting volumes (UID 65532)
+
+The distroless `:nonroot` base runs as **UID 65532** (non-root for
+security; no shell, no package manager). When you bind-mount a host
+directory into the container so the SQLite audit DB persists across
+restarts, that directory must be writable by UID 65532 — otherwise
+gbounce's first attempt to open the store fails with a cryptic error
+like:
+
+```
+open store: unable to open database file
+```
+
+Two ways to fix this:
+
+```sh
+# Option A — chown the host directory once (preferred for daemons).
+mkdir -p ~/.gbounce
+sudo chown -R 65532:65532 ~/.gbounce
+docker run --rm \
+  -v ~/.gbounce:/home/nonroot/.gbounce \
+  -p 127.0.0.1:8080:8080 \
+  -p 127.0.0.1:8769:8769 \
+  ghcr.io/trsreagan3/gbounce:latest \
+  run --upstream https://api.target.com
+
+# Option B — run as your host UID (preferred for short-lived dev runs
+# where you don't want to leave a host directory owned by 65532).
+mkdir -p ~/.gbounce
+docker run --rm \
+  --user $(id -u):$(id -g) \
+  -v ~/.gbounce:/home/nonroot/.gbounce \
+  -p 127.0.0.1:8080:8080 \
+  -p 127.0.0.1:8769:8769 \
+  ghcr.io/trsreagan3/gbounce:latest \
+  run --upstream https://api.target.com
+```
+
+**macOS / colima caveat**: colima only bind-mounts `/Users/*` paths
+reliably. Mounts under `/tmp`, `/var`, or `/private` silently diverge
+between the host and the colima VM — files written by the container
+may not appear on the host, and vice versa. Always mount paths under
+`/Users/<you>/` on Mac.
+
+#### docker-compose example
+
+```yaml
+# compose.yaml — gbounce with host-owned audit dir.
+services:
+  gbounce:
+    image: ghcr.io/trsreagan3/gbounce:latest
+    user: "65532:65532"             # match the distroless :nonroot UID
+    command:
+      - run
+      - --upstream
+      - https://api.target.com
+      - --host
+      - 0.0.0.0
+      - --mgmt-host
+      - 0.0.0.0
+      - --i-know-this-binds-externally
+    ports:
+      - "127.0.0.1:8080:8080"       # loopback-only on the host
+      - "127.0.0.1:8769:8769"
+    volumes:
+      - ./gbounce-data:/home/nonroot/.gbounce
+    # Before `docker compose up`, run once:
+    #   mkdir -p ./gbounce-data && sudo chown 65532:65532 ./gbounce-data
+```
+
+#### Common errors
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `open store: unable to open database file` | Bind-mounted dir not writable by UID 65532 | See **Bind-mounting volumes** above |
+| `permission denied` on `/home/nonroot/.gbounce/...` | Same UID-65532 ownership issue | `chown -R 65532:65532 <hostdir>` or `--user $(id -u):$(id -g)` |
+| Files written in container don't appear on host (macOS) | Mount path under `/tmp` or `/var` on colima | Move mount under `/Users/<you>/` |
+| `bind: address already in use` on `:8080` or `:8769` | Another process holding the port | `lsof -i :8080` then stop the conflicting process or remap `-p 18080:8080` |
+
 ### Go install
 
 ```sh
