@@ -73,6 +73,7 @@ func newProfileCmd() *cobra.Command {
 	cmd.AddCommand(newProfileInstallCmd())
 	cmd.AddCommand(newProfileListCmd())
 	cmd.AddCommand(newProfileShowCmd())
+	cmd.AddCommand(newProfileAllowCmd())
 	return cmd
 }
 

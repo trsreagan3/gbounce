@@ -118,6 +118,9 @@ func newRootCmd() *cobra.Command {
 	// will populate the catalog when gbounce gains a YAML profiles
 	// surface. Per [[cross-product-agent-parity]].
 	root.AddCommand(newProfileCmd())
+	// #388 / §A25 Phase 2 — `gbounce denies recent` cross-bouncer
+	// deny-visibility surface (the symmetric flip of dynamic-deny rules).
+	root.AddCommand(newDeniesCmd())
 	// #363 / §A32 — `gbounce mcp {serve,install-*,show-config,list-tools}`.
 	// Cross-product CLI parity with dbounce / kbouncer / ibounce.
 	root.AddCommand(newMCPCmd())

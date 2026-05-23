@@ -86,6 +86,11 @@ type Config struct {
 	// Actor is the value stamped into added_by when MCP-initiated
 	// deny_add lands. Defaults to "gbounce-mcp" when empty.
 	Actor string
+
+	// DBPath is the on-disk SQLite store path. Used by
+	// gbounce_denies_recent to read recent DENY decisions; empty →
+	// the tool returns store_not_configured. #388 / §A25 Phase 2.
+	DBPath string
 }
 
 // Server is the MCP-over-stdio server.
@@ -192,6 +197,10 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.toolDenyRemove(args)
 	case "gbounce_posture":
 		return s.toolPosture(args)
+	case "gbounce_profile_allow":
+		return s.toolProfileAllow(args)
+	case "gbounce_denies_recent":
+		return s.toolDeniesRecent(args)
 	}
 	return nil, fmt.Errorf("unknown tool: %s", name)
 }

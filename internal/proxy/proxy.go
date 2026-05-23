@@ -47,6 +47,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -158,6 +159,16 @@ type Config struct {
 	// (static rules only).
 	DynamicDenyWatcher *dynamicdeny.Watcher
 
+	// #388 / §A25 Phase 2 — active profile bridge for the POST
+	// /admin/profile/reload endpoint. The proxy hot-path doesn't
+	// consult ActiveProfile directly (gbounce translates the profile
+	// into denyHosts + mitmRules at start); the reload endpoint uses
+	// these fields as the bridge so a `gbounce profile allow`
+	// mutation re-translates without a restart.
+	ActiveProfile     *profile.Profile
+	ActiveProfileName string
+	ProfilesPath      string
+
 	// #315 / §A13 — MITM-mode wiring.
 	//
 	// MITMCertMinter is set when Mode==ModeMITM. NewServer rejects
@@ -266,6 +277,16 @@ type Server struct {
 	mitmMinter             *mitm.CertMinter
 	mitmRules              []profile.Rule
 	mitmAuditIncludeBodies bool
+
+	// #388 / §A25 Phase 2 — hot-swap-aware active profile state. The
+	// proxy hot-path doesn't consult these directly (gbounce
+	// translates profile fields into denyHosts + mitmRules at start);
+	// the POST /admin/profile/reload endpoint uses them as the bridge
+	// so a `gbounce profile allow` mutation re-translates without a
+	// restart. profileMu guards activeProfile + activeProfileName.
+	profileMu         sync.RWMutex
+	activeProfile     *profile.Profile
+	activeProfileName string
 	// #315 — bumped each time a MITM-intercepted request was denied
 	// by a profile rule.
 	totalMITMDenies atomic.Int64
@@ -332,6 +353,8 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 		mitmMinter:             cfg.MITMCertMinter,
 		mitmRules:              cfg.MITMRules,
 		mitmAuditIncludeBodies: cfg.MITMAuditIncludeBodies,
+		activeProfile:          cfg.ActiveProfile,
+		activeProfileName:      cfg.ActiveProfileName,
 		client: &http.Client{
 			Timeout: timeout,
 			// Don't follow redirects — surface the upstream's
@@ -381,6 +404,13 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 	// bearer-token gating as /audit/events since the endpoint
 	// indirectly exposes a manifest-shape view of the active rules.
 	mgmtMux.HandleFunc("/admin/dynamic-denies/reload", s.dynamicDenyReloadHandler(cfg.AuditEventsToken))
+	// #388 / §A25 Phase 2 — POST /admin/profile/reload re-reads
+	// profiles.yaml + re-translates the active profile into the
+	// proxy's denyHosts + mitmRules so a `gbounce profile allow`
+	// mutation takes effect without a restart. Same auth model as
+	// /audit/events. Response shape mirrors ibounce + kbouncer +
+	// dbounce per [[cross-product-agent-parity]].
+	mgmtMux.HandleFunc("/admin/profile/reload", s.profileReloadHandler(cfg.AuditEventsToken, cfg.ProfilesPath))
 
 	// #298 — GET /suite serves the cross-product Bounce-suite link
 	// page. Per [[unified-ui-link-page]] this is signage + status
@@ -417,6 +447,81 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 // product slices.
 func (s *Server) SetObjectStorageWriter(w *audit.ObjectStorageWriter) {
 	s.objectStorage = w
+}
+
+// ActiveProfile returns the hot-swap-aware active profile pointer.
+// May be nil when no profile was selected at proxy start. #388 /
+// §A25 Phase 2.
+func (s *Server) ActiveProfile() *profile.Profile {
+	if s == nil {
+		return nil
+	}
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
+	return s.activeProfile
+}
+
+// ActiveProfileName returns the configured active profile name. May
+// be empty when no profile was selected at proxy start.
+func (s *Server) ActiveProfileName() string {
+	if s == nil {
+		return ""
+	}
+	s.profileMu.RLock()
+	defer s.profileMu.RUnlock()
+	return s.activeProfileName
+}
+
+// SetActiveProfile hot-swaps the active profile pointer + re-
+// translates the profile's DenyHosts + DenyRules into the proxy's
+// active denyHosts + mitmRules. The next inbound CONNECT / forward
+// reads the new compiled state via the proxy's existing accessors.
+// Per [[creates-never-mutates]]: this swaps in a new slice that the
+// proxy owns; we never mutate the prior slice in-place.
+//
+// Returns an error when the translation fails (e.g., a profile
+// deny_rule has an invalid host pattern); on error the prior state
+// is unchanged + the caller surfaces the parse error.
+func (s *Server) SetActiveProfile(p *profile.Profile) error {
+	if s == nil {
+		return nil
+	}
+	if p == nil {
+		s.profileMu.Lock()
+		s.activeProfile = nil
+		s.activeProfileName = ""
+		s.profileMu.Unlock()
+		return nil
+	}
+
+	// Translate DenyHosts → DenyHostRule list. Mirrors the CLI's
+	// run-cmd plumbing — union onto a fresh slice (we deliberately
+	// don't merge with the prior compiled list since the reload
+	// represents the new authoritative state).
+	newDenyHosts, err := ParseDenyHosts(p.DenyHosts)
+	if err != nil {
+		return fmt.Errorf("gbounce: profile %q: deny_hosts: %w", p.Name, err)
+	}
+
+	// Translate DenyRules → MITM []profile.Rule. Mirrors the CLI's
+	// `for _, spec := range ap.DenyRules { profile.ParseRule(spec) }`
+	// step.
+	newMITMRules := make([]profile.Rule, 0, len(p.DenyRules))
+	for _, spec := range p.DenyRules {
+		r, rerr := profile.ParseRule(spec)
+		if rerr != nil {
+			return fmt.Errorf("gbounce: profile %q: deny_rules: %w", p.Name, rerr)
+		}
+		newMITMRules = append(newMITMRules, r)
+	}
+
+	s.profileMu.Lock()
+	s.activeProfile = p
+	s.activeProfileName = p.Name
+	s.denyHosts = newDenyHosts
+	s.mitmRules = newMITMRules
+	s.profileMu.Unlock()
+	return nil
 }
 
 func (s *Server) Addr() string { return s.httpSrv.Addr }

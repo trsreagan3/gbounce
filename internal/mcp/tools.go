@@ -21,6 +21,54 @@ package mcp
 // `tools/list`. Returned as a slice (not a map) so the order is
 // deterministic across runs.
 func ToolDescriptors() []map[string]any {
+	return append(baseToolDescriptors(), profileAllowToolDescriptors()...)
+}
+
+// profileAllowToolDescriptors returns the #388 / §A25 Phase 2 tools.
+func profileAllowToolDescriptors() []map[string]any {
+	return []map[string]any{
+		{
+			"name": "gbounce_profile_allow",
+			"description": "Append a profile allow rule (operator easy-allow). " +
+				"Agent-self-grant SAFETY RAIL: MCP requests are queued at " +
+				"~/.iam-jit/bouncer/profile-allow-pending.jsonl unless the " +
+				"operator opted in via " +
+				"IAM_JIT_BOUNCER_ALLOW_AGENT_SELF_GRANT=1. Refuses target='*' + " +
+				"actions without ':'. Refuses to mutate org-distributed " +
+				"profiles. Mirrors `gbounce profile allow` CLI + the iam-jit " +
+				"bouncer_profile_allow MCP tool. #388 / §A25 Phase 2.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"target":   map[string]any{"type": "string"},
+					"action":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"reason":   map[string]any{"type": "string"},
+					"duration": map[string]any{"type": "string"},
+					"profile":  map[string]any{"type": "string"},
+				},
+				"required": []string{"target", "action", "reason"},
+			},
+		},
+		{
+			"name": "gbounce_denies_recent",
+			"description": "Return recent DENY decisions from the local " +
+				"gbounce audit store with a suggested_allow_command per " +
+				"row. Mirrors `gbounce denies recent` CLI + the iam-jit " +
+				"bouncer_denies_recent MCP tool. Read-only. " +
+				"#388 / §A25 Phase 2.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"since":         map[string]any{"type": "string", "default": "5m"},
+					"agent_session": map[string]any{"type": "string"},
+					"limit":         map[string]any{"type": "integer", "default": 50},
+				},
+			},
+		},
+	}
+}
+
+func baseToolDescriptors() []map[string]any {
 	return []map[string]any{
 		{
 			"name": "gbounce_active_mode",
