@@ -14,6 +14,12 @@ make install        # go install with the same -ldflags
 make test           # go test ./...
 ```
 
+`make install` writes to `$(go env GOPATH)/bin` (defaults to `~/go/bin`).
+If `gbounce --version` reports "command not found", that directory is not
+on your PATH — `export PATH="$PATH:$(go env GOPATH)/bin"` once, and
+persist it in `~/.bashrc` or `~/.zshrc` (closes #549 from UAT L1
+2026-05-24).
+
 `make build` / `make install` stamp `version` / `commit` / `buildTime`
 via `-ldflags` so `gbounce --version` reports a real commit SHA. The
 binary also auto-populates these from Go's `runtime/debug.ReadBuildInfo`

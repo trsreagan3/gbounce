@@ -215,7 +215,24 @@ services:
 
 ```sh
 go install github.com/trsreagan3/gbounce/cmd/gbounce@latest
+
+# Verify the binary is on your PATH:
+gbounce --version
+
+# If you get "command not found": $(go env GOPATH)/bin is not on PATH.
+# Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by
+# default. Fix once per shell:
+export PATH="$PATH:$(go env GOPATH)/bin"
+
+# Persist across sessions (pick the right rc for your shell):
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc   # bash
+echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc    # zsh
 ```
+
+Closes #549 from UAT L1 2026-05-24 — the unmodified `go install` succeeds
+silently with the binary at `~/go/bin/gbounce` while the operator's shell
+reports "command not found", which reads as "install broken" on a fresh
+machine.
 
 Go 1.18+ auto-stamps VCS info (commit SHA + build time) into binaries
 built from a git checkout, so even this unflagged install reports a
