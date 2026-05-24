@@ -217,6 +217,25 @@ services:
 go install github.com/trsreagan3/gbounce/cmd/gbounce@latest
 ```
 
+Go 1.18+ auto-stamps VCS info (commit SHA + build time) into binaries
+built from a git checkout, so even this unflagged install reports a
+real commit in `gbounce --version` — the `iam-jit canary update` flow
+depends on that. For release builds (or to override the auto-stamp with
+a specific tag), pass `-ldflags`:
+
+```sh
+go install \
+  -ldflags "-X github.com/trsreagan3/gbounce/internal/cli.version=v1.0.0 \
+            -X github.com/trsreagan3/gbounce/internal/cli.commit=$(git rev-parse --short HEAD) \
+            -X github.com/trsreagan3/gbounce/internal/cli.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  github.com/trsreagan3/gbounce/cmd/gbounce@latest
+```
+
+The repo's `Makefile` wraps that recipe — `make install` from a source
+checkout does the same thing. The `Dockerfile` + `.github/workflows/docker-publish.yml`
+pipeline applies identical ldflags so every supported install path
+reports the same version shape.
+
 ### After upgrade: `gbounce profile doctor` (cross-product parity)
 
 For cross-product CLI parity with ibounce / kbouncer / dbounce,

@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -51,17 +52,87 @@ var loopbackHosts = map[string]struct{}{
 
 // version / commit / buildTime are stamped at build time via
 // -ldflags "-X github.com/trsreagan3/gbounce/internal/cli.<name>=...".
-// Unstamped builds report "dev" / "none" / "unknown".
+// Unstamped builds (e.g. plain `go install ./...` without ldflags) fall
+// back to VCS info auto-stamped by Go 1.18+ into the binary, surfaced
+// via runtime/debug.ReadBuildInfo. See resolveBuildInfo. Final fallback
+// reports "dev" / "none" / "unknown".
+//
+// This closes the canary-update path in iam-jit: `iam-jit canary
+// update` rebuilds gbounce via `go install ...@latest` (no ldflags),
+// then re-reads `gbounce --version` to confirm the new commit SHA. If
+// these stayed "dev" / "none" forever, the canary's version-check step
+// could never observe an upgrade. Task #515.
 var (
 	version   = "dev"
 	commit    = "none"
 	buildTime = "unknown"
 )
 
+// resolveBuildInfo fills in version / commit / buildTime from
+// runtime/debug.ReadBuildInfo when they haven't been stamped by
+// -ldflags. Go 1.18+ embeds VCS info (vcs.revision, vcs.time, plus
+// vcs.modified) into binaries built from a git checkout — including
+// `go install pkg@latest`, which is exactly the path `iam-jit canary
+// update` uses to rebuild gbounce.
+//
+// Called once at startup from Main, BEFORE audit.SetBuildVersion, so
+// every OCSF audit-event written this process emits the same
+// version string `gbounce --version` reports.
+//
+// Idempotent: ldflags-stamped values (anything other than the literal
+// defaults) win. We only overwrite the defaults.
+func resolveBuildInfo() {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	// bi.Main.Version is non-empty for module-aware builds: "(devel)"
+	// for local builds, the module version (e.g. v1.0.0) for
+	// `go install ...@v1.0.0`. Prefer ldflags-stamped value when set.
+	if version == "dev" && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		version = bi.Main.Version
+	}
+	// Track whether the operator supplied an ldflags commit (sentinel
+	// "none" → unset). The -dirty suffix only piggybacks onto a
+	// VCS-derived commit; ldflags-stamped releases stay verbatim so
+	// `iam-jit canary update`'s regex sees exactly what the build
+	// pipeline declared.
+	commitFromLdflags := commit != "none"
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			if commit == "none" && s.Value != "" {
+				// Match the short-SHA shape the Makefile + Dockerfile
+				// emit (`git rev-parse --short HEAD`) so the canary's
+				// version-check step sees one consistent shape.
+				if len(s.Value) > 7 {
+					commit = s.Value[:7]
+				} else {
+					commit = s.Value
+				}
+			}
+		case "vcs.time":
+			if buildTime == "unknown" && s.Value != "" {
+				buildTime = s.Value
+			}
+		case "vcs.modified":
+			// Mark dirty trees so an operator (or the canary) can tell
+			// the binary was built from a dirty checkout. Mirrors
+			// `git describe --dirty`'s -dirty suffix. Skipped when the
+			// operator stamped a commit via ldflags — release tooling
+			// owns the shape in that case.
+			if !commitFromLdflags && s.Value == "true" && commit != "none" && !strings.HasSuffix(commit, "-dirty") {
+				commit = commit + "-dirty"
+			}
+		}
+	}
+}
+
 // Main is the exported entry point so cmd/gbounce can stay a 3-line
 // shim. Threads the linker-stamped version into the audit package +
 // runs the root cobra command.
 func Main() {
+	resolveBuildInfo()
 	audit.SetBuildVersion(version)
 	if err := newRootCmd().Execute(); err != nil {
 		os.Exit(1)
@@ -70,6 +141,11 @@ func Main() {
 
 // versionString returns the human-readable version surfaced via
 // `gbounce --version`. Format mirrors kbounce/dbounce.
+//
+// Format is load-bearing: `iam-jit canary update` parses it with a
+// regex expecting `gbounce <version> (commit <sha>, built <ts>)`. Do
+// NOT change the shape without coordinating with the canary's
+// version-check step.
 func versionString() string {
 	return fmt.Sprintf("gbounce %s (commit %s, built %s)", version, commit, buildTime)
 }

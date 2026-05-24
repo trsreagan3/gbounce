@@ -9,9 +9,18 @@ from AI agents.
 ## Development setup
 
 ```bash
-go install ./...
-go test ./...
+make build          # ./bin/gbounce with -ldflags version stamping
+make install        # go install with the same -ldflags
+make test           # go test ./...
 ```
+
+`make build` / `make install` stamp `version` / `commit` / `buildTime`
+via `-ldflags` so `gbounce --version` reports a real commit SHA. The
+binary also auto-populates these from Go's `runtime/debug.ReadBuildInfo`
+VCS settings when ldflags are unset (e.g. plain `go install ./...`),
+so `iam-jit canary update`'s version-check step works from every
+supported install path. See `internal/cli/cli.go::resolveBuildInfo` +
+the `Dockerfile` for the canonical shape.
 
 Local-test infrastructure (httpbin upstream + audit DB) lives
 alongside the test suite. Driven by `Makefile` targets.
