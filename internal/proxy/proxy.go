@@ -1028,6 +1028,27 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 			body["audit_log_last_error"] = e
 		}
 	}
+	// #544 / MRR-5 M2 — cross-bouncer parity with ibounce's
+	// /healthz.chain_initialized field. True iff the audit log writer
+	// is configured + ready to stamp events; False when --audit-log is
+	// off OR the writer construction failed (in which case s.log is
+	// nil per NewLogWriter's contract). Closes the cold-start audit-
+	// init-failure gap noted in MRR-5-MONITORING-RUNBOOK.md §6 M2
+	// (failure surfaced in the bouncer log but NOT on /healthz until
+	// the first event tried to write). Per [[cross-product-agent-parity]]
+	// every Bounce surfaces the same field for SRE composite monitors.
+	body["chain_initialized"] = s.log != nil
+	// #544 / MRR-5 M3 — cross-bouncer parity with ibounce's
+	// /healthz.llm_budget block. Go bouncers don't run LLM per
+	// [[bouncer-zero-llm-when-agent-in-loop]] (they're deterministic
+	// by default), so the field is a constant {"enabled": false}. This
+	// is honest per [[ibounce-honest-positioning]] — NOT a stubbed
+	// TODO. If a Go bouncer later adds optional LLM features, expand
+	// to match ibounce's full shape (used_today_usd, cap_per_day_usd,
+	// remaining_usd, percent_consumed, approaching_limit). Returned
+	// unconditionally so a composite monitor scraping all four
+	// /healthz endpoints sees the same key set.
+	body["llm_budget"] = map[string]any{"enabled": false}
 	// #461 / §A63c — disk-pressure subsystem snapshot + 503 status
 	// flip in pause-requests at critical / emergency. Per
 	// [[ibounce-honest-positioning]] every state crossing surfaces
