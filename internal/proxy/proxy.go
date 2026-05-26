@@ -419,14 +419,26 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 	// error on parse / schema failure. Reuses the same loopback /
 	// bearer-token gating as /audit/events since the endpoint
 	// indirectly exposes a manifest-shape view of the active rules.
-	mgmtMux.HandleFunc("/admin/dynamic-denies/reload", s.dynamicDenyReloadHandler(cfg.AuditEventsToken))
+	// #524 BB-3 — defense-in-depth middleware on /admin/* that closes
+	// the residual gap when a future code path bypasses the CLI's
+	// bind-time --audit-events-token requirement (config-file loader,
+	// programmatic embed, test harness). The handler-internal bearer
+	// check below ALSO fires (belt-and-suspenders); requireMgmtAuth
+	// adds the "external bind without token → 503" failure case the
+	// handler-internal check can't enforce because it has no view of
+	// the bind host.
+	mgmtMux.HandleFunc("/admin/dynamic-denies/reload",
+		requireMgmtAuth(s.dynamicDenyReloadHandler(cfg.AuditEventsToken),
+			cfg.AuditEventsToken, cfg.MgmtHost))
 	// #388 / §A25 Phase 2 — POST /admin/profile/reload re-reads
 	// profiles.yaml + re-translates the active profile into the
 	// proxy's denyHosts + mitmRules so a `gbounce profile allow`
 	// mutation takes effect without a restart. Same auth model as
 	// /audit/events. Response shape mirrors ibounce + kbouncer +
 	// dbounce per [[cross-product-agent-parity]].
-	mgmtMux.HandleFunc("/admin/profile/reload", s.profileReloadHandler(cfg.AuditEventsToken, cfg.ProfilesPath))
+	mgmtMux.HandleFunc("/admin/profile/reload",
+		requireMgmtAuth(s.profileReloadHandler(cfg.AuditEventsToken, cfg.ProfilesPath),
+			cfg.AuditEventsToken, cfg.MgmtHost))
 
 	// #298 — GET /suite serves the cross-product Bounce-suite link
 	// page. Per [[unified-ui-link-page]] this is signage + status
@@ -984,42 +996,87 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 // healthz responds 200 with a small JSON liveness payload. Lives on
 // the SEPARATE management port so liveness probes never touch the
 // proxy data path (and never pollute the audit log).
-func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+//
+// #524 BB-4 — field scoping for unauthenticated external callers.
+// When the caller is on loopback OR carries a valid Authorization
+// bearer (matching --audit-events-token), the FULL payload returns
+// (preserves the [[cross-product-agent-parity]] composite-monitor
+// key set). When the caller is unauthenticated AND off-loopback, the
+// response is scoped to the minimal liveness surface (status, product,
+// version-ish keys) — upstream URL, per-counter operational signal,
+// audit-log path, and disk-pressure detail are withheld so an
+// externally-bound /healthz the operator forgot to put behind a
+// reverse proxy doesn't hand attackers reconnaissance on the
+// upstream target + operational tempo.
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	authed := requestAuthenticatedOrLoopback(r,
+		s.cfg.AuditEventsToken, s.cfg.MgmtHost)
+
+	// Minimal liveness surface always returned. Mirrors the
+	// [[ibounce-honest-positioning]] floor: a probe gets a truthful
+	// status without exposing infrastructure detail.
 	body := map[string]any{
-		"status":         "ok",
-		"product":        "gbounce",
-		"mode":           string(s.cfg.Mode),
-		"upstream":       s.cfg.UpstreamURL,
-		"allow_connect":  s.cfg.AllowConnect,
-		"total_requests": s.totalRequests.Load(),
-		"total_errors":   s.totalErrors.Load(),
-		// #308 — invalid X-Agent-* header counter so operators see
-		// agent-config drift in liveness probes.
-		"total_agent_headers_rejected": s.totalAgentHeadersRejected.Load(),
-		// #314 — deny_hosts match counter so operators see deny-rule
-		// activity from /healthz without grepping the audit log.
-		"total_deny_host_matches": s.totalDenyHostMatches.Load(),
-		"deny_hosts_count":        len(s.denyHosts),
-		// #324d — dynamic-deny counters. Independent of the static-
-		// deny pair above so a SIEM dashboard can split the two. When
-		// the watcher is disabled all of these stay zero; pre-existing
-		// /healthz consumers see the new keys as "0" rather than
-		// "missing field" so a JSON-decode against an older schema
-		// doesn't break.
-		"dynamic_denies_enabled":           s.dynamicDeny != nil,
-		"dynamic_denies_count":             s.dynamicDenyActiveCount(),
-		"dynamic_denies_globs_count":       s.dynamicDenyGlobCount(),
-		"dynamic_denies_path":              s.dynamicDenyPath(),
-		"total_dynamic_deny_matches":       s.totalDynamicDenyMatches.Load(),
-		"total_dynamic_deny_reloads":       s.totalDynamicDenyReloads.Load(),
-		"total_dynamic_deny_parse_errors":  s.totalDynamicDenyParseErrors.Load(),
-		// #315 / §A13 — MITM-mode counters.
-		"mitm_enabled":                           s.cfg.Mode == ModeMITM,
-		"mitm_rules_count":                       len(s.mitmRules),
-		"mitm_audit_include_bodies":              s.mitmAuditIncludeBodies,
-		"total_mitm_denies":                      s.totalMITMDenies.Load(),
-		"total_mitm_upstream_handshake_failures": s.totalMITMUpstreamHandshakeFailures.Load(),
+		"status":  "ok",
+		"product": "gbounce",
 	}
+	if !authed {
+		// Unauth + external: still surface chain_initialized +
+		// llm_budget so the cross-bouncer composite monitor's REQUIRED
+		// key set stays present (it's a parity contract per
+		// [[cross-product-agent-parity]]); a missing key would break
+		// the monitor's JSON decode. The VALUES are still safe — a
+		// bool + a small map with {"enabled": false}.
+		body["chain_initialized"] = s.log != nil
+		body["llm_budget"] = map[string]any{"enabled": false}
+		// Mirror the disk-pressure 503 flip below WITHOUT surfacing
+		// the detailed snapshot — operators on unauth probes still
+		// need the degraded signal.
+		statusCode := http.StatusOK
+		if s.cfg.DiskPressure != nil {
+			snap := s.cfg.DiskPressure.Snapshot()
+			if snap.RefuseRequests {
+				body["status"] = "degraded"
+				statusCode = http.StatusServiceUnavailable
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		_ = json.NewEncoder(w).Encode(body)
+		return
+	}
+
+	// Authenticated (or loopback) — full payload.
+	body["mode"] = string(s.cfg.Mode)
+	body["upstream"] = s.cfg.UpstreamURL
+	body["allow_connect"] = s.cfg.AllowConnect
+	body["total_requests"] = s.totalRequests.Load()
+	body["total_errors"] = s.totalErrors.Load()
+	// #308 — invalid X-Agent-* header counter so operators see
+	// agent-config drift in liveness probes.
+	body["total_agent_headers_rejected"] = s.totalAgentHeadersRejected.Load()
+	// #314 — deny_hosts match counter so operators see deny-rule
+	// activity from /healthz without grepping the audit log.
+	body["total_deny_host_matches"] = s.totalDenyHostMatches.Load()
+	body["deny_hosts_count"] = len(s.denyHosts)
+	// #324d — dynamic-deny counters. Independent of the static-
+	// deny pair above so a SIEM dashboard can split the two. When
+	// the watcher is disabled all of these stay zero; pre-existing
+	// /healthz consumers see the new keys as "0" rather than
+	// "missing field" so a JSON-decode against an older schema
+	// doesn't break.
+	body["dynamic_denies_enabled"] = s.dynamicDeny != nil
+	body["dynamic_denies_count"] = s.dynamicDenyActiveCount()
+	body["dynamic_denies_globs_count"] = s.dynamicDenyGlobCount()
+	body["dynamic_denies_path"] = s.dynamicDenyPath()
+	body["total_dynamic_deny_matches"] = s.totalDynamicDenyMatches.Load()
+	body["total_dynamic_deny_reloads"] = s.totalDynamicDenyReloads.Load()
+	body["total_dynamic_deny_parse_errors"] = s.totalDynamicDenyParseErrors.Load()
+	// #315 / §A13 — MITM-mode counters.
+	body["mitm_enabled"] = s.cfg.Mode == ModeMITM
+	body["mitm_rules_count"] = len(s.mitmRules)
+	body["mitm_audit_include_bodies"] = s.mitmAuditIncludeBodies
+	body["total_mitm_denies"] = s.totalMITMDenies.Load()
+	body["total_mitm_upstream_handshake_failures"] = s.totalMITMUpstreamHandshakeFailures.Load()
 	if s.log != nil {
 		body["audit_log_path"] = s.log.Path()
 		body["audit_log_total"] = s.log.Total()
