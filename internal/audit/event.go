@@ -629,8 +629,10 @@ func activityNameForID(activityID int) string {
 //     failure: status_id=Failure + ext.connect_refused=true (the full
 //     connect_error string lives in the JSONL log only — the SIEM-side
 //     filter `connect_refused=true` is enough to isolate the case)
-//   - verdict=DENY → #305 explicit reject: status_id=Denied +
-//     ext.deny_reason="non-CONNECT method on CONNECT-only listener"
+//   - verdict=ERROR → #305/#685 protocol reject: status_id=Failure +
+//     ext.reject_reason="non-CONNECT method on CONNECT-only listener"
+//   - verdict=DENY → policy deny (deny_hosts / dynamic-deny):
+//     status_id=Denied + ext.deny_reason
 //
 // Idempotent: callers that already populated ActivityIDOverride /
 // StatusIDOverride / ExtraExt have those values preserved (the
@@ -653,6 +655,24 @@ func ReconstructOverridesFromRow(in *RequestInput) {
 			in.ExtraExt["connect_refused"] = true
 		}
 	}
+	// #685 — a protocol/config reject (non-CONNECT verb on a CONNECT-only
+	// listener; --upstream not configured) is recorded with
+	// Verdict="ERROR" + status_id=Failure, NOT a policy "Denied".
+	// Reconstruct that shape so a SIEM rebuild from SQLite agrees with the
+	// JSONL hot path. (Rows persisted before #685 carry Verdict="DENY"
+	// for this case and reconstruct as Denied below — we don't rewrite
+	// history; the fix is forward-looking.)
+	if strings.EqualFold(in.Verdict, "ERROR") {
+		if in.StatusIDOverride == 0 {
+			in.StatusIDOverride = StatusFailure
+		}
+		if in.ExtraExt == nil {
+			in.ExtraExt = map[string]any{}
+		}
+		if _, ok := in.ExtraExt["reject_reason"]; !ok {
+			in.ExtraExt["reject_reason"] = "non-CONNECT method on CONNECT-only listener"
+		}
+	}
 	if strings.EqualFold(in.Verdict, "DENY") {
 		if in.StatusIDOverride == 0 {
 			in.StatusIDOverride = StatusDenied
@@ -660,20 +680,15 @@ func ReconstructOverridesFromRow(in *RequestInput) {
 		if in.ExtraExt == nil {
 			in.ExtraExt = map[string]any{}
 		}
-		// #314 — distinguish the two known deny shapes by HTTPStatus.
 		// The JSONL hot path carries the EXACT deny_reason via ExtraExt;
 		// this reconstruction is the SQLite-rebuild fallback used by
 		// `gbounce audit tail` + GET /audit/events to give a SIEM a
 		// useful (if generic) reason when the JSONL log isn't available.
-		//   - HTTP 403 + CONNECT → deny_hosts rule match (#314)
-		//   - HTTP 421 (or anything else) → non-CONNECT on CONNECT-only
-		//     listener (#305)
+		// Post-#685, a verdict=DENY row is a policy deny: a deny_hosts /
+		// dynamic-deny match. (HTTP 403 + CONNECT is the canonical
+		// deny_hosts shape.)
 		if _, ok := in.ExtraExt["deny_reason"]; !ok {
-			if in.HTTPStatus == 403 && strings.EqualFold(in.Method, "CONNECT") {
-				in.ExtraExt["deny_reason"] = "matched deny_hosts rule"
-			} else {
-				in.ExtraExt["deny_reason"] = "non-CONNECT method on CONNECT-only listener"
-			}
+			in.ExtraExt["deny_reason"] = "matched deny rule"
 		}
 	}
 }

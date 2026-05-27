@@ -225,15 +225,25 @@ func TestReconstructOverridesFromRow(t *testing.T) {
 			t.Errorf("ExtraExt.connect_refused = %v; want true", in.ExtraExt["connect_refused"])
 		}
 	})
-	t.Run("deny 305", func(t *testing.T) {
-		in := RequestInput{Method: "GET", HTTPStatus: 421, Verdict: "DENY"}
+	t.Run("reject 305/685 — protocol reject is Failure, not Denied", func(t *testing.T) {
+		in := RequestInput{Method: "GET", HTTPStatus: 421, Verdict: "ERROR"}
+		ReconstructOverridesFromRow(&in)
+		if in.StatusIDOverride != StatusFailure {
+			t.Errorf("StatusIDOverride = %d; want StatusFailure (#685 — NOT Denied)", in.StatusIDOverride)
+		}
+		got, _ := in.ExtraExt["reject_reason"].(string)
+		if got != "non-CONNECT method on CONNECT-only listener" {
+			t.Errorf("ExtraExt.reject_reason = %q", got)
+		}
+	})
+	t.Run("deny — policy deny reconstructs as Denied", func(t *testing.T) {
+		in := RequestInput{Method: "CONNECT", HTTPStatus: 403, Verdict: "DENY"}
 		ReconstructOverridesFromRow(&in)
 		if in.StatusIDOverride != StatusDenied {
 			t.Errorf("StatusIDOverride = %d; want StatusDenied", in.StatusIDOverride)
 		}
-		got, _ := in.ExtraExt["deny_reason"].(string)
-		if got != "non-CONNECT method on CONNECT-only listener" {
-			t.Errorf("ExtraExt.deny_reason = %q", got)
+		if _, ok := in.ExtraExt["deny_reason"]; !ok {
+			t.Error("ExtraExt.deny_reason should be populated for a policy deny")
 		}
 	})
 	t.Run("connect success — only activity_id lifted", func(t *testing.T) {

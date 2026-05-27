@@ -755,9 +755,17 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 		// is a configuration mismatch + a useful attack signal (IMDS
 		// probes ride plain HTTP, not HTTPS). 421 Misdirected Request is
 		// the closest RFC code. Audit the rejection BEFORE writing the
-		// response so the SIEM sees the deny even when the client gives
-		// up on the 421.
-		s.recordDeny(r, startedAt, http.StatusMisdirectedRequest,
+		// response so the SIEM sees it even when the client gives up on
+		// the 421.
+		//
+		// #685 — this is a PROTOCOL/CONFIG reject, NOT a policy decision:
+		// record it as a Failure (status_id=2), not a Denial
+		// (status_id=4). A discovery-mode bouncer with zero deny rules
+		// must never emit "Denied" events ([[ibounce-honest-positioning]]).
+		// The IMDS-probe visibility #305 added is preserved — the request
+		// is still audited with its path + reject_reason; an operator who
+		// wants it DENIED adds a --deny-host (→ recordDenyWithSource).
+		s.recordReject(r, startedAt, http.StatusMisdirectedRequest,
 			"non-CONNECT method on CONNECT-only listener")
 		http.Error(w, "gbounce: --upstream not configured; only CONNECT is accepted", http.StatusMisdirectedRequest)
 		s.totalErrors.Add(1)
@@ -1177,14 +1185,14 @@ func (s *Server) recordFailedConnect(r *http.Request, startedAt time.Time, dialE
 	})
 }
 
-// recordDeny is the #305 entrypoint: audit a request the proxy
-// REJECTED before any forwarding happened (e.g. a non-CONNECT verb on
-// a CONNECT-only listener). The HTTPStatus argument is the status the
-// proxy sent back to the client (421 for the non-CONNECT case); the
-// status_id is pinned to StatusDenied so a SIEM filter on
-// `status_id=4` isolates deny outcomes from generic 4xxs. The path is
-// captured from r.URL.Path so IMDS probes (which set the path to
-// `/latest/meta-data/...`) are visible in the audit row.
+// recordDeny audits a request the proxy refused as a POLICY decision
+// (a deny_hosts / dynamic-deny match — see recordDenyWithSource for the
+// rule-attributed variant). status_id is pinned to StatusDenied so a
+// SIEM filter on `status_id=4` isolates real deny outcomes — and ONLY
+// real deny outcomes: protocol/config rejects (e.g. a non-CONNECT verb
+// on a CONNECT-only listener) go through recordReject (#685) as a
+// Failure, never here. The path is captured from r.URL.Path so a denied
+// host's request target stays visible in the audit row.
 func (s *Server) recordDeny(r *http.Request, startedAt time.Time, httpStatus int, reason string) {
 	ov := recordOverrides{
 		Verdict:  "DENY",
@@ -1199,6 +1207,34 @@ func (s *Server) recordDeny(r *http.Request, startedAt time.Time, httpStatus int
 	// recordDeny call site (#305's non-CONNECT-on-CONNECT-only path)
 	// keeps the default method-derived activity since the rejected
 	// verb is NOT CONNECT.
+	if strings.EqualFold(r.Method, http.MethodConnect) {
+		ov.ActivityID = audit.ActivityConnect
+	}
+	s.recordWith(r, startedAt, httpStatus, 0, ov)
+}
+
+// recordReject (#685) audits a request the proxy refused for a
+// PROTOCOL or CONFIG reason — e.g. a non-CONNECT verb on a
+// CONNECT-only listener (#305) — as distinct from a POLICY deny
+// (recordDeny / recordDenyWithSource). The distinction matters for
+// honesty: a protocol reject is NOT a security decision, so it must
+// NOT read as status_id=4 "Denied". It lands as status_id=2
+// "Failure" with verdict="ERROR" + ext.reject_reason, mirroring
+// recordFailedConnect's treatment of an unreachable upstream (#303,
+// "we made no deny decision; the request just couldn't proceed").
+// This preserves the invariant that a discovery-mode bouncer with
+// zero deny rules emits zero "Denied" events, while keeping the audit
+// visibility (path, host, reason) #305 was built for. Because the
+// verdict is "ERROR" (not "DENY"), the reject also stays out of the
+// profile-allow "recent denies" list (denies.go filters Verdict=="DENY").
+func (s *Server) recordReject(r *http.Request, startedAt time.Time, httpStatus int, reason string) {
+	ov := recordOverrides{
+		Verdict:  "ERROR",
+		StatusID: audit.StatusFailure,
+		ExtraExt: map[string]any{
+			"reject_reason": reason,
+		},
+	}
 	if strings.EqualFold(r.Method, http.MethodConnect) {
 		ov.ActivityID = audit.ActivityConnect
 	}

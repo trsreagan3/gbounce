@@ -647,11 +647,13 @@ func TestProxy_UnreachableHostCONNECTLogged(t *testing.T) {
 	}
 }
 
-// TestProxy_NonCONNECTRequestLogged is the #305 regression: a plain
-// GET sent through the proxy port on a CONNECT-only listener must
-// return 421 AND land in the audit log with verdict=DENY +
-// status_id=Denied + ext.deny_reason. IMDS attacks (which ride plain
-// HTTP, not HTTPS) become visible.
+// TestProxy_NonCONNECTRequestLogged is the #305/#685 regression: a
+// plain GET sent through the proxy port on a CONNECT-only listener must
+// return 421 AND land in the audit log. Per #685 it's a PROTOCOL reject,
+// not a policy decision: verdict=ERROR + status_id=Failure +
+// ext.reject_reason (NOT verdict=DENY / status_id=Denied — a discovery-
+// mode bouncer with no deny rules must never show phantom "Denied"
+// events). IMDS attacks (which ride plain HTTP, not HTTPS) stay visible.
 func TestProxy_NonCONNECTRequestLogged(t *testing.T) {
 	proxyAddr, logPath, st := startConnectOnlyProxy(t)
 
@@ -675,37 +677,39 @@ func TestProxy_NonCONNECTRequestLogged(t *testing.T) {
 		t.Errorf("status = %d; want 421", resp.StatusCode)
 	}
 
-	// SQLite row recorded with verdict=DENY.
+	// SQLite row recorded with verdict=ERROR (#685: protocol reject, not
+	// a policy DENY).
 	time.Sleep(80 * time.Millisecond)
 	rows, _ := st.RecentDecisions(10)
 	if len(rows) == 0 {
 		t.Fatal("no decision rows recorded — #305 regression")
 	}
-	if rows[0].Verdict != "DENY" {
-		t.Errorf("row.Verdict = %q; want DENY", rows[0].Verdict)
+	if rows[0].Verdict != "ERROR" {
+		t.Errorf("row.Verdict = %q; want ERROR (#685 protocol reject, not DENY)", rows[0].Verdict)
 	}
 	if rows[0].UpstreamHost != "169.254.169.254" {
 		t.Errorf("row.UpstreamHost = %q; want 169.254.169.254 (IMDS visibility)", rows[0].UpstreamHost)
 	}
 
-	// OCSF event landed with #305's full extension shape.
+	// OCSF event landed with #305's full extension shape — but as a
+	// Failure (#685), not a Denial.
 	events := readAuditEvents(t, logPath)
 	if len(events) == 0 {
 		t.Fatal("audit log is empty — #305 regression: rejected non-CONNECT was invisible")
 	}
 	ev := events[0]
-	if ev.StatusID != audit.StatusDenied {
-		t.Errorf("status_id = %d; want %d (Denied)", ev.StatusID, audit.StatusDenied)
+	if ev.StatusID != audit.StatusFailure {
+		t.Errorf("status_id = %d; want %d (Failure, #685 — NOT Denied)", ev.StatusID, audit.StatusFailure)
 	}
-	if ev.Unmapped.IAMJIT.Verdict != "DENY" {
-		t.Errorf("verdict = %q; want DENY", ev.Unmapped.IAMJIT.Verdict)
+	if ev.Unmapped.IAMJIT.Verdict != "ERROR" {
+		t.Errorf("verdict = %q; want ERROR (#685)", ev.Unmapped.IAMJIT.Verdict)
 	}
 	if ev.Unmapped.IAMJIT.Ext == nil {
 		t.Fatal("ext should be populated")
 	}
-	reason, _ := ev.Unmapped.IAMJIT.Ext["deny_reason"].(string)
+	reason, _ := ev.Unmapped.IAMJIT.Ext["reject_reason"].(string)
 	if reason != "non-CONNECT method on CONNECT-only listener" {
-		t.Errorf("ext.deny_reason = %q; want non-CONNECT-on-CONNECT-only message", reason)
+		t.Errorf("ext.reject_reason = %q; want non-CONNECT-on-CONNECT-only message", reason)
 	}
 	// Method + path captured pre-TLS — agent operator can see what was
 	// probed even though the response was rejected.

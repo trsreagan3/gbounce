@@ -267,7 +267,9 @@ func applyAuditEventsTimeBounds(events []audit.Event, since, until *time.Time) [
 //     CONNECT (the ONLY path in the proxy that sets BadGateway on the
 //     CONNECT verb is the dial-failure leg; happy-path = 200, other
 //     error legs = 400/405/500).
-//   - verdict=DENY + http_status=421 → #305 non-CONNECT rejected.
+//   - verdict=ERROR + http_status=421 → #305/#685 non-CONNECT protocol
+//     reject (status_id=Failure, NOT a policy Denial).
+//   - verdict=DENY → policy deny (deny_hosts / dynamic-deny match).
 //
 // Both legs also lift the activity_id to ActivityConnect for CONNECT
 // rows so a SIEM filter on activity_id=6 finds tunnel attempts whether
