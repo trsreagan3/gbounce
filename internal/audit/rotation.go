@@ -32,20 +32,30 @@ const (
 	DefaultMaxSizeMB        = 100
 	DefaultMaxAgeDays       = 7
 	DefaultDBRetentionDays  = 30
-	DefaultDiskWarnPercent  = 85
-	DefaultDiskCritPercent  = 95
+	DefaultDiskWarnPercent  = 96
+	DefaultDiskCritPercent  = 98
 	rotatedJSONLPattern     = "audit-%s.jsonl.gz"
 	rotatedDBPattern        = "audit-%s.db.gz"
 	rotationTimestampFormat = "2006-01-02-150405"
 	dbDailyFormat           = "2006-01-02"
 )
 
+const (
+	// DefaultDiskWarnFreeBytes is the absolute-free-space threshold at which
+	// the audit_log status transitions to "degraded". 1 GiB.
+	DefaultDiskWarnFreeBytes int64 = 1073741824
+	// DefaultDiskCritFreeBytes is the absolute-free-space threshold at which
+	// the audit_log status transitions to "critical". 512 MiB.
+	DefaultDiskCritFreeBytes int64 = 524288000
+)
+
 // DiskStatus is the /healthz payload for the audit-log subsystem.
 type DiskStatus struct {
-	Status  string  `json:"status"`
-	Reason  string  `json:"reason"`
-	UsedPct float64 `json:"used_pct"`
-	Path    string  `json:"path"`
+	Status    string  `json:"status"`
+	Reason    string  `json:"reason"`
+	UsedPct   float64 `json:"used_pct"`
+	FreeBytes int64   `json:"free_bytes"`
+	Path      string  `json:"path"`
 }
 
 // IntegrityResult is the outcome of VerifyIntegrity.
@@ -403,7 +413,17 @@ func splitNewlines(b []byte) [][]byte {
 }
 
 // GetDiskStatus inspects the filesystem hosting path.
+// The check uses BOTH absolute-free-space AND percentage; absolute free is
+// the primary signal so a 23 GiB free / 89%-used volume never reports
+// degraded under the defaults.
 func GetDiskStatus(path string, warnPct, critPct int) (DiskStatus, error) {
+	return GetDiskStatusFull(path, warnPct, critPct, DefaultDiskWarnFreeBytes, DefaultDiskCritFreeBytes)
+}
+
+// GetDiskStatusFull is the full form used by the disk-pressure subsystem.
+// warnFreeBytes / critFreeBytes are the absolute-free-space floors below
+// which the status transitions even if usedPct is below the pct thresholds.
+func GetDiskStatusFull(path string, warnPct, critPct int, warnFreeBytes, critFreeBytes int64) (DiskStatus, error) {
 	target := path
 	if _, err := os.Stat(path); err != nil {
 		target = filepath.Dir(path)
@@ -419,22 +439,61 @@ func GetDiskStatus(path string, warnPct, critPct int) (DiskStatus, error) {
 	}
 	used := total - free
 	usedPct := 100.0 * float64(used) / float64(total)
-	return classifyDiskStatus(usedPct, warnPct, critPct, target), nil
+	freeBytes := int64(free)
+	return classifyDiskStatusFull(usedPct, freeBytes, warnPct, critPct, warnFreeBytes, critFreeBytes, target), nil
 }
 
-func classifyDiskStatus(usedPct float64, warnPct, critPct int, path string) DiskStatus {
+// classifyDiskStatusFull applies dual-threshold logic: a volume is OK only
+// when BOTH free bytes are above the warn floor AND usedPct is below the warn
+// percent. Either threshold crossing independently triggers the state change.
+func classifyDiskStatusFull(usedPct float64, freeBytes int64, warnPct, critPct int, warnFreeBytes, critFreeBytes int64, path string) DiskStatus {
+	// Critical: either percentage or absolute-free triggers.
 	if usedPct >= float64(critPct) {
-		return DiskStatus{Status: "critical", Reason: fmt.Sprintf("disk usage %.1f%% >= critical threshold %d%%", usedPct, critPct), UsedPct: usedPct, Path: path}
+		return DiskStatus{
+			Status:    "critical",
+			Reason:    fmt.Sprintf("disk usage %.1f%% >= critical threshold %d%%", usedPct, critPct),
+			UsedPct:   usedPct, FreeBytes: freeBytes, Path: path,
+		}
 	}
+	if critFreeBytes > 0 && freeBytes <= critFreeBytes {
+		return DiskStatus{
+			Status:    "critical",
+			Reason:    fmt.Sprintf("disk free %d bytes <= critical free-space floor %d bytes", freeBytes, critFreeBytes),
+			UsedPct:   usedPct, FreeBytes: freeBytes, Path: path,
+		}
+	}
+	// Warn: either percentage or absolute-free triggers.
 	if usedPct >= float64(warnPct) {
-		return DiskStatus{Status: "degraded", Reason: fmt.Sprintf("disk usage %.1f%% >= warn threshold %d%%", usedPct, warnPct), UsedPct: usedPct, Path: path}
+		return DiskStatus{
+			Status:    "degraded",
+			Reason:    fmt.Sprintf("disk usage %.1f%% >= warn threshold %d%%", usedPct, warnPct),
+			UsedPct:   usedPct, FreeBytes: freeBytes, Path: path,
+		}
 	}
-	return DiskStatus{Status: "ok", Reason: "disk usage within thresholds", UsedPct: usedPct, Path: path}
+	if warnFreeBytes > 0 && freeBytes <= warnFreeBytes {
+		return DiskStatus{
+			Status:    "degraded",
+			Reason:    fmt.Sprintf("disk free %d bytes <= warn free-space floor %d bytes", freeBytes, warnFreeBytes),
+			UsedPct:   usedPct, FreeBytes: freeBytes, Path: path,
+		}
+	}
+	return DiskStatus{Status: "ok", Reason: "disk usage within thresholds", UsedPct: usedPct, FreeBytes: freeBytes, Path: path}
+}
+
+// classifyDiskStatus is retained as a thin shim for internal callers that
+// do not yet pass absolute-free args. Uses the package-level defaults.
+func classifyDiskStatus(usedPct float64, warnPct, critPct int, path string) DiskStatus {
+	return classifyDiskStatusFull(usedPct, 0, warnPct, critPct, 0, 0, path)
 }
 
 // ClassifyDiskStatusForTest exposes the threshold logic to tests.
 func ClassifyDiskStatusForTest(usedPct float64, warnPct, critPct int, path string) DiskStatus {
 	return classifyDiskStatus(usedPct, warnPct, critPct, path)
+}
+
+// ClassifyDiskStatusFullForTest exposes the full dual-threshold logic to tests.
+func ClassifyDiskStatusFullForTest(usedPct float64, freeBytes int64, warnPct, critPct int, warnFreeBytes, critFreeBytes int64, path string) DiskStatus {
+	return classifyDiskStatusFull(usedPct, freeBytes, warnPct, critPct, warnFreeBytes, critFreeBytes, path)
 }
 
 // ParseLogDuration parses 7d / 24h / 30m / 60s; bare integer = days.

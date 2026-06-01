@@ -257,11 +257,14 @@ func newRunCmd() *cobra.Command {
 		// uses the cross-product compliance-heavy default
 		// (pause-requests). Operators on dev laptops can switch to
 		// rotate-aggressively for liveness-over-retention.
-		diskPressureMode     string
-		diskPressureWarnPct  int
-		diskPressureCritPct  int
-		diskPressureEmergPct int
-		stopOnDiskCritical   bool
+		diskPressureMode          string
+		diskPressureWarnPct       int
+		diskPressureCritPct       int
+		diskPressureEmergPct      int
+		stopOnDiskCritical        bool
+		ignoreDiskPressure        bool
+		diskPressureWarnFreeBytes int64
+		diskPressureCritFreeBytes int64
 		forceExternalBind bool
 		forwardTimeout    int
 		mode              string
@@ -683,12 +686,18 @@ so liveness probes never touch the proxy data path.`,
 			if dpErr != nil {
 				return fmt.Errorf("gbounce: --disk-pressure-mode: %w", dpErr)
 			}
-			diskPressureState := audit.NewDiskPressureState(
+			if ignoreDiskPressure {
+				fmt.Fprintf(os.Stderr, "⚠ Disk-pressure check DISABLED via --ignore-disk-pressure. Audit writes may fail if disk fills.\n")
+			}
+			diskPressureState := audit.NewDiskPressureStateFull(
 				normalizedDPMode,
 				audit.ResolveLogDir(auditLogPath),
 				diskPressureWarnPct,
 				diskPressureCritPct,
 				diskPressureEmergPct,
+				diskPressureWarnFreeBytes,
+				diskPressureCritFreeBytes,
+				ignoreDiskPressure,
 			)
 
 			cfg := proxy.Config{
@@ -905,13 +914,26 @@ so liveness probes never touch the proxy data path.`,
 			"choice).")
 	cmd.Flags().IntVar(&diskPressureWarnPct, "disk-pressure-warn-pct", audit.DefaultDiskWarnPercent,
 		"#461 — disk-usage percent at which the audit_log status flips to "+
-			"degraded (informational; no behavior change). Default 85.")
+			"degraded (informational; no behavior change). Default 96. "+
+			"Used together with --disk-pressure-warn-free-bytes; either trigger is sufficient.")
 	cmd.Flags().IntVar(&diskPressureCritPct, "disk-pressure-crit-pct", audit.DefaultDiskCritPercent,
 		"#461 — disk-usage percent at which the operator-declared mode "+
-			"reacts. Default 95.")
+			"reacts. Default 98. Used together with --disk-pressure-crit-free-bytes.")
 	cmd.Flags().IntVar(&diskPressureEmergPct, "disk-pressure-emergency-pct", audit.DefaultDiskEmergencyPercent,
 		"#461 — disk-usage percent at which the bouncer surfaces an "+
 			"emergency status. Default 98.")
+	cmd.Flags().Int64Var(&diskPressureWarnFreeBytes, "disk-pressure-warn-free-bytes", audit.DefaultDiskWarnFreeBytes,
+		"#461 — absolute free-space floor (bytes) below which audit_log flips to "+
+			"degraded. Default 1073741824 (1 GiB). A volume with 23 GiB free never "+
+			"reports degraded even at 89%% used. Set 0 to rely on percentage only.")
+	cmd.Flags().Int64Var(&diskPressureCritFreeBytes, "disk-pressure-crit-free-bytes", audit.DefaultDiskCritFreeBytes,
+		"#461 — absolute free-space floor (bytes) below which the mode reacts. "+
+			"Default 524288000 (512 MiB). Set 0 to rely on percentage only.")
+	cmd.Flags().BoolVar(&ignoreDiskPressure, "ignore-disk-pressure", false,
+		"#461 — disable the disk-pressure check entirely. Audit writes proceed at "+
+			"any disk state; a loud warning is emitted at startup. "+
+			"/healthz audit_log.status shows 'ignored'. Use when you know the "+
+			"volume has enough headroom and want to bypass the circuit breaker.")
 	cmd.Flags().BoolVar(&forceExternalBind, "i-know-this-binds-externally", false, "acknowledge the threat model of binding off loopback")
 	cmd.Flags().IntVar(&forwardTimeout, "forward-timeout-seconds", 60, "per-request forward timeout in seconds")
 	cmd.Flags().StringVar(&mode, "mode", "discovery",
