@@ -932,6 +932,17 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// #59 — Phase H PRE-DECISION anomaly enforcement. The floor verdict
+	// here is ALLOW (no deny_hosts rule matched). In mode=block an
+	// anomalous behavioral deviation TIGHTENS allow->deny BEFORE we dial
+	// the upstream, so block actually enforces. Tighten-only: this branch
+	// is only reached on a non-deny floor, and decideAnomaly never
+	// loosens. Fail-soft: a disabled/alert/normal request returns false
+	// and the request proceeds untouched.
+	if s.decideAnomaly(w, r, startedAt) {
+		return
+	}
+
 	// Rewrite onto the upstream scheme/host. The inbound request's
 	// path + query are preserved verbatim.
 	target := *s.upstreamURL
@@ -1050,6 +1061,15 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// #59 — Phase H PRE-DECISION anomaly enforcement (CONNECT path). The
+	// floor verdict is ALLOW (no deny_hosts rule matched). In mode=block
+	// an anomalous deviation tightens allow->deny BEFORE the dial, so the
+	// tunnel is never established. Tighten-only + fail-soft, as the
+	// forward path.
+	if s.decideAnomaly(w, r, startedAt) {
+		return
+	}
+
 	upstream, err := net.DialTimeout("tcp", target,
 		time.Duration(s.cfg.ForwardTimeoutSeconds)*time.Second)
 	if err != nil {
