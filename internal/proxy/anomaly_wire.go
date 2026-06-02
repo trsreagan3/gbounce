@@ -10,8 +10,8 @@
 //
 //   - action        = the HTTP method (GET / POST / CONNECT / ...)
 //   - resource      = "<upstream-host><path>" — canonicalised by the
-//                     core into a privacy-safe pattern (it never stores
-//                     the raw host/path).
+//     core into a privacy-safe pattern (it never stores
+//     the raw host/path).
 //   - agentIdentity = the validated X-Agent-Name (or "anonymous").
 //
 // DEFAULT = ALERT, NOT BLOCK per [[safety-mode-lean-permissive]]: the
@@ -24,6 +24,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/trsreagan3/gbounce/internal/anomaly"
 )
@@ -83,14 +84,23 @@ func (s *Server) observeAnomaly(ctx context.Context, action, resource, agentIden
 	if floorVerdict == "DENY" || floorVerdict == "deny" {
 		floor = "deny"
 	}
+	// FEED THE REAL DEVIATION SIGNALS (#718 finding HIGH): derive the
+	// current hour-of-day from the clock and the recent-window observed
+	// action rate for this (agent, action, resource_pattern) from the
+	// baseline store, so the hour_of_day + action_frequency dimensions
+	// actually contribute. Computed BEFORE Run records this event so the
+	// rate reflects the burst arriving so far; Run adds the current one.
+	// Privacy preserved: we pass only structural shapes + counts.
+	observedHour := time.Now().UTC().Hour()
+	observedRate := s.anomalyDetector.Store().RecentRate(agentIdentity, action, resource, 0)
 	res := s.anomalyDetector.Run(anomaly.RunInput{
-		Action:            action,
-		AgentIdentity:     agentIdentity,
-		Resource:          resource,
-		ObservedHour:      -1,
-		ObservedActionCount: -1,
-		FloorDecision:     floor,
-		RecordObservation: true,
+		Action:              action,
+		AgentIdentity:       agentIdentity,
+		Resource:            resource,
+		ObservedHour:        observedHour,
+		ObservedActionCount: observedRate,
+		FloorDecision:       floor,
+		RecordObservation:   true,
 	})
 	_ = res // alert emission happens inside Run via the bound emitter
 	_ = ctx
