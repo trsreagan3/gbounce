@@ -174,6 +174,12 @@ type Trigger struct {
 	// Triggers the MITM-mode honest-positioning banner (cert-pinning
 	// SDKs break + bodies are redacted by default).
 	MITMMode bool
+	// AnomalyBlockMode is true when anomaly_detection mode=block is
+	// armed (#59). When true, BannerLines suppresses the B9 "no
+	// blocking" caveat: #59 ships real enforcement so the caveat would
+	// be inaccurate and confusing to operators who deliberately chose
+	// block mode.
+	AnomalyBlockMode bool
 }
 
 // BannerLines returns the per-line banner output for the matched
@@ -187,7 +193,11 @@ func BannerLines(t Trigger) []string {
 			out = append(out, e.BannerLine)
 		}
 	}
-	if t.DiscoveryMode {
+	// B9 "discovery-only (no blocking)" caveat is suppressed when
+	// anomaly_detection mode=block is armed (#59): block mode IS
+	// enforcement, so printing "no blocking" would contradict the
+	// operator's deliberate choice per [[ibounce-honest-positioning]].
+	if t.DiscoveryMode && !t.AnomalyBlockMode {
 		if e := ByID("B9"); e != nil && e.BannerLine != "" {
 			out = append(out, e.BannerLine)
 		}

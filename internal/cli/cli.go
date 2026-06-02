@@ -800,13 +800,37 @@ so liveness probes never touch the proxy data path.`,
 			// Frictionless per [[lightweight-frictionless-principle]];
 			// DISABLED by default + ALERT (never block) when enabled
 			// per [[safety-mode-lean-permissive]].
-			if acfg, aerr := proxy.AnomalyConfigFromEnv(); aerr != nil {
+			//
+			// anomalyBlockModeArmed tracks whether mode=block is active so
+			// the caveats banner below can suppress the B9 "no blocking"
+			// caveat: #59 shipped block enforcement, so the caveat is only
+			// accurate under alert/discovery mode.
+			anomalyBlockModeArmed := false
+			acfg, aerr := proxy.AnomalyConfigFromEnv()
+			if aerr != nil {
 				return fmt.Errorf("anomaly_detection config: %w", aerr)
-			} else if acfg.Enabled {
+			}
+			if acfg.Enabled {
 				srv.SetAnomalyDetector(srv.NewAnomalyDetector(acfg))
-				fmt.Fprintf(cmd.ErrOrStderr(),
-					"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — surfaces a neutral signal for review, does not block by default\n",
-					acfg.Mode, acfg.Sensitivity)
+				if acfg.Mode == "block" {
+					anomalyBlockModeArmed = true
+					// #59 ships block enforcement: mode=block tightens
+					// allow→deny on anomalous requests BEFORE the upstream
+					// is dialed. Say so at startup per
+					// [[ibounce-honest-positioning]] — not "does not block"
+					// when blocking IS armed.
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"anomaly detection: ENABLED (mode=block, sensitivity=%s) — "+
+							"enforcement ARMED: anomalous requests are denied before "+
+							"the upstream is dialed (#59)\n",
+						acfg.Sensitivity)
+				} else {
+					fmt.Fprintf(cmd.ErrOrStderr(),
+						"anomaly detection: ENABLED (mode=%s, sensitivity=%s) — "+
+							"surfaces a neutral signal for review; anomalous requests "+
+							"are forwarded (switch to mode=block to enforce)\n",
+						acfg.Mode, acfg.Sensitivity)
+				}
 			}
 			// #324d — wire the watcher's emit callback now that the
 			// Server exists. Each reload bumps the matching counter +
@@ -938,10 +962,16 @@ so liveness probes never touch the proxy data path.`,
 			// triggering config applies, per the founder direction
 			// "the signal should be useful, not noise." Full doc:
 			// `gbounce doctor caveats` (every gbounce-relevant entry).
+			//
+			// AnomalyBlockMode suppresses B9's "no blocking" caveat when
+			// anomaly detection mode=block is armed: the shipped #59
+			// enforcement means blocking IS happening, so the caveat would
+			// be inaccurate and confusing.
 			for _, line := range caveats.BannerLines(caveats.Trigger{
-				DiscoveryMode: cfg.Mode == proxy.ModeDiscovery,
-				AllowConnect:  allowConnect,
-				MITMMode:      cfg.Mode == proxy.ModeMITM,
+				DiscoveryMode:     cfg.Mode == proxy.ModeDiscovery,
+				AllowConnect:      allowConnect,
+				MITMMode:          cfg.Mode == proxy.ModeMITM,
+				AnomalyBlockMode:  anomalyBlockModeArmed,
 			}) {
 				fmt.Fprintln(cmd.OutOrStdout(), line)
 			}

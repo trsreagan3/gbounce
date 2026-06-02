@@ -279,6 +279,14 @@ This is the highest-friction path — it requires a Go toolchain. Prefer
 Homebrew / a prebuilt binary / Scoop / APT / RPM above unless you're
 building from a checkout or want to pin a commit.
 
+**Toolchain requirement:** `go.mod` specifies `go 1.26.0`. With a stock
+Go 1.24 or earlier toolchain the download will fail. By default Go
+resolves this automatically (`GOTOOLCHAIN=auto` downloads Go 1.26.x on
+first use), but **air-gapped or corporate-managed machines that pin or
+restrict the Go toolchain** must have Go 1.26+ pre-installed — set
+`GOTOOLCHAIN=local` to enforce the locally-installed version is
+sufficient, or install Go 1.26+ from <https://go.dev/dl/>.
+
 ```sh
 go install github.com/trsreagan3/gbounce/cmd/gbounce@latest
 
@@ -300,11 +308,12 @@ silently with the binary at `~/go/bin/gbounce` while the operator's shell
 reports "command not found", which reads as "install broken" on a fresh
 machine.
 
-Go 1.18+ auto-stamps VCS info (commit SHA + build time) into binaries
-built from a git checkout, so even this unflagged install reports a
-real commit in `gbounce --version` — the `iam-jit canary update` flow
-depends on that. For release builds (or to override the auto-stamp with
-a specific tag), pass `-ldflags`:
+**Version stamp note:** `go install` fetches a pre-compiled module-proxy
+binary, which carries no VCS metadata — `gbounce --version` will show
+`commit none, built unknown`. Only a source-checkout build (or an
+explicit `-ldflags` pass) carries a real stamp. For a stamped binary,
+use Homebrew / a prebuilt release binary, or build from a git checkout
+with `-ldflags`:
 
 ```sh
 go install \
