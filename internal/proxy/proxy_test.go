@@ -37,7 +37,15 @@ func startTestProxy(t *testing.T, upstream *httptest.Server, withAuditLog bool, 
 	var lw *audit.LogWriter
 	if withAuditLog {
 		logPath = filepath.Join(dir, "audit.jsonl")
-		lw, err = audit.NewLogWriter(context.Background(), audit.LogWriterOptions{Path: logPath, Fsync: true})
+		// ADOPT-10 / #734 — chain is on by default when audit logging is
+		// on; wire it here so chain_initialized reflects honest forensic
+		// posture (chain actually stamps), not merely "writer active".
+		chain := audit.LoadChainState(dir, 0)
+		signer, serr := audit.NewManifestSigner(dir, "gbounce", audit.DefaultManifestIntervalEvents, filepath.Join(dir, "keys"), audit.DefaultKeypairName)
+		if serr != nil {
+			t.Fatalf("NewManifestSigner: %v", serr)
+		}
+		lw, err = audit.NewLogWriter(context.Background(), audit.LogWriterOptions{Path: logPath, Fsync: true, Chain: chain, Signer: signer})
 		if err != nil {
 			t.Fatalf("NewLogWriter: %v", err)
 		}
@@ -261,6 +269,82 @@ func TestProxy_AuditLogEmitsOCSFEvent(t *testing.T) {
 	}
 	if ev.Unmapped.IAMJIT.Enforced {
 		t.Errorf("enforced should be false")
+	}
+}
+
+// TestProxy_AuditLogIsChainedAndVerifies — ADOPT-10 / #734 — the
+// emitted JSONL must carry the tamper-evident hash-chain block and
+// verify clean end-to-end through the real proxy → LogWriter path, and
+// /healthz must surface honest chain state.
+func TestProxy_AuditLogIsChainedAndVerifies(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	proxyURL, healthURL, _, logPath := startTestProxy(t, upstream, true, false)
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(proxyURL + "/v1/test")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Each line must carry the chain block.
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lines := 0
+	for sc.Scan() {
+		var m map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
+			t.Fatalf("decode line: %v", err)
+		}
+		block, ok := m["unmapped"].(map[string]any)["iam_jit"].(map[string]any)["audit_chain"].(map[string]any)
+		if !ok {
+			t.Fatalf("line %d missing audit_chain block: %s", lines, sc.Bytes())
+		}
+		if _, ok := block["hash"].(string); !ok {
+			t.Fatalf("line %d chain block missing hash", lines)
+		}
+		lines++
+	}
+	_ = f.Close()
+	if lines < 3 {
+		t.Fatalf("expected >=3 chained lines, got %d", lines)
+	}
+
+	// VerifyChain over the log dir must be clean.
+	res, err := audit.VerifyChain(filepath.Dir(logPath), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.OK() {
+		t.Fatalf("emitted chain failed verification: %+v", res.Inconsistencies)
+	}
+
+	// /healthz surfaces honest chain state.
+	resp, err := http.Get(healthURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	_ = resp.Body.Close()
+	if body["chain_initialized"] != true {
+		t.Fatalf("chain_initialized = %v; want true", body["chain_initialized"])
+	}
+	ac, ok := body["audit_chain"].(map[string]any)
+	if !ok || ac["enabled"] != true {
+		t.Fatalf("audit_chain not enabled in healthz: %#v", body["audit_chain"])
+	}
+	if hh, _ := ac["head_hash"].(string); hh == "" {
+		t.Fatalf("audit_chain.head_hash empty: %#v", ac)
 	}
 }
 

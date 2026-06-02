@@ -243,6 +243,7 @@ func newRunCmd() *cobra.Command {
 		dbPath            string
 		auditLogPath      string
 		auditLogFsync     bool
+		noAuditChain      bool
 		// #311 / §A10 — rotation thresholds. Sentinel -1 = "use the
 		// audit-package default (matches iam-roles/docs/LOG-RETENTION.md
 		// — 100 MB / 7 days / 30 days)." 0 = "operator explicitly
@@ -528,9 +529,44 @@ so liveness probes never touch the proxy data path.`,
 			_ = effAuditDBRetentionDays
 
 			if auditLogPath != "" {
+				// ADOPT-10 / #734 — tamper-evident hash-chain + signed
+				// manifests, ON BY DEFAULT when audit logging is on
+				// (cheap + safe per [[v1-scope-bar]]). --no-audit-chain
+				// disables. Chain state lives alongside the JSONL; the
+				// Ed25519 keypair lives in ~/.gbounce/audit-keys
+				// (override via GBOUNCE_AUDIT_KEYS_DIR). The private key
+				// is never logged or committed.
+				logDir := audit.ResolveLogDir(auditLogPath)
+				var chain *audit.ChainState
+				var signer *audit.ManifestSigner
+				if !noAuditChain && logDir != "" {
+					chain = audit.LoadChainState(logDir, 0)
+					keysDir := os.Getenv("GBOUNCE_AUDIT_KEYS_DIR")
+					if keysDir == "" {
+						if home, herr := os.UserHomeDir(); herr == nil {
+							keysDir = filepath.Join(home, ".gbounce", "audit-keys")
+						}
+					}
+					if keysDir != "" {
+						s, serr := audit.NewManifestSigner(
+							logDir, "gbounce",
+							audit.DefaultManifestIntervalEvents,
+							keysDir, audit.DefaultKeypairName,
+						)
+						if serr != nil {
+							fmt.Fprintf(os.Stderr,
+								"gbounce: warn: audit-manifest keypair init failed: %v "+
+									"(hash-chain still active; no signed manifests)\n", serr)
+						} else {
+							signer = s
+						}
+					}
+				}
 				lw, err = audit.NewLogWriter(ctx, audit.LogWriterOptions{
-					Path:  auditLogPath,
-					Fsync: auditLogFsync,
+					Path:   auditLogPath,
+					Fsync:  auditLogFsync,
+					Chain:  chain,
+					Signer: signer,
 				})
 				if err != nil {
 					return err
@@ -902,6 +938,7 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite audit DB path (default ~/.gbounce/state.db; honors GBOUNCE_DB)")
 	cmd.Flags().StringVar(&auditLogPath, "audit-log-path", "", "also append OCSF events to this JSONL file (opt-in)")
 	cmd.Flags().BoolVar(&auditLogFsync, "audit-log-fsync", false, "fsync after every audit-log write (slower; safer on crash)")
+	cmd.Flags().BoolVar(&noAuditChain, "no-audit-chain", false, "disable the tamper-evident hash-chain + Ed25519-signed manifests on the audit-log JSONL (ADOPT-10/#734; on by default when --audit-log-path is set)")
 	// #311 / §A10 — rotation thresholds. Sentinel -1 = "use audit-pkg
 	// default (matches LOG-RETENTION.md)"; 0 = "operator explicitly
 	// disabled this trigger." Same names across all four Bounce

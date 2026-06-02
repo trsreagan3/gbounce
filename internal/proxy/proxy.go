@@ -1124,7 +1124,7 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 		// [[cross-product-agent-parity]]); a missing key would break
 		// the monitor's JSON decode. The VALUES are still safe — a
 		// bool + a small map with {"enabled": false}.
-		body["chain_initialized"] = s.log != nil
+		body["chain_initialized"] = s.log != nil && s.log.ChainEnabled()
 		body["llm_budget"] = map[string]any{"enabled": false}
 		// Mirror the disk-pressure 503 flip below WITHOUT surfacing
 		// the detailed snapshot — operators on unauth probes still
@@ -1203,7 +1203,28 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	// (failure surfaced in the bouncer log but NOT on /healthz until
 	// the first event tried to write). Per [[cross-product-agent-parity]]
 	// every Bounce surfaces the same field for SRE composite monitors.
-	body["chain_initialized"] = s.log != nil
+	// ADOPT-10 / #734 — chain_initialized now reports whether the
+	// tamper-evident hash-chain is actually wired (it stamps + verifies
+	// rows), NOT merely that the JSONL writer is active. Honest chain +
+	// manifest state is surfaced in the dedicated audit_chain field
+	// below so a SOC analyst / composite monitor sees the real forensic
+	// posture (head seq/hash + manifest signature presence).
+	body["chain_initialized"] = s.log != nil && s.log.ChainEnabled()
+	if s.log != nil && s.log.ChainEnabled() {
+		chainBody := map[string]any{
+			"enabled":   true,
+			"head_seq":  s.log.ChainHeadSeq(),
+			"head_hash": s.log.ChainHeadHash(),
+		}
+		if ms := s.log.ManifestStatus(); ms != nil {
+			chainBody["manifest"] = ms
+		} else {
+			chainBody["manifest"] = map[string]any{"configured": false}
+		}
+		body["audit_chain"] = chainBody
+	} else {
+		body["audit_chain"] = map[string]any{"enabled": false}
+	}
 	// #544 / MRR-5 M3 — cross-bouncer parity with ibounce's
 	// /healthz.llm_budget block. Go bouncers don't run LLM per
 	// [[bouncer-zero-llm-when-agent-in-loop]] (they're deterministic
