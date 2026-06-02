@@ -22,12 +22,21 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/trsreagan3/gbounce/internal/anomaly"
+	"github.com/trsreagan3/gbounce/internal/audit"
+	"github.com/trsreagan3/gbounce/internal/structureddeny"
 )
+
+// anomalyDenySource is the canonical deny_source label stamped onto a
+// structured-deny emitted because mode=block tightened an anomalous
+// request (iam-jit#59).
+const anomalyDenySource = "anomaly_block"
 
 // AnomalyConfigFromEnv builds the Phase H detector config from
 // environment variables (frictionless opt-in per
@@ -104,6 +113,111 @@ func (s *Server) observeAnomaly(ctx context.Context, action, resource, agentIden
 	})
 	_ = res // alert emission happens inside Run via the bound emitter
 	_ = ctx
+}
+
+// anomalySignals extracts the privacy-safe structural signals (action /
+// resource / agent identity) for one request, IDENTICALLY for the
+// pre-decision Decide path and the post-decision observe path so both
+// hit the same per-agent baseline key. action = HTTP method; resource =
+// "<upstream-host><path>" mirroring observeAnomaly's
+// row.UpstreamHost+row.Path; agent = the validated X-Agent-Name (or
+// "" -> "anonymous" inside the core).
+func (s *Server) anomalySignals(r *http.Request) (action, resource, agent string) {
+	action = r.Method
+	var upHost, path string
+	if r.Method == http.MethodConnect {
+		// CONNECT: target host:port is r.Host; row.Path carries r.Host.
+		h, _ := splitHostPortStr(r.Host)
+		upHost = h
+		path = r.Host
+	} else if s.upstreamURL != nil {
+		upHost = s.upstreamURL.Hostname()
+		if r.URL != nil {
+			path = r.URL.Path
+		}
+	}
+	resource = upHost + path
+	raw := r.Header.Get("X-Agent-Name")
+	if raw != "" && audit.IsValidAgentName(raw) {
+		agent = raw
+	}
+	return action, resource, agent
+}
+
+// decideAnomaly is the PRE-DECISION tighten check (iam-jit#59). It runs
+// in the LIVE request path on a request the floor would ALLOW, BEFORE
+// gbounce dials the upstream / serves the response. In mode=block an
+// anomalous verdict tightens allow->deny: this writes the structured 403
+// + audits the deny + returns true (the caller must then return without
+// proceeding). In every other case it returns false and the request
+// proceeds untouched.
+//
+// TIGHTEN-ONLY in the live path: this is only ever called on the
+// non-deny branch (after the deny_hosts check has NOT matched), and the
+// core Detector.Decide refuses to loosen a deny floor regardless. The
+// only mutation is allow->deny.
+//
+// FAIL-SOFT: a nil/disabled detector returns false immediately; any
+// non-block mode returns false (no deny). The detector core never
+// panics; if scoring degrades it returns the floor (allow), so a
+// detector hiccup can NEVER turn into a spurious deny or break the path.
+func (s *Server) decideAnomaly(w http.ResponseWriter, r *http.Request, startedAt time.Time) (tightened bool) {
+	if s.anomalyDetector == nil || !s.anomalyDetector.Enabled() {
+		return false
+	}
+	// DEFENSIVE RECOVER: if the core scoring path panics (e.g. future
+	// data-race or nil-deref in a scorer update), degrade to the FLOOR
+	// decision (allow stays allow). A panic must never crash the hot path
+	// or spuriously deny a request. tightened is false by default, so the
+	// named return ensures the caller sees "not tightened" on a panic.
+	defer func() {
+		if recover() != nil {
+			tightened = false
+		}
+	}()
+	action, resource, agentIdentity := s.anomalySignals(r)
+	out := s.anomalyDetector.Decide(anomaly.DecideInput{
+		Action:        action,
+		AgentIdentity: agentIdentity,
+		Resource:      resource,
+		FloorDecision: "allow", // only called on the allow branch
+	})
+	if !out.Tightened || out.Decision != "deny" {
+		// Not tightened (alert mode, normal traffic, detection-only,
+		// disabled) — the request proceeds untouched.
+		return false
+	}
+	// Anomalous + block mode: TIGHTEN allow->deny. Audit + serve a
+	// structured 403. The neutral OCSF anomaly event was already emitted
+	// by Decide via the bound emitter.
+	reason := "request denied: anomaly_detection mode=block flagged a behavioral deviation (signal for review, not proof of a problem)"
+	s.recordDeny(r, startedAt, http.StatusForbidden, reason)
+	s.totalErrors.Add(1)
+	legacyMsg := "gbounce: " + reason
+	deny := structureddeny.Build(structureddeny.BuildOptions{
+		Bouncer:    "gbounce",
+		Action:     gbounceStructuredDenyAction(r),
+		Resource:   resource,
+		DenyReason: legacyMsg,
+		DenySource: anomalyDenySource,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	body := map[string]any{
+		"error":            legacyMsg,
+		"decision_verdict": "deny",
+		"decision_reason":  legacyMsg,
+		"caught_by_bouncer":                  deny.CaughtByBouncer,
+		"is_likely_injection_classification": deny.IsLikelyInjectionClassification,
+		"suggested_allow_command":            deny.SuggestedAllowCommand,
+		"recommended_action":                 deny.RecommendedAction,
+		"deny_event_id":                      deny.DenyEventID,
+		"classifier_hook":                    deny.ClassifierHook,
+		"deny_source_classified":             deny.DenySourceClassified,
+		"structured_deny_schema_version":     deny.StructuredDenySchemaVersion,
+	}
+	_ = json.NewEncoder(w).Encode(body)
+	return true
 }
 
 // NewAnomalyDetector constructs a Detector wired to forward neutral
