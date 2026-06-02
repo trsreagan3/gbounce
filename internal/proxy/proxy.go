@@ -51,6 +51,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/trsreagan3/gbounce/internal/anomaly"
 	"github.com/trsreagan3/gbounce/internal/audit"
 	"github.com/trsreagan3/gbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/gbounce/internal/mitm"
@@ -255,6 +256,19 @@ type Server struct {
 	// [[self-host-zero-billing-dependency]] the destination is
 	// operator-owned; iam-jit-the-company never receives the data.
 	objectStorage *audit.ObjectStorageWriter
+	// #718 ADOPT-4 — Phase H behavioral-deviation / anomaly detector.
+	// Nil disables the channel. When wired (anomaly_detection.enabled),
+	// every recorded decision is observed into a per-agent behavioral
+	// baseline + scored for deviation; an anomalous verdict surfaces a
+	// NEUTRAL OCSF anomaly_detected event through the audit log. ALERT
+	// by default (never blocks) per [[safety-mode-lean-permissive]].
+	anomalyDetector *anomaly.Detector
+	// anomalyRecent is a small bounded ring of the most-recent neutral
+	// OCSF anomaly events emitted by the detector, surfaced on /healthz
+	// + the query surface so the signal is visible before a SIEM
+	// ingests it. Guarded by anomalyMu.
+	anomalyMu     sync.Mutex
+	anomalyRecent []map[string]any
 	httpSrv       *http.Server
 	mgmtSrv  *http.Server
 	// upstreamURL is the parsed cfg.UpstreamURL, kept as *url.URL so
@@ -1236,6 +1250,12 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	// unconditionally so a composite monitor scraping all four
 	// /healthz endpoints sees the same key set.
 	body["llm_budget"] = map[string]any{"enabled": false}
+	// #718 ADOPT-4 — Phase H behavioral-deviation / anomaly detector
+	// status. Always present (enabled:false when unwired) so the
+	// composite monitor's key set stays stable per
+	// [[cross-product-agent-parity]]. ALERT by default; this block is a
+	// visibility surface, never an enforcement signal.
+	body["anomaly"] = s.anomalyHealthz()
 	// #461 / §A63c — disk-pressure subsystem snapshot + 503 status
 	// flip in pause-requests at critical / emergency. Per
 	// [[ibounce-honest-positioning]] every state crossing surfaces
@@ -1753,6 +1773,11 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 			_ = s.log.Write(r.Context(), ev)
 			s.auditLogLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
+		// #718 ADOPT-4 — Phase H behavioral-deviation tap. Observes the
+		// decision into the per-agent baseline + scores it; an anomalous
+		// verdict tees a NEUTRAL anomaly_detected event into the same
+		// audit log. Fail-soft + no-op when the detector is unwired.
+		s.observeAnomaly(r.Context(), row.Method, row.UpstreamHost+row.Path, agentNameValidated, row.Verdict)
 		// #285 — per-session NDJSON tee. Record is fail-soft (disk
 		// errors land on the recorder's lastErr counter + surface via
 		// Status; never propagated into the proxy hot path so a busted
