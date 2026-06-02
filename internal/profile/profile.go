@@ -586,7 +586,7 @@ func (p *Profile) validate() error {
 		}
 	}
 	for i, spec := range p.AllowRules {
-		if _, err := ParseRule(spec); err != nil {
+		if _, err := ParseAllowRule(spec); err != nil {
 			return fmt.Errorf("allow_rules[%d]: %v", i, err)
 		}
 	}

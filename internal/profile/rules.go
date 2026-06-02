@@ -65,6 +65,15 @@ type Rule struct {
 	// audit `ext.deny_reason` field + the 403 response body. Optional.
 	Reason string
 
+	// allowAll is set when the rule carried the explicit allow-all
+	// sentinel (`host: "*"`). It exists so we can distinguish a
+	// deliberately-unconstrained allow_rule (operator typed `*`, mirrors
+	// dbounce/kbouncer's bare `*` convention) from an accidentally
+	// predicate-less spec (a stray/blank allow entry — fail-CLOSED).
+	// A rule with allowAll=true has no host/method/path/query predicate
+	// and therefore matches everything via Match.
+	allowAll bool
+
 	// Source is the original rule index + a short summary used in the
 	// `ext.deny_reason` audit-field when the operator didn't supply
 	// a Reason.
@@ -94,7 +103,14 @@ func ParseRule(spec RuleSpec) (Rule, error) {
 		QueryParams: map[string]string{},
 	}
 
-	if strings.HasPrefix(r.Host, "*.") {
+	if r.Host == "*" {
+		// Explicit allow-all sentinel — mirrors dbounce/kbouncer's bare
+		// `*` convention. Drop the host predicate (Host="" matches every
+		// host) and flag the rule so validate() can tell a deliberate
+		// allow-all apart from an accidentally predicate-less spec.
+		r.Host = ""
+		r.allowAll = true
+	} else if strings.HasPrefix(r.Host, "*.") {
 		r.hostWildcard = true
 		r.hostSuffix = strings.TrimPrefix(r.Host, "*.")
 		if r.hostSuffix == "" {
@@ -166,6 +182,41 @@ func ParseRule(spec RuleSpec) (Rule, error) {
 	}
 
 	r.Source = describeRule(r)
+	return r, nil
+}
+
+// HasPredicates reports whether the rule constrains at least one
+// request facet (host / port / method / path / query). A rule with NO
+// predicates matches EVERY request via Match — harmless for a deny_rule
+// (the operator chose to deny everything) but dangerous for an
+// allow_rule, where it would silently override every deny_rule.
+func (r Rule) HasPredicates() bool {
+	if r.Host != "" || r.Port != 0 || len(r.Methods) > 0 {
+		return true
+	}
+	if r.PathExact != "" || r.PathPrefix != "" || r.PathRegex != nil {
+		return true
+	}
+	return len(r.QueryParams) > 0
+}
+
+// ParseAllowRule compiles an allow_rule spec FAIL-CLOSED. It mirrors
+// dbounce/kbouncer's convention: an unconstrained allow entry is only
+// honored as allow-all when it carries the EXPLICIT `host: "*"`
+// sentinel. A predicate-less spec with no sentinel (a stray or blank
+// allow entry, e.g. from a hand-authored or org-distributed read-only
+// profile) is REJECTED rather than silently matching everything and
+// neutering every deny_rule. deny_rules keep using ParseRule, where a
+// predicate-less rule legitimately means "deny all".
+func ParseAllowRule(spec RuleSpec) (Rule, error) {
+	r, err := ParseRule(spec)
+	if err != nil {
+		return Rule{}, err
+	}
+	if !r.allowAll && !r.HasPredicates() {
+		return Rule{}, fmt.Errorf(
+			"allow_rule has no predicates (host/method/path/query); a predicate-less allow_rule is fail-closed — set `host: \"*\"` for an explicit allow-all")
+	}
 	return r, nil
 }
 

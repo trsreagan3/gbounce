@@ -619,7 +619,7 @@ func (s *Server) SetActiveProfile(p *profile.Profile) error {
 	// the deny_rules layer in serveMITMRequest.
 	newAllowRules := make([]profile.Rule, 0, len(p.AllowRules))
 	for _, spec := range p.AllowRules {
-		r, rerr := profile.ParseRule(spec)
+		r, rerr := profile.ParseAllowRule(spec)
 		if rerr != nil {
 			return fmt.Errorf("gbounce: profile %q: allow_rules: %w", p.Name, rerr)
 		}

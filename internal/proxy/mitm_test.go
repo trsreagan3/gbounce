@@ -462,12 +462,16 @@ func TestMITM_ProfileAllowRule_CannotOverrideDenyHostsHardFloor(t *testing.T) {
 		t.Fatalf("upstream must not be reached: deny_hosts is a hard floor an allow_rule cannot override")
 	})
 
-	// A blanket allow_rule that matches everything (no predicates).
-	allowRules, err := profile.ParseRules([]profile.RuleSpec{
-		{Reason: "operator allow-all (must still lose to deny_hosts)"},
+	// A blanket allow_rule that matches everything. Uses the EXPLICIT
+	// allow-all sentinel (`host: "*"`) — a predicate-less allow_rule is
+	// now fail-closed and rejected at parse time, so allow-all must be
+	// spelled out deliberately (mirrors dbounce/kbouncer's bare `*`).
+	allowRules, err := profile.ParseAllowRule(profile.RuleSpec{
+		Host:   "*",
+		Reason: "operator allow-all (must still lose to deny_hosts)",
 	})
 	if err != nil {
-		t.Fatalf("ParseRules(allow): %v", err)
+		t.Fatalf("ParseAllowRule(allow-all): %v", err)
 	}
 
 	// Build the proxy manually so we can set BOTH a deny_hosts floor
@@ -503,7 +507,7 @@ func TestMITM_ProfileAllowRule_CannotOverrideDenyHostsHardFloor(t *testing.T) {
 		AllowConnect:          true,
 		ForwardTimeoutSeconds: 5,
 		MITMCertMinter:        minter,
-		MITMAllowRules:        allowRules,
+		MITMAllowRules:        []profile.Rule{allowRules},
 		DenyHosts:             []string{upHost}, // hard floor on the upstream host
 	}
 	srv, err := NewServer(cfg, st, nil, nil)

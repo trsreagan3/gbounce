@@ -194,3 +194,71 @@ func TestFirstAllowMatch_EmptyListIsNoOp(t *testing.T) {
 		t.Errorf("empty allow list must never match; got %+v", got)
 	}
 }
+
+// TestParseAllowRule_PredicatelessIsRejected pins the fail-CLOSED
+// contract (security audit MED): a predicate-less allow_rule used to
+// compile to an empty Rule{} that matched EVERYTHING and overrode every
+// deny_rule. ParseAllowRule now REJECTS it. Only the explicit allow-all
+// sentinel (`host: "*"`, mirroring dbounce/kbouncer's bare `*`) is
+// honored as allow-all. A stray/blank allow entry can no longer
+// silently neuter a profile's deny_rules.
+func TestParseAllowRule_PredicatelessIsRejected(t *testing.T) {
+	// Predicate-less (only a Reason) → REJECTED.
+	if _, err := ParseAllowRule(RuleSpec{Reason: "stray blank allow"}); err == nil {
+		t.Fatalf("predicate-less allow_rule must be rejected (fail-closed); got nil error")
+	}
+	// Truly empty spec → REJECTED.
+	if _, err := ParseAllowRule(RuleSpec{}); err == nil {
+		t.Fatalf("empty allow_rule spec must be rejected (fail-closed); got nil error")
+	}
+	// Explicit allow-all sentinel → ACCEPTED, and matches everything.
+	r, err := ParseAllowRule(RuleSpec{Host: "*"})
+	if err != nil {
+		t.Fatalf("explicit allow-all (host: \"*\") must be accepted; got %v", err)
+	}
+	if r.HasPredicates() {
+		t.Errorf("explicit allow-all should have no predicates; got %+v", r)
+	}
+	if !r.Match("anything.example.com", 443, "POST", "/whatever", "") {
+		t.Errorf("explicit allow-all must match every request")
+	}
+	// A constrained allow_rule → ACCEPTED (the normal case).
+	if _, err := ParseAllowRule(RuleSpec{Host: "api.openai.com"}); err != nil {
+		t.Errorf("host-constrained allow_rule must be accepted; got %v", err)
+	}
+}
+
+// TestValidate_PredicatelessAllowRuleRejectedAtLoad confirms the
+// fail-closed gate fires at profile LOAD/validate time too — so a
+// hand-authored or org-distributed (read-only Source URL) profile with
+// a stray blank allow entry is rejected before it can ever override a
+// deny_rule. The companion case proves the explicit `host: "*"` form
+// still loads.
+func TestValidate_PredicatelessAllowRuleRejectedAtLoad(t *testing.T) {
+	bad := []byte(`
+profiles:
+  dev:
+    deny_rules:
+      - host: api.openai.com
+        method: POST
+    allow_rules:
+      - reason: "stray blank allow"
+`)
+	if _, err := parseProfiles(bad, "test.yaml"); err == nil {
+		t.Fatalf("profile with a predicate-less allow_rule must fail to load (fail-closed)")
+	}
+
+	good := []byte(`
+profiles:
+  dev:
+    deny_rules:
+      - host: api.openai.com
+        method: POST
+    allow_rules:
+      - host: "*"
+        reason: "explicit allow-all"
+`)
+	if _, err := parseProfiles(good, "test.yaml"); err != nil {
+		t.Fatalf("profile with explicit allow-all (host: \"*\") must load; got %v", err)
+	}
+}
