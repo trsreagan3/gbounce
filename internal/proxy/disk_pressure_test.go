@@ -69,7 +69,8 @@ func TestHealthzIncludesAuditLogBlock(t *testing.T) {
 func TestHealthz503AtCriticalInPauseMode(t *testing.T) {
 	tmp := t.TempDir()
 	st := audit.NewDiskPressureState(audit.DiskPressureModePauseRequests, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatFnDP(96.0), time.Now())
+	// 98.5% crosses the critical threshold (default 98%); 96% is only degraded.
+	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatFnDP(98.5), time.Now())
 	srv, err := NewServer(Config{DiskPressure: st, UpstreamURL: "http://localhost:1"}.Normalize(), freshStoreForDP(t), nil, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -90,7 +91,8 @@ func TestHealthz503AtCriticalInPauseMode(t *testing.T) {
 func TestHandle_DiskPressurePauseReturns503WithStructuredDeny(t *testing.T) {
 	tmp := t.TempDir()
 	st := audit.NewDiskPressureState(audit.DiskPressureModePauseRequests, tmp, 0, 0, 0)
-	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatFnDP(96.0), time.Now())
+	// 98.5% crosses the critical threshold (default 98%).
+	st.EvaluateAndReact(context.Background(), nil, fakeDiskStatFnDP(98.5), time.Now())
 	srv, err := NewServer(Config{DiskPressure: st, UpstreamURL: "http://localhost:1"}.Normalize(), freshStoreForDP(t), nil, nil)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
