@@ -117,6 +117,68 @@ single upstream service don't want a wide-open tunnel.
 
 ## Install
 
+Pick the lowest-friction path for your machine. The Homebrew / prebuilt
+binary / Scoop / APT / RPM paths need **no Go toolchain** — install from
+source (the bottom of this section) only if you want to build it
+yourself.
+
+### Homebrew (macOS / Linux)
+
+```sh
+brew install trsreagan3/tap/gbounce
+gbounce --version
+```
+
+(`trsreagan3/tap` is the [trsreagan3/homebrew-tap](https://github.com/trsreagan3/homebrew-tap)
+tap. `brew tap trsreagan3/tap` then `brew install gbounce` works too.)
+
+### Prebuilt binary (no toolchain, any OS)
+
+Download the archive for your OS/arch from the
+[Releases page](https://github.com/trsreagan3/gbounce/releases) —
+`gbounce_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) — unpack it,
+and put the `gbounce` binary on your `PATH`:
+
+```sh
+# macOS arm64 example — substitute your version + os + arch.
+curl -L -o gbounce.tar.gz \
+  https://github.com/trsreagan3/gbounce/releases/latest/download/gbounce_<version>_darwin_arm64.tar.gz
+tar -xzf gbounce.tar.gz gbounce
+sudo mv gbounce /usr/local/bin/
+gbounce --version
+```
+
+Verify the download against `checksums.txt` on the same release.
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add trsreagan3 https://github.com/trsreagan3/scoop-bucket
+scoop install trsreagan3/gbounce
+gbounce --version
+```
+
+### APT / RPM (Debian / Ubuntu / Fedora / RHEL)
+
+Each release attaches a `.deb` + `.rpm` to the
+[Releases page](https://github.com/trsreagan3/gbounce/releases). gbounce
+is **not** (yet) published to a hosted APT/RPM registry — install the
+attached package directly:
+
+```sh
+# Debian / Ubuntu (.deb)
+curl -L -o gbounce.deb \
+  https://github.com/trsreagan3/gbounce/releases/latest/download/gbounce_<version>_linux_amd64.deb
+sudo dpkg -i gbounce.deb
+
+# Fedora / RHEL (.rpm)
+curl -L -o gbounce.rpm \
+  https://github.com/trsreagan3/gbounce/releases/latest/download/gbounce_<version>_linux_amd64.rpm
+sudo rpm -i gbounce.rpm
+
+gbounce --version
+```
+
 ### Docker
 
 ```sh
@@ -211,7 +273,11 @@ services:
 | Files written in container don't appear on host (macOS) | Mount path under `/tmp` or `/var` on colima | Move mount under `/Users/<you>/` |
 | `bind: address already in use` on `:8080` or `:8769` | Another process holding the port | `lsof -i :8080` then stop the conflicting process or remap `-p 18080:8080` |
 
-### Go install
+### From source (`go install`, needs Go ≥1.26)
+
+This is the highest-friction path — it requires a Go toolchain. Prefer
+Homebrew / a prebuilt binary / Scoop / APT / RPM above unless you're
+building from a checkout or want to pin a commit.
 
 ```sh
 go install github.com/trsreagan3/gbounce/cmd/gbounce@latest
@@ -357,9 +423,58 @@ Honest trade-offs (per `[[ibounce-honest-positioning]]`):
 
 Full reference: [docs/MITM-MODE.md](docs/MITM-MODE.md).
 
-### Homebrew
+## Add to your agent
 
-Planned post G-Slice 1.
+`gbounce` plugs into any AI agent two ways. Most agents want **both**: the
+MCP server lets the agent introspect its own decisions + manage denies;
+the transparent proxy actually audits (and, in G-Slice 2, gates) the
+agent's outbound HTTP.
+
+### MCP mode — let the agent query + scope itself
+
+`gbounce mcp serve` is an MCP-over-stdio server exposing the `gbounce_*`
+tool family. One-shot installers wire it into the common clients
+(idempotent; they preserve any other `mcpServers` entries):
+
+```sh
+gbounce mcp install-claude-code   # Claude Code / Claude Desktop
+gbounce mcp install-cursor        # Cursor
+gbounce mcp install-codex         # Codex (prints a TOML snippet to paste)
+gbounce mcp install-devin         # Devin (cloud agent — prints a wiring recipe)
+```
+
+`install-devin` differs from the rest: Devin runs in Cognition's cloud
+sandbox, not on your machine, so there's no local config to write and a
+`127.0.0.1` proxy is unreachable from the sandbox. The recipe wires Devin
+to gbounce at its **host** address instead of loopback — pass
+`--devin-host HOST:PORT` to bake in a concrete reachable address.
+
+For any other MCP client, `gbounce mcp show-config` prints the canonical
+JSON (or `--shape yaml`) snippet, and `gbounce mcp list-tools` shows the
+exact tools the agent will see.
+
+### Transparent-proxy mode — audit (and gate) the agent's HTTP
+
+Point the agent's standard proxy env var at gbounce's CONNECT-mode
+listener. Every outbound HTTP/HTTPS call is forwarded verbatim and
+audited (no MITM — only `host:port` + metadata for HTTPS tunnels):
+
+```sh
+gbounce run --allow-connect --port 8080
+export HTTPS_PROXY=http://127.0.0.1:8080
+export HTTP_PROXY=http://127.0.0.1:8080
+export NO_PROXY=localhost,127.0.0.1
+```
+
+For URL-level visibility into HTTPS (paths + redacted bodies) use
+`--mode mitm` (see [TLS handling](#tls-handling-g-slice-1) above).
+
+### Claude-in-a-container
+
+Running Claude Code inside Docker? See the cross-product
+[Claude-in-container recipe](https://github.com/trsreagan3/iam-roles/blob/main/docs/DOCKER-CLAUDE-INTEGRATION.md)
+(Pattern A: gbounce in-container; Pattern B: gbounce as a sidecar) for
+how to wire the proxy env vars across the container boundary.
 
 ## Audit log
 

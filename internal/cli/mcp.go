@@ -28,6 +28,7 @@ import (
 //	gbounce mcp install-claude-code   — wire gbounce into Claude Code / Desktop
 //	gbounce mcp install-cursor        — wire gbounce into Cursor
 //	gbounce mcp install-codex         — wire gbounce into Codex (manual snippet)
+//	gbounce mcp install-devin         — print the Devin cloud-agent wiring recipe
 //	gbounce mcp show-config           — print the canonical JSON snippet
 //	gbounce mcp list-tools            — print the tool list (name + summary)
 //
@@ -86,6 +87,7 @@ Subcommands:
   gbounce mcp install-claude-code   wire gbounce into Claude Code / Desktop
   gbounce mcp install-cursor        wire gbounce into Cursor
   gbounce mcp install-codex         print Codex TOML snippet (manual install)
+  gbounce mcp install-devin         print the Devin cloud-agent wiring recipe
   gbounce mcp show-config           print the canonical JSON / YAML snippet
   gbounce mcp list-tools            print the gbounce_* tool list
 
@@ -116,6 +118,7 @@ to stderr so they don't poison the wire.`,
 	parent.AddCommand(newMCPInstallClaudeCodeCmd())
 	parent.AddCommand(newMCPInstallCursorCmd())
 	parent.AddCommand(newMCPInstallCodexCmd())
+	parent.AddCommand(newMCPInstallDevinCmd())
 	parent.AddCommand(newMCPShowConfigCmd())
 	parent.AddCommand(newMCPListToolsCmd())
 	return parent
@@ -235,6 +238,43 @@ the same way it does for Claude Code / Cursor.`,
 			"are not edited in place.")
 	cmd.Flags().BoolVar(&force, "force", false,
 		"Overwrite malformed existing JSON config without prompting.")
+	return cmd
+}
+
+func newMCPInstallDevinCmd() *cobra.Command {
+	var devinHost string
+	cmd := &cobra.Command{
+		Use:   "install-devin",
+		Short: "Print the Devin cloud-agent bouncer-wiring recipe",
+		Long: `Print the Devin wiring recipe. Devin is a cloud-hosted agent — it
+runs in Cognition's sandboxed environment, NOT on your local machine,
+so there is no local config file for gbounce to write into AND a
+gbounce listener on 127.0.0.1 is not reachable from Devin's sandbox.
+
+This command prints the two supported wiring paths instead of
+silently degrading:
+
+  PATH A  add the ` + "`gbounce mcp show-config`" + ` snippet to Devin's
+          MCP settings (when Devin's MCP support is enabled).
+  PATH B  run gbounce on a host Devin can reach (NOT loopback) and set
+          HTTP_PROXY / HTTPS_PROXY in Devin's task environment.
+
+Pass --devin-host HOST:PORT to bake a concrete reachable address into
+the printed HTTP_PROXY / HTTPS_PROXY lines (default prints a
+<gbounce-host>:8080 placeholder + a substitute note).`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := mcpinstall.InstallDevin(mcpinstall.Options{
+				DevinHost: devinHost,
+				Out:       cmd.OutOrStdout(),
+				Stderr:    cmd.ErrOrStderr(),
+			})
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&devinHost, "devin-host", "",
+		"Reachable gbounce HOST:PORT to bake into the recipe's "+
+			"HTTP_PROXY / HTTPS_PROXY lines (default: <gbounce-host>:8080 placeholder).")
 	return cmd
 }
 
