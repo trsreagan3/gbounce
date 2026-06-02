@@ -214,3 +214,89 @@ func TestRunCmd_RegistersRotationFlags(t *testing.T) {
 		}
 	}
 }
+
+// TestLogsVerifyChain_FileScoped_IgnoresSiblings is the load-bearing
+// regression test for the dir-scoped sibling-glob bug: when
+// --audit-log points at a specific .jsonl file, the verifier MUST
+// inspect ONLY that file and ignore unrelated *.jsonl siblings in the
+// same directory. Before the fix, siblings with missing chain blocks
+// (e.g. a plain audit log that was never stamped, or an old rotated
+// file from a different chain) caused a false TAMPER DETECTED exit 1.
+func TestLogsVerifyChain_FileScoped_IgnoresSiblings(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a clean 4-event chain into the TARGET file.
+	targetPath := stampChainToFile(t, dir, 4)
+
+	// Write a sibling that looks like an audit log but has NO chain
+	// blocks — exactly the shape that caused the false positive before
+	// the fix. Naming it "passA-audit.jsonl" to mirror the live repro.
+	sibling := filepath.Join(dir, "passA-audit.jsonl")
+	unstamped := `{"class_uid":6003,"activity_name":"Read","time":1700001234000}` + "\n"
+	if err := os.WriteFile(sibling, []byte(unstamped), 0o600); err != nil {
+		t.Fatalf("WriteFile sibling: %v", err)
+	}
+
+	// Pointing at the target file must succeed (chain OK) even though
+	// the sibling in the same dir would have caused TAMPER DETECTED.
+	root := newRootCmd()
+	root.SetArgs([]string{"logs", "verify-chain", "--audit-log", targetPath})
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	if err := root.Execute(); err != nil {
+		t.Fatalf(
+			"verify-chain with a clean target MUST succeed even when unrelated "+
+				"siblings exist in the same dir (sibling-glob regression). "+
+				"got err=%v out=%q", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "chain OK:") {
+		t.Errorf("expected 'chain OK:' in output; got: %q", buf.String())
+	}
+}
+
+// TestLogsVerifyChain_FileScoped_TamperInTargetStillDetected ensures that
+// file-scoped mode still catches a real tamper in the named file —
+// ignoring siblings must NOT also ignore real evidence in the target.
+func TestLogsVerifyChain_FileScoped_TamperInTargetStillDetected(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := stampChainToFile(t, dir, 4)
+
+	// A clean sibling that must be ignored.
+	sibling := filepath.Join(dir, "clean-sibling.jsonl")
+	if err := os.WriteFile(sibling, []byte(`{"class_uid":6003,"time":1700000000001}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile sibling: %v", err)
+	}
+
+	// Tamper the target: flip activity_name in row index 1 without
+	// recomputing its chain hash — the canonical tamper pattern.
+	raw, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) < 4 {
+		t.Fatalf("expected 4 rows, got %d", len(lines))
+	}
+	lines[1] = strings.Replace(lines[1], `"activity_name":"Read"`, `"activity_name":"Delete"`, 1)
+	if err := os.WriteFile(targetPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := newRootCmd()
+	root.SetArgs([]string{"logs", "verify-chain", "--audit-log", targetPath})
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	err = root.Execute()
+	if err == nil {
+		t.Fatalf("verify-chain MUST detect tamper in the named file and exit non-zero; got out=%q", buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "TAMPER DETECTED") {
+		t.Errorf("expected 'TAMPER DETECTED' in output; got: %q", out)
+	}
+	if !strings.Contains(out, "hash mismatch") {
+		t.Errorf("expected the hash-mismatch reason in output; got: %q", out)
+	}
+}

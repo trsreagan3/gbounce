@@ -95,3 +95,40 @@ func TestCanonicalDocURL(t *testing.T) {
 		t.Errorf("CanonicalDocURL should end with /KNOWN-CAVEATS.md, got %q", got)
 	}
 }
+
+// TestBannerLines_AnomalyBlockMode_SuppressesB9 pins the Fix 2 banner
+// correction: when anomaly_detection mode=block is armed (#59), the B9
+// "G-Slice 1 is discovery-only (no blocking)" caveat MUST be suppressed.
+// Printing it alongside an "enforcement ARMED" banner would contradict
+// the operator's deliberate choice and violate [[ibounce-honest-positioning]].
+func TestBannerLines_AnomalyBlockMode_SuppressesB9(t *testing.T) {
+	// DiscoveryMode=true (proxy mode) + AnomalyBlockMode=true (anomaly
+	// block armed): B9 must be absent.
+	lines := BannerLines(Trigger{DiscoveryMode: true, AnomalyBlockMode: true})
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "§B9") {
+		t.Errorf("B9 caveat MUST be suppressed when AnomalyBlockMode=true; got: %v", lines)
+	}
+	// B8 is independent of AnomalyBlockMode — it must still fire when
+	// AllowConnect is set alongside block mode.
+	lines2 := BannerLines(Trigger{DiscoveryMode: true, AllowConnect: true, AnomalyBlockMode: true})
+	joined2 := strings.Join(lines2, "\n")
+	if !strings.Contains(joined2, "§B8") {
+		t.Errorf("B8 caveat must still fire with AllowConnect=true even when AnomalyBlockMode=true; got: %v", lines2)
+	}
+	if strings.Contains(joined2, "§B9") {
+		t.Errorf("B9 caveat must be suppressed even when AllowConnect=true + AnomalyBlockMode=true; got: %v", lines2)
+	}
+}
+
+// TestBannerLines_AlertMode_KeepsB9 pins the inverse: in alert mode
+// (or when anomaly detection is disabled), B9 must still fire for
+// DiscoveryMode=true so operators know blocking is not active.
+func TestBannerLines_AlertMode_KeepsB9(t *testing.T) {
+	// AnomalyBlockMode=false (alert/disabled) + DiscoveryMode: B9 must appear.
+	lines := BannerLines(Trigger{DiscoveryMode: true, AnomalyBlockMode: false})
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "§B9") {
+		t.Errorf("B9 caveat must appear in alert/disabled anomaly mode when DiscoveryMode=true; got: %v", lines)
+	}
+}
