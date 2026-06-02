@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **iam-jit #729 / BUILD-8 — hallucinated-tool-call validator** (2026-06-02) —
+  New `internal/toolcallvalidator/` package + MITM-request-path wire-up
+  that inspect OUTBOUND tool-call request bodies (MCP `tools/call`,
+  OpenAI `tool_calls` / `function_call`, Anthropic `tool_use`) against
+  a baked-in known-tool schema corpus + report calls whose name or
+  arguments don't match. Lock-step rule set with the Python
+  implementation at `iam-roles/src/iam_jit/tool_call_validator/`.
+  Five indicator rules: `hallucinated-tool-name`,
+  `missing-required-arg`, `unexpected-arg`, `placeholder-credential`,
+  `naming-style-mix`. Three action modes: `warn` (forward + add
+  `X-IAM-JIT-Hallucinated-Tool-Call` header), `strip` (replace the
+  hallucinated call sub-structure with a JSON redaction marker before
+  forwarding), `deny` (return `422 Unprocessable Entity` with a
+  structured `caught_by_bouncer` JSON body — 422 vs. 403 because the
+  request is shape-malformed, not authz-denied). Default OFF; opt-in
+  per profile via `validate_tool_calls.enabled: true`. Profile YAML
+  field added: `ValidateToolCallsConfig`. /admin/stats counters added:
+  `total_tool_call_validator_warns` / `strips` / `denies`.
+  /admin/features gains a `validate_tool_calls` row with the same
+  fire-count + last-fired-ts + `configured_but_never_fired` shape the
+  #730 injection scanner uses (the purpose-driven UI from #682
+  surfaces both). Test coverage: 12 unit-test cases in
+  `internal/toolcallvalidator/` covering valid MCP/OpenAI/Anthropic
+  shapes, hallucinated names, missing-required + extra-arg +
+  placeholder + naming-mix heuristics, allowlist suppression,
+  non-JSON skip, profile-config wiring, and JSON-aware `ApplyStrip`;
+  5 integration tests in `internal/proxy/mitm_tool_call_validator_test.go`
+  covering default-off pass-through, warn-mode header + audit-log +
+  /admin/features fire-count tick, deny-mode 422 response (with
+  upstream NOT hit), valid-call pass-through, and strip-mode body
+  rewrite. Per [[uat-tests-setup-end-to-end]] the warn-mode
+  integration test asserts the actual /admin/features fire-count
+  increment — not just a unit-test feature signal. Pairs with iam-jit
+  #730 (response-side BUILD-9 injection scanner); together they form
+  the MITM request-and-response inspection cluster. The "95% catch"
+  PDF claim is INTENTIONALLY NOT in code/docs until a calibration
+  follow-up validates against a real corpus.
 - **iam-jit #682 — purpose-driven monitoring UI at `/admin/ui`** (2026-06-02) —
   Per founder direction in `[[gbounce-ui-purpose-driven]]`, the gbounce
   mgmt-port now serves a 5-panel monitoring console that answers the
