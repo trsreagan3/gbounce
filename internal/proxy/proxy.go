@@ -309,6 +309,13 @@ type Server struct {
 	// #315 — bumped each time an upstream TLS handshake fails inside
 	// MITM mode (most commonly = upstream pins certs).
 	totalMITMUpstreamHandshakeFailures atomic.Int64
+	// #730 — indirect-prompt-injection response-body scanner counters.
+	// Each is bumped from the MITM response path when the scanner's
+	// decided action (post-profile-config reconciliation) is the
+	// matching mode. Surfaced via /admin/stats.
+	totalInjectionScanWarns   atomic.Int64
+	totalInjectionScanStrips  atomic.Int64
+	totalInjectionScanDenies  atomic.Int64
 }
 
 // NewServer builds a Server from the given Config + Store. Caller
@@ -1085,6 +1092,10 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	body["mitm_audit_include_bodies"] = s.mitmAuditIncludeBodies
 	body["total_mitm_denies"] = s.totalMITMDenies.Load()
 	body["total_mitm_upstream_handshake_failures"] = s.totalMITMUpstreamHandshakeFailures.Load()
+	// #730 — response-body injection-scanner counters.
+	body["total_injection_scan_warns"] = s.totalInjectionScanWarns.Load()
+	body["total_injection_scan_strips"] = s.totalInjectionScanStrips.Load()
+	body["total_injection_scan_denies"] = s.totalInjectionScanDenies.Load()
 	if s.log != nil {
 		body["audit_log_path"] = s.log.Path()
 		body["audit_log_total"] = s.log.Total()

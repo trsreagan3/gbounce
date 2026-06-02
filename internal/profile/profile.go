@@ -108,6 +108,34 @@ type Profile struct {
 	// refuses to overwrite a non-local source). Mirrors the
 	// kbouncer / dbounce / ibouncer field of the same name.
 	Source string `yaml:"source,omitempty"`
+
+	// InjectionScanResponseBodies (iam-jit #730) — opt-in indirect-
+	// prompt-injection response-body scanner. Default OFF; only
+	// honored when the proxy is in MITM mode (response bodies aren't
+	// visible in CONNECT mode). Per [[mitm-beta-pii-pci-concern]]
+	// MITM ships BETA; this feature inherits that posture.
+	InjectionScanResponseBodies InjectionScanConfig `yaml:"injection_scan_response_bodies,omitempty"`
+}
+
+// InjectionScanConfig is the per-profile response-body scanner config.
+// Mirrors iam-roles/src/iam_jit/injection_scanner/config.py field-for-field.
+type InjectionScanConfig struct {
+	// Enabled is the on/off toggle. Default false.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Action is one of: warn | strip | deny. Default warn.
+	Action string `yaml:"action,omitempty"`
+
+	// AllowlistPatterns are regexes; matches suppress detection.
+	AllowlistPatterns []string `yaml:"allowlist_patterns,omitempty"`
+
+	// MaxBodyBytes caps the scanned body size (ReDoS guard).
+	// Default 64 KiB. Bodies above this are truncated before scanning.
+	MaxBodyBytes int `yaml:"max_body_bytes,omitempty"`
+
+	// MinConfidenceForDeny: when Action==deny, results below this
+	// confidence downgrade to warn. Default 0.7.
+	MinConfidenceForDeny float64 `yaml:"min_confidence_for_deny,omitempty"`
 }
 
 // IsLocalSource reports whether the profile is editable at the CLI

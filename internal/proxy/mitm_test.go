@@ -70,6 +70,9 @@ type mitmTestServer struct {
 	auditPath string
 	upstream  *httptest.Server
 	ca        *x509.Certificate
+	// srv is exposed for tests that need to install an active
+	// profile post-start (see #730 injection-scan E2E tests).
+	srv *Server
 }
 
 func startMITMTestProxy(t *testing.T, handler http.Handler, rules []profile.Rule, includeBodies bool) *mitmTestServer {
@@ -149,7 +152,19 @@ func startMITMTestProxy(t *testing.T, handler http.Handler, rules []profile.Rule
 		auditPath: auditPath,
 		upstream:  upstream,
 		ca:        caCert,
+		srv:       srv,
 	}
+}
+
+// getServerForTest is a test helper that returns the underlying
+// *Server so tests can hot-install a profile after the proxy is up.
+// Only used by the injection-scan E2E tests (#730).
+func getServerForTest(t *testing.T, ts *mitmTestServer) *Server {
+	t.Helper()
+	if ts == nil || ts.srv == nil {
+		t.Fatalf("mitmTestServer has no Server reference")
+	}
+	return ts.srv
 }
 
 // clientFor returns an HTTPS client that:
