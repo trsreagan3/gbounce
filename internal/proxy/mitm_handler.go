@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/trsreagan3/gbounce/internal/audit"
+	"github.com/trsreagan3/gbounce/internal/injectionscan"
 	"github.com/trsreagan3/gbounce/internal/mitm"
 	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/store"
@@ -255,10 +256,258 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 		return
 	}
 
-	resp.Body = io.NopCloser(strings.NewReader(string(respBodyBytes)))
+	// #730 / BUILD-9 — indirect-prompt-injection response-body scan.
+	// Only runs when MITM mode is active (we're here, so it is) AND
+	// the active profile opts in. Default OFF per
+	// [[mitm-beta-pii-pci-concern]] + [[ibounce-honest-positioning]].
+	finalRespBody := respBodyBytes
+	scanResult, scanDecision := s.runResponseInjectionScan(resp, respBodyBytes)
+	switch scanDecision {
+	case injectionscan.ActionDeny:
+		// Block the response from reaching the agent. Emit a
+		// structured caught_by_bouncer-shaped 403 with the indicator
+		// list so the harness can surface why.
+		s.totalInjectionScanDenies.Add(1)
+		writeInjectionScanDenyResponse(clientConn, req, host, scanResult)
+		s.recordMITMResponseWithInjectionFinding(req, host, port, startedAt, http.StatusForbidden, 0, redactedReqBody, reqRedacted, bodyTruncated, scanResult, "deny")
+		return
+	case injectionscan.ActionStrip:
+		finalRespBody = injectionscan.ApplyStrip(respBodyBytes, scanResult)
+		// The body changed, so Content-Length on `resp` is stale.
+		resp.Header.Set("Content-Length", strconv.Itoa(len(finalRespBody)))
+		resp.ContentLength = int64(len(finalRespBody))
+		resp.Header.Set("X-IAM-JIT-Injection-Warning", injectionWarningHeader(scanResult))
+		s.totalInjectionScanStrips.Add(1)
+	case injectionscan.ActionWarn:
+		resp.Header.Set("X-IAM-JIT-Injection-Warning", injectionWarningHeader(scanResult))
+		s.totalInjectionScanWarns.Add(1)
+	}
+
+	resp.Body = io.NopCloser(strings.NewReader(string(finalRespBody)))
 	_ = resp.Write(clientConn)
 
-	s.recordMITMRequest(req, host, port, startedAt, resp.StatusCode, int64(len(respBodyBytes)), redactedReqBody, reqRedacted, bodyTruncated)
+	// For warn/strip/allow paths, record one event with the finding
+	// fields merged into extras when detected.
+	if scanResult.Detected && (scanDecision == injectionscan.ActionWarn || scanDecision == injectionscan.ActionStrip) {
+		s.recordMITMResponseWithInjectionFinding(req, host, port, startedAt, resp.StatusCode, int64(len(finalRespBody)), redactedReqBody, reqRedacted, bodyTruncated, scanResult, string(scanDecision))
+	} else {
+		s.recordMITMRequest(req, host, port, startedAt, resp.StatusCode, int64(len(finalRespBody)), redactedReqBody, reqRedacted, bodyTruncated)
+	}
+}
+
+// recordMITMResponseWithInjectionFinding is the variant of recordMITMRequest
+// that merges injection-scanner indicator fields into the OCSF event's
+// `unmapped.iam_jit.ext` extras. Keeps the existing 6003 (API Activity)
+// shape; the finding details ride alongside as ext fields so
+// log-shipping pipelines pick them up automatically (no new class_uid
+// required for v1.0).
+func (s *Server) recordMITMResponseWithInjectionFinding(
+	req *http.Request, host string, port int, startedAt time.Time,
+	status int, respSize int64, redactedReqBody []byte, reqRedacted, truncated bool,
+	r injectionscan.ScanResult, decidedAction string,
+) {
+	clientHost, clientPort := splitHostPort(req.RemoteAddr)
+	redactedQuery, _ := mitm.RedactQueryParams(req.URL.RawQuery)
+	extras := map[string]any{
+		"url_path":              req.URL.Path,
+		"url_query":             redactedQuery,
+		"request_method":        req.Method,
+		"request_body_redacted": reqRedacted,
+		"response_status":       status,
+	}
+	if truncated {
+		extras["request_body_truncated"] = true
+	}
+	if s.mitmAuditIncludeBodies && len(redactedReqBody) > 0 {
+		extras["request_body_snapshot"] = string(redactedReqBody)
+	}
+	// Injection finding fields — present iff detected.
+	if r.Detected {
+		indicatorList := make([]map[string]any, 0, len(r.Indicators))
+		for _, ind := range r.Indicators {
+			indicatorList = append(indicatorList, map[string]any{
+				"rule":     ind.Rule,
+				"layer":    string(ind.Layer),
+				"severity": string(ind.Severity),
+				"source":   ind.Source,
+				"snippet":  ind.Snippet,
+			})
+		}
+		extras["injection_scan_detected"] = true
+		extras["injection_scan_confidence"] = r.Confidence
+		extras["injection_scan_action"] = decidedAction
+		extras["injection_scan_indicators"] = indicatorList
+		// MITRE ATLAS T0051 — LLM Prompt Injection. Citing the
+		// taxonomy gives downstream OCSF consumers a stable join key.
+		extras["injection_scan_mitre_attack_id"] = "T0051"
+		if r.LowConfidenceExplanation != "" {
+			extras["injection_scan_low_confidence_explanation"] = r.LowConfidenceExplanation
+		}
+	}
+
+	row := store.DecisionRow{
+		At:             startedAt.UTC(),
+		Method:         req.Method,
+		Path:           buildPathWithQuery(req.URL.Path, redactedQuery),
+		UpstreamHost:   host,
+		UpstreamPort:   port,
+		UpstreamScheme: "https",
+		ClientHost:     clientHost,
+		ClientPort:     clientPort,
+		HTTPStatus:     status,
+		ResponseSize:   respSize,
+		LatencyMS:      time.Since(startedAt).Milliseconds(),
+		Verdict:        "ALLOW",
+		Mode:           string(ModeMITM),
+		Enforced:       decidedAction == "deny" || decidedAction == "strip",
+	}
+	if decidedAction == "deny" {
+		row.Verdict = "DENY"
+	}
+	rawSessionID := req.Header.Get("X-Agent-Session-Id")
+	rawAgentName := req.Header.Get("X-Agent-Name")
+	if rawSessionID != "" && audit.IsValidSessionID(rawSessionID) {
+		row.AgentSessionID = rawSessionID
+	}
+	if rawAgentName != "" && audit.IsValidAgentName(rawAgentName) {
+		row.AgentName = rawAgentName
+	}
+	var decisionID int64
+	if s.store != nil {
+		if id, err := s.store.RecordDecision(row); err == nil {
+			decisionID = id
+		}
+	}
+	if s.log != nil || s.recorder != nil {
+		ev := audit.FromRequest(audit.RequestInput{
+			At:             row.At,
+			DecisionID:     decisionID,
+			Mode:           row.Mode,
+			Method:         row.Method,
+			Path:           row.Path,
+			UpstreamHost:   row.UpstreamHost,
+			UpstreamPort:   row.UpstreamPort,
+			UpstreamScheme: row.UpstreamScheme,
+			ClientHost:     row.ClientHost,
+			ClientPort:     row.ClientPort,
+			HTTPStatus:     row.HTTPStatus,
+			ResponseSize:   row.ResponseSize,
+			LatencyMS:      row.LatencyMS,
+			AgentSessionID: row.AgentSessionID,
+			AgentName:      row.AgentName,
+			Verdict:        row.Verdict,
+			ExtraExt:       extras,
+		})
+		if s.log != nil {
+			_ = s.log.Write(req.Context(), ev)
+		}
+		if s.recorder != nil {
+			s.recorder.Record(ev)
+		}
+		if s.objectStorage != nil {
+			s.objectStorage.Write(req.Context(), ev)
+		}
+	}
+}
+
+// runResponseInjectionScan inspects the upstream response body for
+// indirect-prompt-injection indicators per #730. Returns the verdict
+// + the decided action (post-profile-config reconciliation). Returns
+// ActionAllow when the scanner is disabled on the active profile or
+// not configured — caller treats Allow as no-op.
+func (s *Server) runResponseInjectionScan(resp *http.Response, body []byte) (injectionscan.ScanResult, injectionscan.Action) {
+	prof := s.ActiveProfile()
+	if prof == nil {
+		return injectionscan.ScanResult{}, injectionscan.ActionAllow
+	}
+	pcfg := prof.InjectionScanResponseBodies
+	if !pcfg.Enabled {
+		return injectionscan.ScanResult{}, injectionscan.ActionAllow
+	}
+	cfg := injectionscan.DefaultConfig()
+	cfg.Enabled = true
+	if pcfg.Action != "" {
+		cfg.Action = injectionscan.Action(pcfg.Action)
+	}
+	if len(pcfg.AllowlistPatterns) > 0 {
+		cfg.AllowlistPatterns = pcfg.AllowlistPatterns
+	}
+	if pcfg.MaxBodyBytes > 0 {
+		cfg.MaxBodyBytes = pcfg.MaxBodyBytes
+	}
+	if pcfg.MinConfidenceForDeny > 0 {
+		cfg.MinConfidenceForDeny = pcfg.MinConfidenceForDeny
+	}
+	ct := ""
+	if resp != nil {
+		ct = resp.Header.Get("Content-Type")
+	}
+	result := injectionscan.ScanResponseBody(body, ct, cfg)
+	return result, injectionscan.DecideAction(result, cfg)
+}
+
+// injectionWarningHeader serializes scanner indicators into a single
+// HTTP header value. Format:
+//
+//	detected; rules=<csv>; confidence=<float>
+//
+// Kept short (≤ 256 bytes) so it survives downstream proxies that
+// trim long header values.
+func injectionWarningHeader(r injectionscan.ScanResult) string {
+	names := make([]string, 0, len(r.Indicators))
+	for _, ind := range r.Indicators {
+		names = append(names, ind.Rule)
+	}
+	csv := strings.Join(names, ",")
+	if len(csv) > 200 {
+		csv = csv[:200]
+	}
+	return fmt.Sprintf("detected; rules=%s; confidence=%.2f", csv, r.Confidence)
+}
+
+// writeInjectionScanDenyResponse emits a 403 to the client with a
+// structured caught_by_bouncer-shaped JSON body. The agent's harness
+// sees the same `caught_by_bouncer` framing it gets from request-side
+// denies (#459 / §A57b parity).
+func writeInjectionScanDenyResponse(w io.Writer, req *http.Request, host string, r injectionscan.ScanResult) {
+	if w == nil {
+		return
+	}
+	indicators := make([]map[string]any, 0, len(r.Indicators))
+	for _, ind := range r.Indicators {
+		indicators = append(indicators, map[string]any{
+			"rule":     ind.Rule,
+			"layer":    string(ind.Layer),
+			"severity": string(ind.Severity),
+			"source":   ind.Source,
+			"snippet":  ind.Snippet,
+		})
+	}
+	payload := map[string]any{
+		"caught_by_bouncer": "gbounce",
+		"reason":            "indirect_prompt_injection_in_response_body",
+		"host":              host,
+		"confidence":        r.Confidence,
+		"indicators":        indicators,
+		"deny_source":       "injection_scanner",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		// Fall back to plain message rather than leaking a 500.
+		writeRawHTTPResponse(w, req, http.StatusForbidden,
+			"gbounce: indirect prompt injection detected in upstream response body")
+		return
+	}
+	statusText := http.StatusText(http.StatusForbidden)
+	if statusText == "" {
+		statusText = "Forbidden"
+	}
+	headers := fmt.Sprintf(
+		"HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+		http.StatusForbidden, statusText, len(body),
+	)
+	_, _ = w.Write([]byte(headers))
+	_, _ = w.Write(body)
 }
 
 // readBounded copies up to maxBytes from r + returns the captured
