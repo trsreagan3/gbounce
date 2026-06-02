@@ -161,10 +161,20 @@ func (s *Server) anomalySignals(r *http.Request) (action, resource, agent string
 // non-block mode returns false (no deny). The detector core never
 // panics; if scoring degrades it returns the floor (allow), so a
 // detector hiccup can NEVER turn into a spurious deny or break the path.
-func (s *Server) decideAnomaly(w http.ResponseWriter, r *http.Request, startedAt time.Time) bool {
+func (s *Server) decideAnomaly(w http.ResponseWriter, r *http.Request, startedAt time.Time) (tightened bool) {
 	if s.anomalyDetector == nil || !s.anomalyDetector.Enabled() {
 		return false
 	}
+	// DEFENSIVE RECOVER: if the core scoring path panics (e.g. future
+	// data-race or nil-deref in a scorer update), degrade to the FLOOR
+	// decision (allow stays allow). A panic must never crash the hot path
+	// or spuriously deny a request. tightened is false by default, so the
+	// named return ensures the caller sees "not tightened" on a panic.
+	defer func() {
+		if recover() != nil {
+			tightened = false
+		}
+	}()
 	action, resource, agentIdentity := s.anomalySignals(r)
 	out := s.anomalyDetector.Decide(anomaly.DecideInput{
 		Action:        action,

@@ -3,7 +3,11 @@
 package proxy
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/trsreagan3/gbounce/internal/anomaly"
 )
@@ -81,6 +85,52 @@ func TestObserveAnomalyEmitsThroughWire(t *testing.T) {
 	}
 	if h["recent_count"].(int) < 1 {
 		t.Fatalf("expected recent ring to hold the emitted event")
+	}
+}
+
+// TestDecideAnomalyPanicDegradesToFloor verifies the defensive recover in
+// decideAnomaly: a panicking emitter in the core Decide path must not crash
+// the hot path and must degrade to the FLOOR decision (allow stays allow,
+// i.e. returns false/"not tightened") rather than spuriously denying.
+//
+// Mechanism: we install a block-mode detector whose emitter panics, then
+// trigger the cold-start adversarial backstop (action "truncate" with no
+// baseline so MinActionsForBaseline=50 forces cold-start). Decide flags the
+// action as anomalous, calls the emitter (panic), and the defer/recover in
+// decideAnomaly catches it — returning false (floor = allow).
+//
+// Note: http.Request.Method is set directly (not via httptest.NewRequest)
+// to allow an adversarial verb string that httptest would reject.
+func TestDecideAnomalyPanicDegradesToFloor(t *testing.T) {
+	cfg := anomaly.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Mode = "block"
+	cfg.MinActionsForBaseline = 50 // ensure cold-start so backstop fires
+	panicEmitter := func(_ map[string]any) {
+		panic("simulated scorer panic for recover test")
+	}
+	anomaly.SetProduct("gbounce")
+	d := anomaly.NewDetector(cfg, panicEmitter, false)
+	s := &Server{}
+	s.SetAnomalyDetector(d)
+
+	// Build the request directly so we can set Method to the adversarial
+	// verb "truncate" (in knownAdversarialActions); httptest.NewRequest
+	// would panic if the method contained spaces.
+	req := &http.Request{
+		Method: "truncate",
+		Header: make(http.Header),
+		URL:    &url.URL{Path: "/prod_table"},
+	}
+	w := httptest.NewRecorder()
+	// Must not panic; must return false (floor = allow, not tightened).
+	got := s.decideAnomaly(w, req, time.Now())
+	if got {
+		t.Fatalf("decideAnomaly must return false (floor=allow) on a scorer panic, got true")
+	}
+	if w.Code != http.StatusOK {
+		// decideAnomaly must not have written a 403 if the recover fired.
+		t.Fatalf("expected no deny response written on panic-degrade; got HTTP %d", w.Code)
 	}
 }
 
