@@ -96,8 +96,10 @@ func (s *Server) handleMITMConnect(w http.ResponseWriter, r *http.Request) {
 		if rule := MatchDenyHosts(effective, denyHost); rule != nil {
 			if rule.Source == DenySourceDynamic {
 				s.totalDynamicDenyMatches.Add(1)
+				s.dynamicDenyLastFiredUnixMs.Store(time.Now().UnixMilli())
 			} else {
 				s.totalDenyHostMatches.Add(1)
+				s.denyHostsLastFiredUnixMs.Store(time.Now().UnixMilli())
 			}
 			reason := fmt.Sprintf("matched deny_hosts: %s", rule.Raw)
 			if rule.Source == DenySourceDynamic && rule.DynamicDenyRuleID != "" {
@@ -161,6 +163,10 @@ func (s *Server) handleMITMConnect(w http.ResponseWriter, r *http.Request) {
 	if err := tlsClient.Handshake(); err != nil {
 		_ = tlsClient.Close()
 		s.totalMITMUpstreamHandshakeFailures.Add(1)
+		// #682 — record so /admin/features surfaces the most-recent
+		// MITM error (typically upstream cert pinning) instead of a
+		// silent zero.
+		recordFeatureError(&s.mitmLastError, "client TLS handshake failed: "+err.Error())
 		return
 	}
 	defer tlsClient.Close()
@@ -191,10 +197,17 @@ func (s *Server) handleMITMConnect(w http.ResponseWriter, r *http.Request) {
 // handleMITMConnect's read loop.
 func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host string, port int, target string) {
 	s.totalRequests.Add(1)
+	// #682 — record the MITM "fire" (one decrypted request observed)
+	// so /admin/features can answer "is MITM actually intercepting
+	// anything" honestly. Distinct from totalMITMDenies which only
+	// counts profile-rule denies.
+	s.totalMITMIntercepted.Add(1)
+	s.mitmLastFiredUnixMs.Store(time.Now().UnixMilli())
 	startedAt := time.Now()
 
 	if rule := profile.FirstMatch(s.mitmRules, true, host, port, req.Method, req.URL.Path, req.URL.RawQuery); rule != nil {
 		s.totalMITMDenies.Add(1)
+		s.profileEnforcementLastFiredUnixMs.Store(time.Now().UnixMilli())
 		s.recordMITMDeny(req, host, port, startedAt, rule)
 		legacyMsg := "gbounce: request denied by profile rule"
 		if rule.Reason != "" {
@@ -268,6 +281,7 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 		// structured caught_by_bouncer-shaped 403 with the indicator
 		// list so the harness can surface why.
 		s.totalInjectionScanDenies.Add(1)
+		s.injectionScanLastFiredUnixMs.Store(time.Now().UnixMilli())
 		writeInjectionScanDenyResponse(clientConn, req, host, scanResult)
 		s.recordMITMResponseWithInjectionFinding(req, host, port, startedAt, http.StatusForbidden, 0, redactedReqBody, reqRedacted, bodyTruncated, scanResult, "deny")
 		return
@@ -278,9 +292,11 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 		resp.ContentLength = int64(len(finalRespBody))
 		resp.Header.Set("X-IAM-JIT-Injection-Warning", injectionWarningHeader(scanResult))
 		s.totalInjectionScanStrips.Add(1)
+		s.injectionScanLastFiredUnixMs.Store(time.Now().UnixMilli())
 	case injectionscan.ActionWarn:
 		resp.Header.Set("X-IAM-JIT-Injection-Warning", injectionWarningHeader(scanResult))
 		s.totalInjectionScanWarns.Add(1)
+		s.injectionScanLastFiredUnixMs.Store(time.Now().UnixMilli())
 	}
 
 	resp.Body = io.NopCloser(strings.NewReader(string(finalRespBody)))
@@ -400,12 +416,17 @@ func (s *Server) recordMITMResponseWithInjectionFinding(
 		})
 		if s.log != nil {
 			_ = s.log.Write(req.Context(), ev)
+			s.auditLogLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
 		if s.recorder != nil {
 			s.recorder.Record(ev)
+			s.sessionRecorderFireCount.Add(1)
+			s.sessionRecorderLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
 		if s.objectStorage != nil {
 			s.objectStorage.Write(req.Context(), ev)
+			s.objectStorageFireCount.Add(1)
+			s.objectStorageLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
 	}
 }
@@ -766,9 +787,12 @@ func (s *Server) recordMITMHandshakeFailure(req *http.Request, host string, port
 			ExtraExt:         extras,
 		})
 		_ = s.log.Write(req.Context(), ev)
+		s.auditLogLastFiredUnixMs.Store(time.Now().UnixMilli())
 		// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
 		if s.objectStorage != nil {
 			s.objectStorage.Write(req.Context(), ev)
+			s.objectStorageFireCount.Add(1)
+			s.objectStorageLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
 	}
 }
