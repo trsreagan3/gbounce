@@ -159,3 +159,38 @@ func TestFirstMatch_SkipsMITMOnlyRulesInDiscoveryMode(t *testing.T) {
 		t.Errorf("MITM-required rule should match when mitmActive=true")
 	}
 }
+
+// TestFirstAllowMatch_MatchesSamePredicatesAsFirstMatch (iam-jit
+// #377) confirms the allow-rule matcher uses the identical predicate
+// engine + mitmActive skip semantics as FirstMatch — the allow layer
+// is just the deny matcher pointed at the allow_rules slice.
+func TestFirstAllowMatch_MatchesSamePredicatesAsFirstMatch(t *testing.T) {
+	allow, err := ParseRules([]RuleSpec{
+		{Host: "api.openai.com", Path: "/v1/chat/completions", Method: "POST"},
+	})
+	if err != nil {
+		t.Fatalf("ParseRules: %v", err)
+	}
+	// MITM mode: the predicate set matches → allow fires.
+	if got := FirstAllowMatch(allow, true, "api.openai.com", 443, "POST", "/v1/chat/completions", ""); got == nil {
+		t.Errorf("allow_rule should match the exact request shape in MITM mode")
+	}
+	// Wrong method → no match.
+	if got := FirstAllowMatch(allow, true, "api.openai.com", 443, "GET", "/v1/chat/completions", ""); got != nil {
+		t.Errorf("allow_rule must not match a different method; got %+v", got)
+	}
+	// CONNECT-only mode: a MITM-required allow_rule is skipped (same as
+	// the deny matcher) so a discovery-mode run can't accidentally
+	// "allow" on an unmatchable predicate.
+	if got := FirstAllowMatch(allow, false, "api.openai.com", 443, "POST", "/v1/chat/completions", ""); got != nil {
+		t.Errorf("MITM-required allow_rule must be skipped in CONNECT mode; got %+v", got)
+	}
+}
+
+// TestFirstAllowMatch_EmptyListIsNoOp confirms a nil/empty allow list
+// never matches (the pre-#377 deny-only shape).
+func TestFirstAllowMatch_EmptyListIsNoOp(t *testing.T) {
+	if got := FirstAllowMatch(nil, true, "api.openai.com", 443, "POST", "/x", ""); got != nil {
+		t.Errorf("empty allow list must never match; got %+v", got)
+	}
+}

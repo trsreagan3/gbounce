@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,19 @@ import (
 // streamed past with request_body_truncated=true marked in the
 // audit row.
 const maxBodySnapshotBytes = 1 << 20
+
+// sourceProfileAllow is the decision_source value recorded when a
+// profile allow_rule explicitly allowed the intercepted request.
+// Mirrors dbounce's profile.SourceProfileAllow ("profile.allow") so
+// the suite's audit attribution lines up across bouncers.
+const sourceProfileAllow = "profile.allow"
+
+// allowRuleCtxKey is the request-context key under which
+// serveMITMRequest stashes the *profile.Rule that fired the allow,
+// so the downstream recordMITMRequest can attribute the ALLOW to
+// source=profile.allow without a wider signature change. Private
+// zero-size type so it can't collide with another package's key.
+type allowRuleCtxKey struct{}
 
 // mitmAllowInsecureUpstreamForTest is a TEST-ONLY toggle that bypasses
 // upstream TLS verification when MITM mode dials the real upstream.
@@ -206,7 +220,34 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 	s.mitmLastFiredUnixMs.Store(time.Now().UnixMilli())
 	startedAt := time.Now()
 
-	if rule := profile.FirstMatch(s.mitmRules, true, host, port, req.Method, req.URL.Path, req.URL.RawQuery); rule != nil {
+	// iam-jit #377 — profile allow_rules layer. Mirrors dbounce's
+	// Profile.Evaluate Order 4 (matchAnyAllowRule): an explicit
+	// allow_rule that matches the intercepted request OVERRIDES a
+	// would-be deny_rule deny. We consult it BEFORE the deny_rules
+	// FirstMatch below so the allow short-circuits the deny layer.
+	//
+	// PRECEDENCE (matches dbounce exactly): allow_rules sit ABOVE the
+	// finer-grained deny_rules but BELOW the deny_hosts hard floor.
+	// deny_hosts is enforced at the CONNECT pre-dial gate (see
+	// handleMITMConnect, before the hijack), so a deny_hosts-blocked
+	// destination never reaches serveMITMRequest — an allow_rule
+	// structurally CANNOT resurrect it. That is the documented
+	// deny_hosts.go posture ("deny_hosts WINS over any allow list")
+	// and dbounce's "hard floor denies run before allow_rules" order.
+	//
+	// On match we stash the rule on the request context so the eventual
+	// recordMITMRequest emits decision_source=profile.allow honestly,
+	// then fall through to the normal proxy path (the deny FirstMatch
+	// is skipped). The orthogonal opt-in safety scanners (tool-call
+	// validator, response-injection scan) still run — an allow_rule
+	// overrides the profile DENY decision, not the independent BETA
+	// safety features.
+	var matchedAllow *profile.Rule
+	if matchedAllow = profile.FirstAllowMatch(s.mitmAllowRules, true, host, port, req.Method, req.URL.Path, req.URL.RawQuery); matchedAllow != nil {
+		s.totalMITMAllows.Add(1)
+		s.profileEnforcementLastFiredUnixMs.Store(time.Now().UnixMilli())
+		req = req.WithContext(context.WithValue(req.Context(), allowRuleCtxKey{}, matchedAllow))
+	} else if rule := profile.FirstMatch(s.mitmRules, true, host, port, req.Method, req.URL.Path, req.URL.RawQuery); rule != nil {
 		s.totalMITMDenies.Add(1)
 		s.profileEnforcementLastFiredUnixMs.Store(time.Now().UnixMilli())
 		s.recordMITMDeny(req, host, port, startedAt, rule)
@@ -632,6 +673,20 @@ func (s *Server) recordMITMRequest(req *http.Request, host string, port int, sta
 	}
 	if s.mitmAuditIncludeBodies && len(redactedReqBody) > 0 {
 		extras["request_body_snapshot"] = string(redactedReqBody)
+	}
+	// iam-jit #377 — when an allow_rule fired (stashed on the context
+	// by serveMITMRequest), attribute the ALLOW honestly so the audit
+	// log shows the request was explicitly allowed by the profile
+	// (source=profile.allow) rather than merely "not denied". Mirrors
+	// dbounce's SourceProfileAllow attribution.
+	if ar, ok := req.Context().Value(allowRuleCtxKey{}).(*profile.Rule); ok && ar != nil {
+		extras["decision_source"] = sourceProfileAllow
+		if ar.Source != "" {
+			extras["allow_rule"] = ar.Source
+		}
+		if ar.Reason != "" {
+			extras["allow_reason"] = ar.Reason
+		}
 	}
 
 	row := store.DecisionRow{

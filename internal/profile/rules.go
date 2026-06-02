@@ -316,3 +316,24 @@ func FirstMatch(rules []Rule, mitmActive bool, host string, port int, method, pa
 	}
 	return nil
 }
+
+// FirstAllowMatch is FirstMatch's twin for the profile-scoped
+// allow_rules layer (G-Slice / iam-jit #377). It walks the compiled
+// allow-rule list with the SAME predicate engine + the SAME
+// `mitmActive` skip semantics as FirstMatch, and returns the first
+// allow_rule that matches the request shape (nil when none match).
+//
+// The allow layer sits between the deny_hosts hard floor and the
+// finer-grained profile deny_rules — mirroring dbounce's
+// matchAnyAllowRule precedence (Profile.Evaluate Order 4, AFTER the
+// deny_keywords / deny_actions / DCL-public hard floors). The caller
+// (proxy.serveMITMRequest) consults this BEFORE the deny_rules
+// FirstMatch so an explicit allow_rule overrides a would-be deny_rule
+// deny. It does NOT — and structurally cannot — override a deny_hosts
+// entry: deny_hosts is evaluated at the CONNECT pre-dial gate before
+// the MITM hijack, so a deny_hosts match short-circuits the request
+// before serveMITMRequest (and thus this matcher) ever runs. That is
+// the exact dbounce posture ("deny_hosts WINS over any allow list").
+func FirstAllowMatch(rules []Rule, mitmActive bool, host string, port int, method, path, query string) *Rule {
+	return FirstMatch(rules, mitmActive, host, port, method, path, query)
+}

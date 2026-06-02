@@ -77,6 +77,15 @@ type mitmTestServer struct {
 
 func startMITMTestProxy(t *testing.T, handler http.Handler, rules []profile.Rule, includeBodies bool) *mitmTestServer {
 	t.Helper()
+	return startMITMTestProxyWithAllow(t, handler, rules, nil, includeBodies)
+}
+
+// startMITMTestProxyWithAllow is the iam-jit #377 variant of
+// startMITMTestProxy that also wires a profile allow-rule list
+// (MITMAllowRules). Used by the allow-enforcement tests to prove an
+// allow_rule flips a would-be deny_rule deny into an allow.
+func startMITMTestProxyWithAllow(t *testing.T, handler http.Handler, rules, allowRules []profile.Rule, includeBodies bool) *mitmTestServer {
+	t.Helper()
 	dir := t.TempDir()
 
 	// CA + cert minter.
@@ -123,6 +132,7 @@ func startMITMTestProxy(t *testing.T, handler http.Handler, rules []profile.Rule
 		ForwardTimeoutSeconds:  5,
 		MITMCertMinter:         minter,
 		MITMRules:              rules,
+		MITMAllowRules:         allowRules,
 		MITMAuditIncludeBodies: includeBodies,
 	}
 	srv, err := NewServer(cfg, st, lw, nil)
@@ -349,6 +359,194 @@ func TestMITM_ProfileRule_EndToEndDeny(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status=%d; want 403 (denied)", resp.StatusCode)
+	}
+}
+
+// TestMITM_ProfileAllowRule_FlipsDenyToAllow (iam-jit #377) is the
+// load-bearing regression test for the silent-degradation bug: an
+// allow_rule that ROUND-TRIPS but is IGNORED at runtime. With the
+// SAME deny_rule that TestMITM_ProfileRule_EndToEndDeny proves blocks
+// POST /v1/chat/completions, adding a matching allow_rule must flip
+// the verdict to ALLOW — the request reaches the upstream + returns
+// 200, and the audit row carries decision_source=profile.allow.
+//
+// Before #377 the allow_rule was inert: this request would still 403.
+func TestMITM_ProfileAllowRule_FlipsDenyToAllow(t *testing.T) {
+	mitmAllowInsecureUpstreamForTest = true
+	t.Cleanup(func() { mitmAllowInsecureUpstreamForTest = false })
+
+	upstreamHit := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case upstreamHit <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+
+	// Same deny_rule as the deny test: POST /v1/chat/completions blocked.
+	denyRules, err := profile.ParseRules([]profile.RuleSpec{
+		{Path: "/v1/chat/completions", Method: "POST", Reason: "AI chat denied"},
+	})
+	if err != nil {
+		t.Fatalf("ParseRules(deny): %v", err)
+	}
+	// An allow_rule that targets the exact same request.
+	allowRules, err := profile.ParseRules([]profile.RuleSpec{
+		{Path: "/v1/chat/completions", Method: "POST", Reason: "chat explicitly allowed by operator"},
+	})
+	if err != nil {
+		t.Fatalf("ParseRules(allow): %v", err)
+	}
+
+	ts := startMITMTestProxyWithAllow(t, handler, denyRules, allowRules, false)
+	upHost, upPort := splitUpstreamHostPort(t, ts.upstream.URL)
+	c := ts.clientFor(t)
+
+	target := fmt.Sprintf("https://%s:%d/v1/chat/completions", upHost, upPort)
+	resp, err := c.Post(target, "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("client.Post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d; want 200 (allow_rule must flip the deny to allow)", resp.StatusCode)
+	}
+	select {
+	case <-upstreamHit:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("upstream never saw the request — allow_rule did not flip the deny")
+	}
+
+	// Audit row must attribute the ALLOW to source=profile.allow so the
+	// operator sees the explicit allow, not a silent "not denied".
+	time.Sleep(120 * time.Millisecond)
+	events := readAuditJSONL(t, ts.auditPath)
+	foundAllowSource := false
+	for _, ev := range events {
+		ext, _ := ev["unmapped"].(map[string]any)
+		if ext == nil {
+			continue
+		}
+		jit, _ := ext["iam_jit"].(map[string]any)
+		if jit == nil {
+			continue
+		}
+		extMap, _ := jit["ext"].(map[string]any)
+		if extMap == nil {
+			continue
+		}
+		if src, _ := extMap["decision_source"].(string); src == "profile.allow" {
+			foundAllowSource = true
+		}
+	}
+	if !foundAllowSource {
+		t.Errorf("audit log missing decision_source=profile.allow on the allowed request")
+	}
+}
+
+// TestMITM_ProfileAllowRule_CannotOverrideDenyHostsHardFloor (iam-jit
+// #377) pins the precedence guarantee that mirrors dbounce: an
+// allow_rule must NOT resurrect a deny_hosts-blocked destination.
+// deny_hosts is the hard floor — it fires at the CONNECT pre-dial
+// gate, BEFORE the MITM hijack + allow-rule evaluation. Even with an
+// allow_rule that would match the request, a deny_hosts entry for the
+// upstream host must still produce a 403 and the upstream must never
+// be dialed.
+func TestMITM_ProfileAllowRule_CannotOverrideDenyHostsHardFloor(t *testing.T) {
+	mitmAllowInsecureUpstreamForTest = true
+	t.Cleanup(func() { mitmAllowInsecureUpstreamForTest = false })
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("upstream must not be reached: deny_hosts is a hard floor an allow_rule cannot override")
+	})
+
+	// A blanket allow_rule that matches everything (no predicates).
+	allowRules, err := profile.ParseRules([]profile.RuleSpec{
+		{Reason: "operator allow-all (must still lose to deny_hosts)"},
+	})
+	if err != nil {
+		t.Fatalf("ParseRules(allow): %v", err)
+	}
+
+	// Build the proxy manually so we can set BOTH a deny_hosts floor
+	// (for the upstream host) AND the blanket allow_rule.
+	dir := t.TempDir()
+	caPaths := mitm.CAPaths{
+		Dir:      dir,
+		CertFile: filepath.Join(dir, "ca.pem"),
+		KeyFile:  filepath.Join(dir, "ca-key.pem"),
+	}
+	caCert, caKey, err := mitm.GenerateCA(caPaths, false)
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	minter, err := mitm.NewCertMinter(caCert, caKey)
+	if err != nil {
+		t.Fatalf("NewCertMinter: %v", err)
+	}
+	upstream := httptest.NewTLSServer(handler)
+	t.Cleanup(upstream.Close)
+	upHost, _ := splitUpstreamHostPort(t, upstream.URL)
+
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	cfg := Config{
+		Host:                  "127.0.0.1",
+		Port:                  0,
+		Mode:                  ModeMITM,
+		AllowConnect:          true,
+		ForwardTimeoutSeconds: 5,
+		MITMCertMinter:        minter,
+		MITMAllowRules:        allowRules,
+		DenyHosts:             []string{upHost}, // hard floor on the upstream host
+	}
+	srv, err := NewServer(cfg, st, nil, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	proxyL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	mgmtL, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen mgmt: %v", err)
+	}
+	srv.SetAddrs(proxyL.Addr().String(), mgmtL.Addr().String())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = srv.ServeListeners(ctx, proxyL, mgmtL) }()
+	t.Cleanup(func() {
+		cancel()
+		time.Sleep(20 * time.Millisecond)
+	})
+
+	ts := &mitmTestServer{
+		proxyURL: "http://" + proxyL.Addr().String(),
+		upstream: upstream,
+		ca:       caCert,
+		srv:      srv,
+	}
+	_, upPort := splitUpstreamHostPort(t, upstream.URL)
+	c := ts.clientFor(t)
+
+	target := fmt.Sprintf("https://%s:%d/anything", upHost, upPort)
+	resp, err := c.Get(target)
+	if err != nil {
+		// A CONNECT-gate 403 surfaces to the client as a proxy error on
+		// the tunnel; that's an acceptable "blocked" outcome too. The
+		// load-bearing assertion is that the upstream handler (which
+		// t.Fatalf's) is never reached.
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status=%d; want 403 — deny_hosts hard floor must beat the allow_rule", resp.StatusCode)
 	}
 }
 

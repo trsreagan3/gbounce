@@ -138,7 +138,7 @@ func newProfileListCmd() *cobra.Command {
 					fmt.Fprintf(cmd.OutOrStdout(), "    deny_rules:  %d\n", n)
 				}
 				if n := len(p.AllowRules); n > 0 {
-					fmt.Fprintf(cmd.OutOrStdout(), "    allow_rules: %d (round-trip only — not enforced in v1.0)\n", n)
+					fmt.Fprintf(cmd.OutOrStdout(), "    allow_rules: %d (enforced in MITM mode; overrides deny_rules, not deny_hosts)\n", n)
 				}
 				if p.Source != "" && p.Source != "local" {
 					fmt.Fprintf(cmd.OutOrStdout(), "    source:      %s (READ-ONLY)\n", p.Source)
@@ -234,7 +234,7 @@ func newProfileShowCmd() *cobra.Command {
 				}
 			}
 			if n := len(p.AllowRules); n > 0 {
-				fmt.Fprintf(w, "allow_rules: %d (round-trip only — not enforced in v1.0)\n", n)
+				fmt.Fprintf(w, "allow_rules: %d (enforced in MITM mode; overrides deny_rules, not deny_hosts)\n", n)
 				for _, r := range p.AllowRules {
 					fmt.Fprintf(w, "  - %s\n", r.Host)
 				}
