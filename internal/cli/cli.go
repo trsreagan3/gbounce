@@ -401,6 +401,7 @@ so liveness probes never touch the proxy data path.`,
 			// listener binds.
 			var mitmMinter *mitm.CertMinter
 			var mitmRules []profile.Rule
+			var mitmAllowRules []profile.Rule
 			switch mode {
 			case "discovery":
 				// G-Slice 1: the default mode.
@@ -592,9 +593,11 @@ so liveness probes never touch the proxy data path.`,
 			// is loaded its deny_hosts stack on top of the CLI list (union
 			// semantics; CLI denies always apply). deny_rules from the
 			// profile are surfaced to the MITM-mode rule list (see below).
-			// Per [[v1-scope-bar]] AllowRules are NOT enforced in v1.0 —
-			// they round-trip on disk so a generator-emitted profile
-			// installs cleanly; enforcement waits for #377 in v1.1.
+			// iam-jit #377 — AllowRules ARE enforced (MITM mode): the
+			// proxy consults them BEFORE the deny_rules layer so an
+			// explicit allow_rule overrides a would-be deny_rule deny.
+			// They sit BELOW the deny_hosts hard floor (deny_hosts fires
+			// at the CONNECT pre-dial gate) — exact dbounce precedence.
 			activeProfileName := profileName
 			if activeProfileName == "" {
 				activeProfileName = os.Getenv("GBOUNCE_PROFILE")
@@ -627,6 +630,13 @@ so liveness probes never touch the proxy data path.`,
 				// for MITM-mode enforcement. The non-MITM proxy path only
 				// consults deny_hosts; that union above is sufficient for
 				// discovery-mode profile enforcement.
+				//
+				// iam-jit #377 — also compile profile.AllowRules into the
+				// MITMAllowRules slice. The proxy consults these BEFORE the
+				// deny_rules layer so an explicit allow_rule overrides a
+				// would-be deny_rule deny (source=profile.allow), mirroring
+				// dbounce. Allow rules NEVER override deny_hosts (the hard
+				// floor fires at the CONNECT pre-dial gate).
 				if mode == "mitm" {
 					for _, spec := range ap.DenyRules {
 						r, rerr := profile.ParseRule(spec)
@@ -634,6 +644,13 @@ so liveness probes never touch the proxy data path.`,
 							return fmt.Errorf("--profile %q: deny_rules: %w", activeProfileName, rerr)
 						}
 						mitmRules = append(mitmRules, r)
+					}
+					for _, spec := range ap.AllowRules {
+						r, rerr := profile.ParseRule(spec)
+						if rerr != nil {
+							return fmt.Errorf("--profile %q: allow_rules: %w", activeProfileName, rerr)
+						}
+						mitmAllowRules = append(mitmAllowRules, r)
 					}
 				}
 			}
@@ -714,6 +731,7 @@ so liveness probes never touch the proxy data path.`,
 				Mode:                   cfgMode,
 				MITMCertMinter:         mitmMinter,
 				MITMRules:              mitmRules,
+				MITMAllowRules:         mitmAllowRules,
 				MITMAuditIncludeBodies: auditLogIncludeBodies,
 				DenyHosts:              denyHostsMerged,
 				DynamicDenyWatcher:     ddWatcher,
@@ -1020,9 +1038,10 @@ so liveness probes never touch the proxy data path.`,
 			"proxy enforces both. Falls back to GBOUNCE_PROFILE env var. "+
 			"Unset = no profile loaded (pre-#376 shape). Install profiles "+
 			"with `gbounce profile install --from URL_OR_PATH`; list with "+
-			"`gbounce profile list`. AllowRules round-trip but are NOT "+
-			"enforced in v1.0 (queued for #377 in v1.1 per "+
-			"[[v1-scope-bar]]).")
+			"`gbounce profile list`. AllowRules ARE enforced in MITM "+
+			"mode (consulted before deny_rules so an allow overrides a "+
+			"would-be deny_rule deny; they never override the deny_hosts "+
+			"hard floor) — iam-jit #377, mirroring dbounce.")
 	cmd.Flags().StringVar(&profilesPath, "profiles-path", "",
 		"Path to profiles.yaml (default: ~/.gbounce/profiles.yaml; honors "+
 			"GBOUNCE_PROFILES_PATH).")

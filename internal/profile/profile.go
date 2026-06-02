@@ -47,13 +47,14 @@
 // The shim's `denies[].target` → DenyHosts when no `actions:` are
 // specified AND the target is hostname-shaped (no `/`); otherwise it
 // becomes a DenyRule with the target as host + actions as methods.
-// `allows:` entries are preserved for round-trip parity with the
-// sibling bouncers but NOT enforced by gbounce's matcher today — they
-// land in AllowRules where a future allow-list slice will consume
-// them. Per [[v1-scope-bar]] we do NOT add an allow-list matcher in
-// this slice; the data round-trips so a single generator-bundle
-// installs cleanly across all four bouncers + nothing is silently
-// dropped at parse time.
+// `allows:` entries land in AllowRules and ARE enforced (iam-jit
+// #377): in MITM mode an allow_rule that matches an outbound request
+// overrides a would-be profile deny_rule deny, mirroring dbounce's
+// matchAnyAllowRule precedence. They sit ABOVE the finer-grained
+// deny_rules but BELOW the deny_hosts hard floor (deny_hosts is
+// evaluated at the CONNECT pre-dial gate, before MITM allow-rule
+// evaluation, so an allow_rule cannot resurrect a deny_hosts-blocked
+// destination — the exact dbounce "deny WINS" posture).
 package profile
 
 import (
@@ -94,12 +95,17 @@ type Profile struct {
 	// FirstMatch's `mitmActive` arg.
 	DenyRules []RuleSpec `yaml:"deny_rules,omitempty"`
 
-	// AllowRules is preserved for round-trip with the generator's
-	// `allows:` field + the sibling bouncers' profile YAML. gbounce
-	// does NOT consume this list for matching in v1.0 — a future
-	// allow-list slice will. Per [[v1-scope-bar]] we keep the field
-	// so generator-emitted profiles install cleanly + nothing is
-	// silently lost; we do NOT build an allow-list matcher yet.
+	// AllowRules is the profile-scoped allow-list. Each entry compiles
+	// through ParseRule (same predicate shape as DenyRules). In MITM
+	// mode the proxy consults the compiled allow-rule list BEFORE the
+	// deny_rules layer: an allow_rule match overrides a would-be
+	// deny_rule deny (source=profile.allow). It does NOT override a
+	// deny_hosts entry — deny_hosts is the hard floor, evaluated at the
+	// CONNECT pre-dial gate before any MITM allow-rule evaluation.
+	// Mirrors dbounce's Profile.Evaluate Order 4 (matchAnyAllowRule
+	// runs AFTER the deny hard floors). Predicates that require MITM
+	// (method / path / query_params) are SKIPPED in CONNECT-only mode,
+	// same as DenyRules.
 	AllowRules []RuleSpec `yaml:"allow_rules,omitempty"`
 
 	// Source records provenance. Empty or "local" → user-edited.
@@ -580,7 +586,7 @@ func (p *Profile) validate() error {
 		}
 	}
 	for i, spec := range p.AllowRules {
-		if _, err := ParseRule(spec); err != nil {
+		if _, err := ParseAllowRule(spec); err != nil {
 			return fmt.Errorf("allow_rules[%d]: %v", i, err)
 		}
 	}

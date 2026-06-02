@@ -180,6 +180,14 @@ type Config struct {
 	// path + query-param matching). Empty list = MITM mode with only
 	// URL-level audit visibility.
 	MITMRules []profile.Rule
+	// MITMAllowRules is the compiled profile allow-rule list
+	// (iam-jit #377). Consulted BEFORE MITMRules in serveMITMRequest:
+	// an allow_rule match overrides a would-be deny_rule deny
+	// (source=profile.allow). Empty list = no allow layer (the
+	// pre-#377 deny-only shape). Allow rules NEVER override a
+	// deny_hosts entry — deny_hosts fires at the CONNECT pre-dial
+	// gate before the MITM hijack. Mirrors dbounce precedence.
+	MITMAllowRules []profile.Rule
 	// MITMAuditIncludeBodies opts INTO storing redacted request +
 	// response bodies in the audit log. Default false — only the
 	// redaction MARK + the bool surface so a SIEM can find which
@@ -292,6 +300,7 @@ type Server struct {
 	// #315 / §A13 — MITM-mode state. nil minter = MITM disabled.
 	mitmMinter             *mitm.CertMinter
 	mitmRules              []profile.Rule
+	mitmAllowRules         []profile.Rule
 	mitmAuditIncludeBodies bool
 
 	// #388 / §A25 Phase 2 — hot-swap-aware active profile state. The
@@ -306,6 +315,11 @@ type Server struct {
 	// #315 — bumped each time a MITM-intercepted request was denied
 	// by a profile rule.
 	totalMITMDenies atomic.Int64
+	// iam-jit #377 — bumped each time a MITM-intercepted request was
+	// ALLOWED by a profile allow_rule (source=profile.allow). Surfaced
+	// via /admin/stats + /healthz so the operator can see the allow
+	// layer is actually firing (per [[ibounce-honest-positioning]]).
+	totalMITMAllows atomic.Int64
 	// #315 — bumped each time an upstream TLS handshake fails inside
 	// MITM mode (most commonly = upstream pins certs).
 	totalMITMUpstreamHandshakeFailures atomic.Int64
@@ -410,6 +424,7 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 		dynamicDeny:            cfg.DynamicDenyWatcher,
 		mitmMinter:             cfg.MITMCertMinter,
 		mitmRules:              cfg.MITMRules,
+		mitmAllowRules:         cfg.MITMAllowRules,
 		mitmAuditIncludeBodies: cfg.MITMAuditIncludeBodies,
 		activeProfile:          cfg.ActiveProfile,
 		activeProfileName:      cfg.ActiveProfileName,
@@ -599,11 +614,24 @@ func (s *Server) SetActiveProfile(p *profile.Profile) error {
 		newMITMRules = append(newMITMRules, r)
 	}
 
+	// Translate AllowRules → MITM allow []profile.Rule (iam-jit #377).
+	// Same compile path as deny_rules; the proxy consults these BEFORE
+	// the deny_rules layer in serveMITMRequest.
+	newAllowRules := make([]profile.Rule, 0, len(p.AllowRules))
+	for _, spec := range p.AllowRules {
+		r, rerr := profile.ParseAllowRule(spec)
+		if rerr != nil {
+			return fmt.Errorf("gbounce: profile %q: allow_rules: %w", p.Name, rerr)
+		}
+		newAllowRules = append(newAllowRules, r)
+	}
+
 	s.profileMu.Lock()
 	s.activeProfile = p
 	s.activeProfileName = p.Name
 	s.denyHosts = newDenyHosts
 	s.mitmRules = newMITMRules
+	s.mitmAllowRules = newAllowRules
 	s.profileMu.Unlock()
 	return nil
 }
@@ -1144,8 +1172,11 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	// #315 / §A13 — MITM-mode counters.
 	body["mitm_enabled"] = s.cfg.Mode == ModeMITM
 	body["mitm_rules_count"] = len(s.mitmRules)
+	body["mitm_allow_rules_count"] = len(s.mitmAllowRules)
 	body["mitm_audit_include_bodies"] = s.mitmAuditIncludeBodies
 	body["total_mitm_denies"] = s.totalMITMDenies.Load()
+	// iam-jit #377 — profile allow_rule fires (source=profile.allow).
+	body["total_mitm_allows"] = s.totalMITMAllows.Load()
 	body["total_mitm_upstream_handshake_failures"] = s.totalMITMUpstreamHandshakeFailures.Load()
 	// #730 — response-body injection-scanner counters.
 	body["total_injection_scan_warns"] = s.totalInjectionScanWarns.Load()
