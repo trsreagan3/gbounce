@@ -192,6 +192,25 @@ func (s *Server) snapshotFeatures() featureStatusSnapshot {
 		DetailHint:              "enable in profile + MITM-decode a response containing prompt-injection indicators",
 	})
 
+	// #729 / BUILD-8 — hallucinated-tool-call validator. Inspects
+	// REQUEST bodies, so the fire surface is MCP / OpenAI / Anthropic
+	// tool-call shapes going OUT of the agent. Fires on warn/strip/deny.
+	tcvEnabled := false
+	if ap := s.ActiveProfile(); ap != nil {
+		tcvEnabled = ap.ValidateToolCalls.Enabled
+	}
+	tcvFires := s.totalToolCallValidatorWarns.Load() +
+		s.totalToolCallValidatorStrips.Load() +
+		s.totalToolCallValidatorDenies.Load()
+	out.Features = append(out.Features, FeatureStatus{
+		Name:                    "validate_tool_calls",
+		Enabled:                 tcvEnabled,
+		FireCountTotal:          tcvFires,
+		LastFiredUnixMs:         s.toolCallValidatorLastFiredUnixMs.Load(),
+		ConfiguredButNeverFired: tcvEnabled && tcvFires == 0,
+		DetailHint:              "enable in profile + send a hallucinated MCP/OpenAI/Anthropic tool-call JSON body through the MITM proxy",
+	})
+
 	// Profile enforcement — fires when an MITM-intercepted request is
 	// denied by a profile rule.
 	profileEnabled := s.ActiveProfile() != nil

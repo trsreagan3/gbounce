@@ -32,6 +32,7 @@ import (
 	"github.com/trsreagan3/gbounce/internal/profile"
 	"github.com/trsreagan3/gbounce/internal/store"
 	"github.com/trsreagan3/gbounce/internal/structureddeny"
+	"github.com/trsreagan3/gbounce/internal/toolcallvalidator"
 )
 
 // maxBodySnapshotBytes caps the in-memory request/response body
@@ -230,6 +231,36 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 	}
 	redactedReqBody, reqRedacted := mitm.RedactJSONBody(requestBodyBytes)
 
+	// #729 / BUILD-8 — hallucinated tool-call validator. Only runs on
+	// POST-like bodies (the wire shapes we recognize all live in JSON
+	// request bodies). Default OFF; only active when the profile opts
+	// in via `validate_tool_calls.enabled: true`.
+	tcResult, tcDecision := s.runToolCallValidator(req, requestBodyBytes)
+	switch tcDecision {
+	case toolcallvalidator.ActionDeny:
+		s.totalToolCallValidatorDenies.Add(1)
+		s.toolCallValidatorLastFiredUnixMs.Store(time.Now().UnixMilli())
+		writeToolCallValidatorDenyResponse(clientConn, req, host, tcResult)
+		s.recordMITMResponseWithToolCallFinding(req, host, port, startedAt, http.StatusUnprocessableEntity, 0, redactedReqBody, reqRedacted, bodyTruncated, tcResult, "deny")
+		return
+	case toolcallvalidator.ActionStrip:
+		// Replace the request body with the stripped version BEFORE
+		// the upstream dial; the upstream sees a sanitized body.
+		newBody := toolcallvalidator.ApplyStrip(requestBodyBytes, tcResult)
+		if len(newBody) > 0 {
+			requestBodyBytes = newBody
+			req.ContentLength = int64(len(newBody))
+			req.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+		}
+		req.Header.Set("X-IAM-JIT-Hallucinated-Tool-Call", toolCallValidatorWarningHeader(tcResult))
+		s.totalToolCallValidatorStrips.Add(1)
+		s.toolCallValidatorLastFiredUnixMs.Store(time.Now().UnixMilli())
+	case toolcallvalidator.ActionWarn:
+		req.Header.Set("X-IAM-JIT-Hallucinated-Tool-Call", toolCallValidatorWarningHeader(tcResult))
+		s.totalToolCallValidatorWarns.Add(1)
+		s.toolCallValidatorLastFiredUnixMs.Store(time.Now().UnixMilli())
+	}
+
 	upstreamConn, err := tls.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)), &tls.Config{
 		ServerName:         host,
 		MinVersion:         tls.VersionTLS12,
@@ -304,8 +335,17 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 
 	// For warn/strip/allow paths, record one event with the finding
 	// fields merged into extras when detected.
+	//
+	// Precedence on the recording variant:
+	//   1. BUILD-9 (response-side injection) — if detected, takes the
+	//      injection variant (its indicators are response-shaped).
+	//   2. BUILD-8 (request-side tool-call validator) — if detected
+	//      but BUILD-9 didn't, record via the tool-call variant.
+	//   3. Otherwise — plain recordMITMRequest.
 	if scanResult.Detected && (scanDecision == injectionscan.ActionWarn || scanDecision == injectionscan.ActionStrip) {
 		s.recordMITMResponseWithInjectionFinding(req, host, port, startedAt, resp.StatusCode, int64(len(finalRespBody)), redactedReqBody, reqRedacted, bodyTruncated, scanResult, string(scanDecision))
+	} else if tcResult.Detected && (tcDecision == toolcallvalidator.ActionWarn || tcDecision == toolcallvalidator.ActionStrip) {
+		s.recordMITMResponseWithToolCallFinding(req, host, port, startedAt, resp.StatusCode, int64(len(finalRespBody)), redactedReqBody, reqRedacted, bodyTruncated, tcResult, string(tcDecision))
 	} else {
 		s.recordMITMRequest(req, host, port, startedAt, resp.StatusCode, int64(len(finalRespBody)), redactedReqBody, reqRedacted, bodyTruncated)
 	}
@@ -894,4 +934,247 @@ func writeRawHTTPStructuredDenyResponse(w io.Writer, req *http.Request, host, le
 		Request:       req,
 	}
 	_ = resp.Write(w)
+}
+
+// --------------------------------------------------------------------
+// Hallucinated-tool-call validator wire-up (#729 / BUILD-8).
+//
+// Parallel to runResponseInjectionScan but inspecting the REQUEST body
+// instead of the upstream response. The validator runs only when the
+// active profile opts in. Default OFF — same posture as the response
+// scanner per [[ibounce-honest-positioning]].
+// --------------------------------------------------------------------
+
+// runToolCallValidator inspects the request body for hallucinated tool-
+// call shapes per #729. Returns the verdict + the decided action (post-
+// profile-config reconciliation). Returns ActionAllow when the
+// validator is disabled on the active profile.
+func (s *Server) runToolCallValidator(req *http.Request, body []byte) (toolcallvalidator.ValidationResult, toolcallvalidator.Action) {
+	prof := s.ActiveProfile()
+	if prof == nil {
+		return toolcallvalidator.ValidationResult{}, toolcallvalidator.ActionAllow
+	}
+	pcfg := prof.ValidateToolCalls
+	if !pcfg.Enabled {
+		return toolcallvalidator.ValidationResult{}, toolcallvalidator.ActionAllow
+	}
+	cfg := toolcallvalidator.DefaultConfig()
+	cfg.Enabled = true
+	if pcfg.Action != "" {
+		cfg.Action = toolcallvalidator.Action(pcfg.Action)
+	}
+	if len(pcfg.AllowlistPatterns) > 0 {
+		cfg.AllowlistPatterns = pcfg.AllowlistPatterns
+	}
+	if pcfg.MaxBodyBytes > 0 {
+		cfg.MaxBodyBytes = pcfg.MaxBodyBytes
+	}
+	if pcfg.MinConfidenceForDeny > 0 {
+		cfg.MinConfidenceForDeny = pcfg.MinConfidenceForDeny
+	}
+	// Operator corpus override path is recognized in the YAML; the
+	// runtime loader for it is a follow-up — the file-system read
+	// would need to be cached so we don't re-parse per-request. For
+	// v1.0 the baked-in corpus is the active set; operators with
+	// custom tools should add the names to allowlist_patterns until
+	// the corpus loader lands.
+	result := toolcallvalidator.Validate(body, cfg)
+	return result, toolcallvalidator.DecideAction(result, cfg)
+}
+
+// toolCallValidatorWarningHeader serializes validator indicators into a
+// single HTTP header value. Same shape as injectionWarningHeader.
+//
+//	detected; rules=<csv>; confidence=<float>
+func toolCallValidatorWarningHeader(r toolcallvalidator.ValidationResult) string {
+	names := make([]string, 0, len(r.Indicators))
+	for _, ind := range r.Indicators {
+		names = append(names, ind.Rule)
+	}
+	csv := strings.Join(names, ",")
+	if len(csv) > 200 {
+		csv = csv[:200]
+	}
+	return fmt.Sprintf("detected; rules=%s; confidence=%.2f", csv, r.Confidence)
+}
+
+// writeToolCallValidatorDenyResponse emits a 422 Unprocessable Entity
+// with a structured caught_by_bouncer-shaped JSON body. 422 is
+// semantically correct: the request body is syntactically valid but
+// fails validation (vs. 403 which is for authz failures + injection).
+//
+// The harness sees the same `caught_by_bouncer` framing it gets from
+// request-side denies (#459 / §A57b parity), with reason=
+// hallucinated_tool_call_shape.
+func writeToolCallValidatorDenyResponse(w io.Writer, req *http.Request, host string, r toolcallvalidator.ValidationResult) {
+	if w == nil {
+		return
+	}
+	indicators := make([]map[string]any, 0, len(r.Indicators))
+	for _, ind := range r.Indicators {
+		indicators = append(indicators, map[string]any{
+			"rule":      ind.Rule,
+			"shape":     ind.Shape,
+			"tool_name": ind.ToolName,
+			"severity":  string(ind.Severity),
+			"source":    ind.Source,
+			"reason":    ind.Reason,
+		})
+	}
+	extracted := make([]map[string]string, 0, len(r.ExtractedCalls))
+	for _, ec := range r.ExtractedCalls {
+		extracted = append(extracted, map[string]string{
+			"shape": ec.Shape,
+			"name":  ec.Name,
+		})
+	}
+	payload := map[string]any{
+		"caught_by_bouncer": "gbounce",
+		"reason":            "hallucinated_tool_call_shape",
+		"host":              host,
+		"confidence":        r.Confidence,
+		"indicators":        indicators,
+		"extracted_calls":   extracted,
+		"deny_source":       "tool_call_validator",
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		writeRawHTTPResponse(w, req, http.StatusUnprocessableEntity,
+			"gbounce: hallucinated tool call shape detected in request body")
+		return
+	}
+	statusText := http.StatusText(http.StatusUnprocessableEntity)
+	if statusText == "" {
+		statusText = "Unprocessable Entity"
+	}
+	headers := fmt.Sprintf(
+		"HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+		http.StatusUnprocessableEntity, statusText, len(body),
+	)
+	_, _ = w.Write([]byte(headers))
+	_, _ = w.Write(body)
+}
+
+// recordMITMResponseWithToolCallFinding is the variant of
+// recordMITMRequest that merges tool-call-validator indicator fields
+// into the OCSF event's ext extras. Same shape as
+// recordMITMResponseWithInjectionFinding (#730) — fields prefixed
+// `tool_call_validator_` so log pipelines can disambiguate.
+func (s *Server) recordMITMResponseWithToolCallFinding(
+	req *http.Request, host string, port int, startedAt time.Time,
+	status int, respSize int64, redactedReqBody []byte, reqRedacted, truncated bool,
+	r toolcallvalidator.ValidationResult, decidedAction string,
+) {
+	clientHost, clientPort := splitHostPort(req.RemoteAddr)
+	redactedQuery, _ := mitm.RedactQueryParams(req.URL.RawQuery)
+	extras := map[string]any{
+		"url_path":              req.URL.Path,
+		"url_query":             redactedQuery,
+		"request_method":        req.Method,
+		"request_body_redacted": reqRedacted,
+		"response_status":       status,
+	}
+	if truncated {
+		extras["request_body_truncated"] = true
+	}
+	if s.mitmAuditIncludeBodies && len(redactedReqBody) > 0 {
+		extras["request_body_snapshot"] = string(redactedReqBody)
+	}
+	if r.Detected {
+		indicatorList := make([]map[string]any, 0, len(r.Indicators))
+		for _, ind := range r.Indicators {
+			indicatorList = append(indicatorList, map[string]any{
+				"rule":      ind.Rule,
+				"shape":     ind.Shape,
+				"tool_name": ind.ToolName,
+				"severity":  string(ind.Severity),
+				"source":    ind.Source,
+				"reason":    ind.Reason,
+			})
+		}
+		extracted := make([]map[string]string, 0, len(r.ExtractedCalls))
+		for _, ec := range r.ExtractedCalls {
+			extracted = append(extracted, map[string]string{
+				"shape": ec.Shape,
+				"name":  ec.Name,
+			})
+		}
+		extras["tool_call_validator_detected"] = true
+		extras["tool_call_validator_confidence"] = r.Confidence
+		extras["tool_call_validator_action"] = decidedAction
+		extras["tool_call_validator_indicators"] = indicatorList
+		extras["tool_call_validator_extracted_calls"] = extracted
+		if r.LowConfidenceExplanation != "" {
+			extras["tool_call_validator_low_confidence_explanation"] = r.LowConfidenceExplanation
+		}
+	}
+
+	row := store.DecisionRow{
+		At:             startedAt.UTC(),
+		Method:         req.Method,
+		Path:           buildPathWithQuery(req.URL.Path, redactedQuery),
+		UpstreamHost:   host,
+		UpstreamPort:   port,
+		UpstreamScheme: "https",
+		ClientHost:     clientHost,
+		ClientPort:     clientPort,
+		HTTPStatus:     status,
+		ResponseSize:   respSize,
+		LatencyMS:      time.Since(startedAt).Milliseconds(),
+		Verdict:        "ALLOW",
+		Mode:           string(ModeMITM),
+		Enforced:       decidedAction == "deny" || decidedAction == "strip",
+	}
+	if decidedAction == "deny" {
+		row.Verdict = "DENY"
+	}
+	rawSessionID := req.Header.Get("X-Agent-Session-Id")
+	rawAgentName := req.Header.Get("X-Agent-Name")
+	if rawSessionID != "" && audit.IsValidSessionID(rawSessionID) {
+		row.AgentSessionID = rawSessionID
+	}
+	if rawAgentName != "" && audit.IsValidAgentName(rawAgentName) {
+		row.AgentName = rawAgentName
+	}
+	var decisionID int64
+	if s.store != nil {
+		if id, err := s.store.RecordDecision(row); err == nil {
+			decisionID = id
+		}
+	}
+	if s.log != nil || s.recorder != nil {
+		ev := audit.FromRequest(audit.RequestInput{
+			At:             row.At,
+			DecisionID:     decisionID,
+			Mode:           row.Mode,
+			Method:         row.Method,
+			Path:           row.Path,
+			UpstreamHost:   row.UpstreamHost,
+			UpstreamPort:   row.UpstreamPort,
+			UpstreamScheme: row.UpstreamScheme,
+			ClientHost:     row.ClientHost,
+			ClientPort:     row.ClientPort,
+			HTTPStatus:     row.HTTPStatus,
+			ResponseSize:   row.ResponseSize,
+			LatencyMS:      row.LatencyMS,
+			AgentSessionID: row.AgentSessionID,
+			AgentName:      row.AgentName,
+			Verdict:        row.Verdict,
+			ExtraExt:       extras,
+		})
+		if s.log != nil {
+			_ = s.log.Write(req.Context(), ev)
+			s.auditLogLastFiredUnixMs.Store(time.Now().UnixMilli())
+		}
+		if s.recorder != nil {
+			s.recorder.Record(ev)
+			s.sessionRecorderFireCount.Add(1)
+			s.sessionRecorderLastFiredUnixMs.Store(time.Now().UnixMilli())
+		}
+		if s.objectStorage != nil {
+			s.objectStorage.Write(req.Context(), ev)
+			s.objectStorageFireCount.Add(1)
+			s.objectStorageLastFiredUnixMs.Store(time.Now().UnixMilli())
+		}
+	}
 }

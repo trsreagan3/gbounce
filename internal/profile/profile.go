@@ -115,6 +115,40 @@ type Profile struct {
 	// visible in CONNECT mode). Per [[mitm-beta-pii-pci-concern]]
 	// MITM ships BETA; this feature inherits that posture.
 	InjectionScanResponseBodies InjectionScanConfig `yaml:"injection_scan_response_bodies,omitempty"`
+
+	// ValidateToolCalls (iam-jit #729 / BUILD-8) — opt-in hallucinated-
+	// tool-call validator. Inspects OUTBOUND MCP / OpenAI / Anthropic
+	// tool-call request bodies + rejects calls whose name + arguments
+	// don't match the known-tool schema corpus. Default OFF. Only
+	// honored in MITM mode (request bodies inspectable without TLS
+	// termination only when the upstream is plain HTTP).
+	ValidateToolCalls ValidateToolCallsConfig `yaml:"validate_tool_calls,omitempty"`
+}
+
+// ValidateToolCallsConfig is the per-profile hallucinated-tool-call-
+// validator config. Mirrors iam-roles/src/iam_jit/tool_call_validator/
+// config.py field-for-field.
+type ValidateToolCallsConfig struct {
+	// Enabled is the on/off toggle. Default false.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Action is one of: warn | strip | deny. Default warn.
+	Action string `yaml:"action,omitempty"`
+
+	// SchemaCorpusPath is an optional path/URL to an operator-supplied
+	// schema-corpus override file. Empty = baked-in corpus only.
+	SchemaCorpusPath string `yaml:"schema_corpus_path,omitempty"`
+
+	// AllowlistPatterns are regexes; matches suppress detection.
+	AllowlistPatterns []string `yaml:"allowlist_patterns,omitempty"`
+
+	// MaxBodyBytes caps the scanned body size (ReDoS guard).
+	// Default 64 KiB.
+	MaxBodyBytes int `yaml:"max_body_bytes,omitempty"`
+
+	// MinConfidenceForDeny: when Action==deny, results below this
+	// confidence downgrade to warn. Default 0.7.
+	MinConfidenceForDeny float64 `yaml:"min_confidence_for_deny,omitempty"`
 }
 
 // InjectionScanConfig is the per-profile response-body scanner config.

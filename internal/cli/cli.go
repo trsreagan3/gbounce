@@ -723,6 +723,18 @@ so liveness probes never touch the proxy data path.`,
 			if err != nil {
 				return err
 			}
+			// #729 / BUILD-8 + #730 / BUILD-9 — install the active
+			// profile pointer on the server so per-profile-config
+			// features (validate_tool_calls,
+			// injection_scan_response_bodies) actually fire. Pre-fix
+			// the loaded `activeProfile` was thrown away after its
+			// DenyHosts + DenyRules were extracted, so the
+			// MITM-path-only features were silently OFF.
+			if activeProfile != nil {
+				if perr := srv.SetActiveProfile(activeProfile); perr != nil {
+					return fmt.Errorf("--profile %q: activate: %w", activeProfileName, perr)
+				}
+			}
 			// #324d — wire the watcher's emit callback now that the
 			// Server exists. Each reload bumps the matching counter +
 			// tees an OCSF admin-action event into the audit log so a

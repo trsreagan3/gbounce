@@ -317,6 +317,14 @@ type Server struct {
 	totalInjectionScanStrips  atomic.Int64
 	totalInjectionScanDenies  atomic.Int64
 
+	// #729 / BUILD-8 — hallucinated tool-call validator counters.
+	// Bumped from the MITM request path when the validator's decided
+	// action is the matching mode. Surfaced via /admin/stats +
+	// /admin/features.
+	totalToolCallValidatorWarns  atomic.Int64
+	totalToolCallValidatorStrips atomic.Int64
+	totalToolCallValidatorDenies atomic.Int64
+
 	// #682 — purpose-driven monitoring UI per
 	// [[gbounce-ui-purpose-driven]]. Each feature has a "last fired"
 	// unix-ms stamp + optional last-error string so the
@@ -334,6 +342,7 @@ type Server struct {
 	denyHostsLastFiredUnixMs           atomic.Int64
 	dynamicDenyLastFiredUnixMs         atomic.Int64
 	injectionScanLastFiredUnixMs       atomic.Int64
+	toolCallValidatorLastFiredUnixMs   atomic.Int64
 	profileEnforcementLastFiredUnixMs  atomic.Int64
 	auditLogLastFiredUnixMs            atomic.Int64
 	sessionRecorderLastFiredUnixMs     atomic.Int64
@@ -1142,6 +1151,10 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	body["total_injection_scan_warns"] = s.totalInjectionScanWarns.Load()
 	body["total_injection_scan_strips"] = s.totalInjectionScanStrips.Load()
 	body["total_injection_scan_denies"] = s.totalInjectionScanDenies.Load()
+	// #729 / BUILD-8 — hallucinated tool-call validator counters.
+	body["total_tool_call_validator_warns"] = s.totalToolCallValidatorWarns.Load()
+	body["total_tool_call_validator_strips"] = s.totalToolCallValidatorStrips.Load()
+	body["total_tool_call_validator_denies"] = s.totalToolCallValidatorDenies.Load()
 	if s.log != nil {
 		body["audit_log_path"] = s.log.Path()
 		body["audit_log_total"] = s.log.Total()
