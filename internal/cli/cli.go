@@ -234,16 +234,17 @@ Later slices add profile mode (G-2), tap mode (G-3), auto-recommender
 
 func newRunCmd() *cobra.Command {
 	var (
-		port              int
-		host              string
-		mgmtPort          int
-		mgmtHost          string
-		upstreamURL       string
-		allowConnect      bool
-		dbPath            string
-		auditLogPath      string
-		auditLogFsync     bool
-		noAuditChain      bool
+		port             int
+		host             string
+		mgmtPort         int
+		mgmtHost         string
+		upstreamURL      string
+		allowConnect     bool
+		dbPath           string
+		auditLogPath     string
+		auditLogFsync    bool
+		noAuditChain     bool
+		manifestInterval int64
 		// #311 / §A10 — rotation thresholds. Sentinel -1 = "use the
 		// audit-package default (matches iam-roles/docs/LOG-RETENTION.md
 		// — 100 MB / 7 days / 30 days)." 0 = "operator explicitly
@@ -266,10 +267,10 @@ func newRunCmd() *cobra.Command {
 		ignoreDiskPressure        bool
 		diskPressureWarnFreeBytes int64
 		diskPressureCritFreeBytes int64
-		forceExternalBind bool
-		forwardTimeout    int
-		mode              string
-		auditEventsToken  string
+		forceExternalBind         bool
+		forwardTimeout            int
+		mode                      string
+		auditEventsToken          string
 		// #254 — deployment preset. Single-flag shortcut for a common
 		// deployment shape (only `security-observe` in v1.0). Resolved
 		// BEFORE downstream mode validation so the preset's HARD/SOFT
@@ -548,9 +549,13 @@ so liveness probes never touch the proxy data path.`,
 						}
 					}
 					if keysDir != "" {
+						interval := int64(audit.DefaultManifestIntervalEvents)
+						if manifestInterval > 0 {
+							interval = manifestInterval
+						}
 						s, serr := audit.NewManifestSigner(
 							logDir, "gbounce",
-							audit.DefaultManifestIntervalEvents,
+							interval,
 							keysDir, audit.DefaultKeypairName,
 						)
 						if serr != nil {
@@ -939,6 +944,7 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().StringVar(&auditLogPath, "audit-log-path", "", "also append OCSF events to this JSONL file (opt-in)")
 	cmd.Flags().BoolVar(&auditLogFsync, "audit-log-fsync", false, "fsync after every audit-log write (slower; safer on crash)")
 	cmd.Flags().BoolVar(&noAuditChain, "no-audit-chain", false, "disable the tamper-evident hash-chain + Ed25519-signed manifests on the audit-log JSONL (ADOPT-10/#734; on by default when --audit-log-path is set)")
+	cmd.Flags().Int64Var(&manifestInterval, "manifest-interval", 0, "emit a signed chain-checkpoint manifest every N events (ADOPT-10/#734; 0 = default 1000). Lower it on low-traffic deployments so a signed checkpoint lands without waiting for 1000 events.")
 	// #311 / §A10 — rotation thresholds. Sentinel -1 = "use audit-pkg
 	// default (matches LOG-RETENTION.md)"; 0 = "operator explicitly
 	// disabled this trigger." Same names across all four Bounce
