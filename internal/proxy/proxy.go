@@ -316,6 +316,32 @@ type Server struct {
 	totalInjectionScanWarns   atomic.Int64
 	totalInjectionScanStrips  atomic.Int64
 	totalInjectionScanDenies  atomic.Int64
+
+	// #682 — purpose-driven monitoring UI per
+	// [[gbounce-ui-purpose-driven]]. Each feature has a "last fired"
+	// unix-ms stamp + optional last-error string so the
+	// /admin/features endpoint can answer "is this feature actually
+	// doing its job" honestly (per [[ibounce-honest-positioning]]).
+	// Hot-path cost is one atomic store per fire; snapshot cost is
+	// one load per feature. processStartedUnixMs is set in NewServer
+	// so the UI can render "monitoring since X" honestly.
+	processStartedUnixMs atomic.Int64
+	// Per-feature last-fired timestamps (unix ms). Zero = never fired
+	// since process start.
+	mitmLastFiredUnixMs                atomic.Int64
+	mitmLastError                      atomic.Value // string
+	totalMITMIntercepted               atomic.Int64
+	denyHostsLastFiredUnixMs           atomic.Int64
+	dynamicDenyLastFiredUnixMs         atomic.Int64
+	injectionScanLastFiredUnixMs       atomic.Int64
+	profileEnforcementLastFiredUnixMs  atomic.Int64
+	auditLogLastFiredUnixMs            atomic.Int64
+	sessionRecorderLastFiredUnixMs     atomic.Int64
+	sessionRecorderFireCount           atomic.Int64
+	objectStorageLastFiredUnixMs       atomic.Int64
+	objectStorageFireCount             atomic.Int64
+	diskPressureLastFiredUnixMs        atomic.Int64
+	diskPressureFireCount              atomic.Int64
 }
 
 // NewServer builds a Server from the given Config + Store. Caller
@@ -388,6 +414,11 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 			},
 		},
 	}
+	// #682 — stamp process start so /admin/features can render
+	// "monitoring since <ts>" honestly. Done here (NOT in Serve)
+	// because tests construct a Server without calling Serve and
+	// still expect a non-zero start time.
+	s.processStartedUnixMs.Store(time.Now().UnixMilli())
 
 	// Proxy listener uses a bare HandlerFunc (NOT a ServeMux) because
 	// the HTTP CONNECT verb has a request-target of "host:port" not a
@@ -456,6 +487,15 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 	// match routes /suite here instead of the live audit UI's
 	// 404-on-non-root path.
 	mgmtMux.HandleFunc("/suite", suiteUIHandler())
+	// #682 — purpose-driven monitoring console + SSE stream +
+	// feature-status + stuck-signals. The console answers the 5
+	// founder questions per [[gbounce-ui-purpose-driven]]. Read-only;
+	// same auth model as /audit/events. Registered BEFORE the "/"
+	// catch-all so the more-specific prefixes win.
+	mgmtMux.HandleFunc("/admin/ui", adminUIHandler(cfg.AuditEventsToken))
+	mgmtMux.HandleFunc("/admin/features", s.adminFeaturesHandler(cfg.AuditEventsToken))
+	mgmtMux.HandleFunc("/admin/stuck-signals", s.adminStuckSignalsHandler(cfg.AuditEventsToken))
+	mgmtMux.HandleFunc("/admin/stream", s.adminStreamHandler(cfg.AuditEventsToken))
 	// #272 — GET / serves the minimal live audit-stream web UI on
 	// the same mgmt port as /healthz + /audit/events. The page polls
 	// /audit/events every 2 s. Same auth model as /audit/events:
@@ -706,6 +746,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// never flip refuse_requests so this is a no-op for them.
 	if s.cfg.DiskPressure != nil && s.cfg.DiskPressure.RefuseRequests() {
 		writeDiskPressurePause(w, s.cfg.DiskPressure.Snapshot())
+		s.diskPressureFireCount.Add(1)
+		s.diskPressureLastFiredUnixMs.Store(time.Now().UnixMilli())
 		return
 	}
 	if r.Method == http.MethodConnect {
@@ -818,8 +860,10 @@ func (s *Server) handleForward(w http.ResponseWriter, r *http.Request) {
 			}
 			if rule.Source == DenySourceDynamic {
 				s.totalDynamicDenyMatches.Add(1)
+				s.dynamicDenyLastFiredUnixMs.Store(time.Now().UnixMilli())
 			} else {
 				s.totalDenyHostMatches.Add(1)
+				s.denyHostsLastFiredUnixMs.Store(time.Now().UnixMilli())
 			}
 			reason := fmt.Sprintf("matched deny_hosts: %s", rule.Raw)
 			if rule.Source == DenySourceDynamic && rule.DynamicDenyRuleID != "" {
@@ -925,8 +969,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if rule := MatchDenyHosts(effective, denyHost); rule != nil {
 			if rule.Source == DenySourceDynamic {
 				s.totalDynamicDenyMatches.Add(1)
+				s.dynamicDenyLastFiredUnixMs.Store(time.Now().UnixMilli())
 			} else {
 				s.totalDenyHostMatches.Add(1)
+				s.denyHostsLastFiredUnixMs.Store(time.Now().UnixMilli())
 			}
 			reason := fmt.Sprintf("matched deny_hosts: %s", rule.Raw)
 			if rule.Source == DenySourceDynamic && rule.DynamicDenyRuleID != "" {
@@ -1640,6 +1686,7 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 		})
 		if s.log != nil {
 			_ = s.log.Write(r.Context(), ev)
+			s.auditLogLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
 		// #285 — per-session NDJSON tee. Record is fail-soft (disk
 		// errors land on the recorder's lastErr counter + surface via
@@ -1647,6 +1694,8 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 		// recording dir can't stall the proxy).
 		if s.recorder != nil {
 			s.recorder.Record(ev)
+			s.sessionRecorderFireCount.Add(1)
+			s.sessionRecorderLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
 		// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
 		// Synchronous in-memory append; the background rotator handles
@@ -1654,6 +1703,8 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 		// blocks the proxy hot path.
 		if s.objectStorage != nil {
 			s.objectStorage.Write(r.Context(), ev)
+			s.objectStorageFireCount.Add(1)
+			s.objectStorageLastFiredUnixMs.Store(time.Now().UnixMilli())
 		}
 	}
 }

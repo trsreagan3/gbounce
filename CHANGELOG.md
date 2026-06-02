@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **iam-jit #682 — purpose-driven monitoring UI at `/admin/ui`** (2026-06-02) —
+  Per founder direction in `[[gbounce-ui-purpose-driven]]`, the gbounce
+  mgmt-port now serves a 5-panel monitoring console that answers the
+  five questions an operator actually has when watching an agent:
+  (1) "what is my agent doing right now" — live SSE decision stream;
+  (2) "is my agent stuck" — three quantified pattern detections
+  (`upstream_retry_storm`, `error_repeat`, `deny_storm`) each carrying
+  the EXACT threshold that fired ("5 in 30s") so the heuristic is
+  auditable; (3) "what is gbounce blocking" — DENY-only filtered
+  stream with rule + source + severity; (4) "which features are
+  turned on" — explicit ON/OFF table for `mitm`, `deny_hosts`,
+  `dynamic_deny`, `injection_scan`, `profile_enforcement`,
+  `audit_log`, `session_recorder`, `object_storage`,
+  `disk_pressure_circuit_breaker`; (5) "are the features actually
+  doing their job" — per-feature last-fired timestamp, total + 24h
+  fire counts, last error, and an amber
+  `CONFIGURED / NEVER FIRED` pill that distinctly highlights
+  silent-degradation per `[[ibounce-honest-positioning]]`. Page
+  bundles every byte (HTML + CSS + JS) into the Go binary; no CDNs,
+  no fonts, no analytics. Empty-state copy ships an actionable
+  `HTTPS_PROXY=... curl` test command so an operator never sees a
+  blank console without a way out. Three new JSON endpoints back the
+  page: `GET /admin/features`, `GET /admin/stuck-signals`,
+  `GET /admin/stream` (SSE). Auth mirrors `/audit/events`: loopback
+  open, external bind requires bearer via header OR `#token=` URL
+  fragment that the JS surfaces as `?_token=`. 14 new tests cover
+  HTML structure, the 5 question labels, no-external-dependency
+  guard, no-embedded-token guard, anti-surveillance copy guard, CSP
+  headers, the feature snapshot wire shape, the
+  `ConfiguredButNeverFired` honesty surface, the stuck-pattern
+  threshold strings, deny-storm detection, retry-storm detection,
+  and the initial SSE frame emission. Verified end-to-end with a
+  real-bouncer probe: launched `gbounce run --port 18080 --mgmt-port
+  18769 --allow-connect --deny-host bad.example.com --audit-log-path
+  /tmp/audit.jsonl`, sent `HTTPS_PROXY=http://127.0.0.1:18080 curl`
+  to both an allowed + a denied host, confirmed the SSE stream
+  pushed `event: decision` frames with verdict ALLOW + DENY,
+  confirmed `deny_hosts` and `audit_log` features showed
+  `fire_count_total > 0` and `last_fired_unix_ms > 0`, and
+  confirmed `dynamic_deny` showed `configured_but_never_fired:
+  true` (the honest gap). Legacy `/` live-tail UI is unchanged for
+  backcompat. Operator guide: `docs/UI-USAGE.md`.
+
 ### Docs
 
 - **#367 / §A36 — Docker bind-mount UID 65532 + colima caveat documented in README** (2026-05-23) —
