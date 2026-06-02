@@ -117,26 +117,61 @@ single upstream service don't want a wide-open tunnel.
 
 ## Install
 
-Pick the lowest-friction path for your machine. The Homebrew / prebuilt
-binary / Scoop / APT / RPM paths need **no Go toolchain** — install from
-source (the bottom of this section) only if you want to build it
-yourself.
+### go install (works today — no toolchain needed beyond Go ≥1.26)
 
-### Homebrew (macOS / Linux)
+```sh
+go install github.com/trsreagan3/gbounce/cmd/gbounce@latest
+
+# Verify:
+gbounce --version
+
+# If you get "command not found": $(go env GOPATH)/bin is not on PATH.
+# Stock Ubuntu (and most Linux distros) do NOT put ~/go/bin on PATH by default.
+export PATH="$PATH:$(go env GOPATH)/bin"
+# Persist: echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.bashrc
+```
+
+**Toolchain note:** `go.mod` specifies `go 1.26.0`. With `GOTOOLCHAIN=auto`
+(the default), Go downloads Go 1.26.x on first use. Air-gapped machines
+that pin `GOTOOLCHAIN=local` must have Go 1.26+ pre-installed.
+
+**Version stamp note:** `go install` does not carry ldflags, so
+`gbounce --version` will report `commit none, built unknown`. This is
+expected and does not affect functionality. Stamped binaries come from
+the tagged release artifacts.
+
+### From source (git clone + go build)
+
+```sh
+git clone https://github.com/trsreagan3/gbounce.git
+cd gbounce
+go build -o bin/gbounce ./cmd/gbounce
+./bin/gbounce --version
+# or: make install   (stamped build → $(go env GOPATH)/bin/gbounce)
+```
+
+### Available at launch (first tagged release)
+
+> The following paths require a tagged GitHub release with prebuilt
+> artifacts. They are configured but dormant — no tag has been pushed yet.
+> Run `goreleaser build --snapshot --clean` in the repo to validate the
+> build matrix locally.
+
+#### Homebrew (macOS / Linux)
 
 ```sh
 brew install trsreagan3/tap/gbounce
 gbounce --version
 ```
 
-(`trsreagan3/tap` is the [trsreagan3/homebrew-tap](https://github.com/trsreagan3/homebrew-tap)
-tap. `brew tap trsreagan3/tap` then `brew install gbounce` works too.)
+(`trsreagan3/tap` is [trsreagan3/homebrew-tap](https://github.com/trsreagan3/homebrew-tap).
+`brew tap trsreagan3/tap` then `brew install gbounce` works too.)
 
-### Prebuilt binary (no toolchain, any OS)
+#### Prebuilt binary (no toolchain, any OS)
 
 Download the archive for your OS/arch from the
 [Releases page](https://github.com/trsreagan3/gbounce/releases) —
-`gbounce_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) — unpack it,
+`gbounce_<version>_<os>_<arch>.tar.gz` — unpack it,
 and put the `gbounce` binary on your `PATH`:
 
 ```sh
@@ -150,7 +185,7 @@ gbounce --version
 
 Verify the download against `checksums.txt` on the same release.
 
-### Scoop (Windows)
+#### Scoop (Windows)
 
 ```powershell
 scoop bucket add trsreagan3 https://github.com/trsreagan3/scoop-bucket
@@ -158,7 +193,7 @@ scoop install trsreagan3/gbounce
 gbounce --version
 ```
 
-### APT / RPM (Debian / Ubuntu / Fedora / RHEL)
+#### APT / RPM (Debian / Ubuntu / Fedora / RHEL)
 
 Each release attaches a `.deb` + `.rpm` to the
 [Releases page](https://github.com/trsreagan3/gbounce/releases). gbounce
@@ -179,7 +214,7 @@ sudo rpm -i gbounce.rpm
 gbounce --version
 ```
 
-### Docker
+#### Docker
 
 ```sh
 docker pull ghcr.io/trsreagan3/gbounce:latest
