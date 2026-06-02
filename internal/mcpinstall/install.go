@@ -228,6 +228,12 @@ type Options struct {
 	Force  bool
 	Out    io.Writer
 	Stderr io.Writer
+
+	// DevinHost overrides the placeholder host:port in the
+	// install-devin recipe (HTTP_PROXY / HTTPS_PROXY target). Empty
+	// emits the <gbounce-host>:8080 placeholder + a substitute note.
+	// Unused by the JSON-merge installers.
+	DevinHost string
 }
 
 func (o *Options) defaults() {
@@ -258,6 +264,81 @@ func InstallCursor(opts Options) (*InstallResult, error) {
 		return nil, err
 	}
 	return installJSON(target, "cursor", opts)
+}
+
+// InstallDevin prints the Devin bouncer-wiring recipe. Unlike the
+// install-claude-code / install-cursor / install-codex paths, there is
+// NO local config to write: Devin is a cloud-hosted agent that runs in
+// Cognition's sandboxed environment, not on the operator's machine, so
+// a gbounce listener on 127.0.0.1 is NOT reachable from Devin's sandbox.
+//
+// Mirrors `ibounce mcp install-devin` ([[cross-product-agent-parity]]):
+// surface the limitation honestly per [[ibounce-honest-positioning]] and
+// emit the two supported wiring paths instead of silently degrading.
+//
+// PATH A — MCP server in Devin's task settings (paste `gbounce mcp
+//
+//	show-config` into the Devin UI) + a host-reachable gbounce proxy.
+//
+// PATH B — operator/CI sets HTTP_PROXY / HTTPS_PROXY in Devin's task
+//
+//	environment to the gbounce HOST address (not loopback) so Devin's
+//	outbound HTTP traffic routes through the proxy.
+//
+// The DevinHost option overrides the placeholder <gbounce-host>:<port>
+// (default loopback-with-a-note) so an operator can paste a concrete
+// reachable address; --devin-host is the corresponding CLI flag.
+func InstallDevin(opts Options) (*InstallResult, error) {
+	opts.defaults()
+
+	host := opts.DevinHost
+	noteSubstitute := false
+	if host == "" {
+		host = "<gbounce-host>:8080"
+		noteSubstitute = true
+	}
+	proxyURL := "http://" + host
+
+	res := &InstallResult{
+		Manual: true,
+		Reason: "Devin is a cloud-hosted agent — it runs in Cognition's " +
+			"sandboxed environment, not on your local machine, so there is " +
+			"no local config file for gbounce to write into. A gbounce " +
+			"listener on 127.0.0.1 is NOT reachable from Devin's sandbox; " +
+			"wire Devin to a gbounce host Devin can reach over the network.",
+	}
+
+	fmt.Fprintln(opts.Out, "Devin is a cloud-hosted agent — no local config to write.")
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, res.Reason)
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "PATH A: MCP server (when Devin's MCP support is enabled)")
+	fmt.Fprintln(opts.Out, "  1. In the Devin UI, go to Settings > MCP Servers.")
+	fmt.Fprintln(opts.Out, "  2. Add the snippet from `gbounce mcp show-config`.")
+	fmt.Fprintln(opts.Out, "  3. Set the proxy env vars in your Devin task environment (PATH B).")
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "PATH B: route Devin's HTTP traffic through a host-reachable gbounce")
+	fmt.Fprintln(opts.Out, "  1. Run gbounce on a host Devin can reach (NOT 127.0.0.1):")
+	fmt.Fprintln(opts.Out, "       gbounce run --allow-connect --host 0.0.0.0 --port 8080 \\")
+	fmt.Fprintln(opts.Out, "                   --i-know-this-binds-externally")
+	fmt.Fprintln(opts.Out, "  2. In the Devin UI, set task env vars:")
+	fmt.Fprintf(opts.Out, "       HTTP_PROXY=%s\n", proxyURL)
+	fmt.Fprintf(opts.Out, "       HTTPS_PROXY=%s\n", proxyURL)
+	fmt.Fprintln(opts.Out, "       NO_PROXY=localhost,127.0.0.1")
+	if noteSubstitute {
+		fmt.Fprintln(opts.Stderr,
+			"  [note] substitute <gbounce-host>:8080 above with your reachable "+
+				"gbounce host:port (pass --devin-host HOST:PORT to bake it in).")
+	}
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out,
+		"Full recipe: https://github.com/trsreagan3/iam-roles/blob/main/docs/HARNESS-RECIPES/devin.md\n"+
+			"Limitation: Devin runs in Cognition's cloud sandbox; gbounce must be "+
+			"on a host Devin can reach. A gbounce proxy on 127.0.0.1 is NOT visible "+
+			"to Devin's sandbox.")
+
+	res.Snippet = proxyURL
+	return res, nil
 }
 
 // InstallCodex installs into Codex.

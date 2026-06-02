@@ -145,6 +145,53 @@ func TestMcpInstall_EnvBlockNotEmpty_AllClients(t *testing.T) {
 	}
 }
 
+// TestInstallDevin_PrintsRecipeNoConfigWrite — parity with ibounce's
+// install-devin. Devin is a cloud agent, so the command prints a wiring
+// recipe (Manual=true) and writes NO local config file.
+func TestInstallDevin_PrintsRecipeNoConfigWrite(t *testing.T) {
+	out := &bytes.Buffer{}
+	errOut := &bytes.Buffer{}
+	res, err := InstallDevin(Options{Out: out, Stderr: errOut})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.True(t, res.Manual, "install-devin is a manual/recipe command")
+	assert.False(t, res.Created)
+	assert.False(t, res.Updated)
+
+	body := out.String()
+	// Honest cloud-agent limitation surfaced (no loopback).
+	assert.Contains(t, body, "cloud-hosted agent")
+	assert.Contains(t, body, "127.0.0.1")
+	// Both wiring paths present.
+	assert.Contains(t, body, "PATH A")
+	assert.Contains(t, body, "PATH B")
+	assert.Contains(t, body, "gbounce mcp show-config")
+	// Proxy env vars present with the default placeholder host.
+	assert.Contains(t, body, "HTTP_PROXY=http://<gbounce-host>:8080")
+	assert.Contains(t, body, "HTTPS_PROXY=http://<gbounce-host>:8080")
+	// Substitute note goes to stderr when no host supplied.
+	assert.Contains(t, errOut.String(), "--devin-host")
+}
+
+// TestInstallDevin_HonorsDevinHost — --devin-host bakes a concrete
+// reachable address into the printed proxy lines + suppresses the
+// substitute note.
+func TestInstallDevin_HonorsDevinHost(t *testing.T) {
+	out := &bytes.Buffer{}
+	errOut := &bytes.Buffer{}
+	res, err := InstallDevin(Options{DevinHost: "10.0.0.5:9090", Out: out, Stderr: errOut})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	body := out.String()
+	assert.Contains(t, body, "HTTP_PROXY=http://10.0.0.5:9090")
+	assert.Contains(t, body, "HTTPS_PROXY=http://10.0.0.5:9090")
+	assert.NotContains(t, body, "<gbounce-host>")
+	assert.NotContains(t, errOut.String(), "substitute",
+		"no placeholder note when a concrete host is given")
+	assert.Equal(t, "http://10.0.0.5:9090", res.Snippet)
+}
+
 func TestInstallClaudeCode_UpdateExisting(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "claude.json")
