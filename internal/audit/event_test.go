@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -144,6 +145,27 @@ func TestFromRequest_FieldShape(t *testing.T) {
 	}
 	if ext.Ext["latency_ms"] != int64(37) {
 		t.Errorf("ext.latency_ms = %v; want 37", ext.Ext["latency_ms"])
+	}
+}
+
+func TestFromRequest_ConnectResourceUIDNotDoubleConcatenated(t *testing.T) {
+	// UC5 regression: a CONNECT tunnel carries the host:port authority in
+	// Path. The old code built scheme://host + path, producing a malformed
+	// uid like "https://example.comexample.com:443". The uid must be the
+	// clean authority.
+	ev := FromRequest(RequestInput{
+		Method: "CONNECT", Path: "example.com:443",
+		UpstreamHost: "example.com", UpstreamPort: 443,
+	})
+	if len(ev.Resources) != 1 {
+		t.Fatalf("resources length = %d; want 1", len(ev.Resources))
+	}
+	uid := ev.Resources[0].UID
+	if uid != "example.com:443" {
+		t.Errorf("CONNECT resource uid = %q; want %q", uid, "example.com:443")
+	}
+	if strings.Contains(uid, "example.comexample.com") {
+		t.Errorf("uid is double-concatenated: %q", uid)
 	}
 }
 

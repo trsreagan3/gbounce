@@ -270,7 +270,7 @@ func (s *Server) serveMITMRequest(req *http.Request, clientConn io.Writer, host 
 		s.recordMITMRequest(req, host, port, startedAt, http.StatusBadGateway, 0, nil, false, false)
 		return
 	}
-	redactedReqBody, reqRedacted := mitm.RedactJSONBody(requestBodyBytes)
+	redactedReqBody, reqRedacted := mitm.RedactBody(req.Header.Get("Content-Type"), requestBodyBytes)
 
 	// #729 / BUILD-8 — hallucinated tool-call validator. Only runs on
 	// POST-like bodies (the wire shapes we recognize all live in JSON
