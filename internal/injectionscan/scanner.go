@@ -156,12 +156,20 @@ var highSignalRules = []Rule{
 	},
 	{
 		Name: "json-system-prompt-smuggle",
+		// NOTE: deliberately does NOT match a bare "instructions" key — that is
+		// an extremely common LEGITIMATE data field (task managers, workflows,
+		// recipes, DB rows), so matching it produced high-confidence false
+		// positives on ordinary tool responses (UAT FP-1). The
+		// injection-specific keys below are rarely legitimate response data;
+		// genuine injection CONTENT inside any field (incl. "instructions") is
+		// still caught by the content rules (canonical-injection-phrase,
+		// new-instructions, instruction-shape-imperative, etc.).
 		Pattern: regexp.MustCompile(
-			`(?is)[\{\[,]\s*"(system|system_prompt|instructions|developer)"\s*:\s*"`,
+			`(?is)[\{\[,]\s*"(system|system_prompt|developer)"\s*:\s*"`,
 		),
 		Severity: SeverityHigh,
 		Source:   "owasp-agentic-01",
-		Note:     "JSON key 'system' / 'system_prompt' / 'instructions'",
+		Note:     "JSON key 'system' / 'system_prompt' / 'developer' (system-prompt smuggle)",
 	},
 	{
 		Name: "exfil-imperative",
