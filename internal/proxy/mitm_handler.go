@@ -475,7 +475,7 @@ func (s *Server) recordMITMResponseWithInjectionFinding(
 			decisionID = id
 		}
 	}
-	if s.log != nil || s.recorder != nil {
+	if s.log != nil || s.recorder != nil || s.objectStorage != nil {
 		ev := audit.FromRequest(audit.RequestInput{
 			At:             row.At,
 			DecisionID:     decisionID,
@@ -719,7 +719,7 @@ func (s *Server) recordMITMRequest(req *http.Request, host string, port int, sta
 			decisionID = id
 		}
 	}
-	if s.log != nil || s.recorder != nil {
+	if s.log != nil || s.recorder != nil || s.objectStorage != nil {
 		ev := audit.FromRequest(audit.RequestInput{
 			At:             row.At,
 			DecisionID:     decisionID,
@@ -798,7 +798,7 @@ func (s *Server) recordMITMDeny(req *http.Request, host string, port int, starte
 			decisionID = id
 		}
 	}
-	if s.log != nil || s.recorder != nil {
+	if s.log != nil || s.recorder != nil || s.objectStorage != nil {
 		ev := audit.FromRequest(audit.RequestInput{
 			At:               row.At,
 			DecisionID:       decisionID,
@@ -863,7 +863,7 @@ func (s *Server) recordMITMHandshakeFailure(req *http.Request, host string, port
 			decisionID = id
 		}
 	}
-	if s.log != nil {
+	if s.log != nil || s.objectStorage != nil {
 		ev := audit.FromRequest(audit.RequestInput{
 			At:               row.At,
 			DecisionID:       decisionID,
@@ -881,8 +881,10 @@ func (s *Server) recordMITMHandshakeFailure(req *http.Request, host string, port
 			StatusIDOverride: audit.StatusFailure,
 			ExtraExt:         extras,
 		})
-		_ = s.log.Write(req.Context(), ev)
-		s.auditLogLastFiredUnixMs.Store(time.Now().UnixMilli())
+		if s.log != nil {
+			_ = s.log.Write(req.Context(), ev)
+			s.auditLogLastFiredUnixMs.Store(time.Now().UnixMilli())
+		}
 		// #317 — cloud-neutral S3-compat NDJSON object-storage writer.
 		if s.objectStorage != nil {
 			s.objectStorage.Write(req.Context(), ev)
@@ -1197,7 +1199,7 @@ func (s *Server) recordMITMResponseWithToolCallFinding(
 			decisionID = id
 		}
 	}
-	if s.log != nil || s.recorder != nil {
+	if s.log != nil || s.recorder != nil || s.objectStorage != nil {
 		ev := audit.FromRequest(audit.RequestInput{
 			At:             row.At,
 			DecisionID:     decisionID,

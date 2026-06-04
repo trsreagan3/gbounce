@@ -162,6 +162,13 @@ func newRootCmd() *cobra.Command {
 	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(newRunCmd())
 	root.AddCommand(newAuditCmd())
+	// Cross-bouncer commands — gbounce as the read-only suite anchor
+	// (founder decision 2026-06-04). Fan out to every bouncer's mgmt
+	// /audit/events; never control another bouncer.
+	root.AddCommand(newFlightRecorderCmd())
+	root.AddCommand(newComplianceMapCmd())
+	root.AddCommand(newDenyCmd())
+	root.AddCommand(newServiceCmd())
 	// #315 / §A13 — `gbounce ca {install,uninstall,info,rotate}` for the
 	// optional MITM mode. Default-off; operator opts in by installing the
 	// CA then running `gbounce run --mode mitm`.
@@ -239,6 +246,7 @@ func newRunCmd() *cobra.Command {
 		mgmtPort         int
 		mgmtHost         string
 		upstreamURL      string
+		runConfigPath    string
 		allowConnect     bool
 		dbPath           string
 		auditLogPath     string
@@ -289,6 +297,14 @@ func newRunCmd() *cobra.Command {
 		// parse-time rejection rules.
 		denyHosts     []string
 		denyHostsFile string
+		// UI-only display filter: hosts whose events are HIDDEN from the
+		// /audit/events UI view (e.g. telemetry like *.datadoghq.com that
+		// is environmental noise, not the operator's agent traffic). This
+		// is DISPLAY-ONLY — it never affects gating/forwarding, and the
+		// full audit log still records everything. Repeatable flag +
+		// GBOUNCE_UI_EXCLUDE_HOSTS env (comma-separated). Glob via
+		// path.Match against the port-stripped hostname.
+		uiExcludeHosts []string
 		// #324d — dynamic-deny YAML path. Operator override of the
 		// default `~/.iam-jit/dynamic-denies.yaml`. Empty string falls
 		// back to the default. Per [[cross-product-agent-parity]] the
@@ -354,6 +370,35 @@ pass --i-know-this-binds-externally to acknowledge the threat model.
 Management endpoint: /healthz lives on a SEPARATE port (default 8769)
 so liveness probes never touch the proxy data path.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Persistent operator config (~/.gbounce/config.yaml or
+			// $GBOUNCE_CONFIG) — loaded FIRST as defaults so settings survive
+			// a restart. A value here is overridden by an explicitly-set flag
+			// (Flags().Changed) and by an active --preset; a missing file is a
+			// no-op. This is what makes e.g. --ui-exclude-host durable.
+			cfgPath := runConfigPath
+			if cfgPath == "" {
+				cfgPath = DefaultRunConfigPath()
+			}
+			if rc, found, err := LoadRunConfig(cfgPath); err != nil {
+				return fmt.Errorf("gbounce: %w", err)
+			} else if found {
+				mode = resolveString(cmd.Flags().Changed("mode"), rc.Mode, mode)
+				allowConnect = resolveBool(cmd.Flags().Changed("allow-connect"), rc.AllowConnect, allowConnect)
+				auditLogPath = resolveString(cmd.Flags().Changed("audit-log-path"), rc.AuditLogPath, auditLogPath)
+				uiExcludeHosts = resolveStringSlice(cmd.Flags().Changed("ui-exclude-host"), rc.UIExcludeHosts, uiExcludeHosts)
+				denyHosts = resolveStringSlice(cmd.Flags().Changed("deny-host"), rc.DenyHosts, denyHosts)
+				if obj := rc.AuditObjectStorage; obj != nil {
+					auditObjectStorageEndpoint = resolveString(cmd.Flags().Changed("audit-object-storage-endpoint"), obj.Endpoint, auditObjectStorageEndpoint)
+					auditObjectStorageBucket = resolveString(cmd.Flags().Changed("audit-object-storage-bucket"), obj.Bucket, auditObjectStorageBucket)
+					auditObjectStoragePrefix = resolveString(cmd.Flags().Changed("audit-object-storage-prefix"), obj.Prefix, auditObjectStoragePrefix)
+					auditObjectStorageRegion = resolveString(cmd.Flags().Changed("audit-object-storage-region"), obj.Region, auditObjectStorageRegion)
+					auditObjectStorageCredentialsFile = resolveString(cmd.Flags().Changed("audit-object-storage-credentials-file"), obj.CredentialsFile, auditObjectStorageCredentialsFile)
+					auditObjectStorageRotationMinutes = resolveInt(cmd.Flags().Changed("audit-object-storage-rotation-minutes"), obj.RotationMinutes, auditObjectStorageRotationMinutes)
+					auditObjectStorageMaxSizeMB = resolveInt(cmd.Flags().Changed("audit-object-storage-max-size-mb"), obj.MaxSizeMB, auditObjectStorageMaxSizeMB)
+					auditObjectStorageInstanceID = resolveString(cmd.Flags().Changed("audit-object-storage-instance-id"), obj.InstanceID, auditObjectStorageInstanceID)
+				}
+			}
+
 			// #254 — deployment preset resolution. Runs BEFORE mode
 			// validation so the preset-resolved values flow through.
 			// HARD-override conflicts (e.g. --preset security-observe
@@ -643,6 +688,18 @@ so liveness probes never touch the proxy data path.`,
 			if activeProfileName == "" {
 				activeProfileName = os.Getenv("GBOUNCE_PROFILE")
 			}
+
+			// UI display-only host-exclude list: union of the repeatable
+			// --ui-exclude-host flag and the GBOUNCE_UI_EXCLUDE_HOSTS env
+			// (comma-separated). Kept in config — NOT hardcoded — because
+			// telemetry hostnames (e.g. Datadog's region-specific intake)
+			// change without notice. DISPLAY-ONLY: never touches gating.
+			uiExcludeHostsMerged := append([]string(nil), uiExcludeHosts...)
+			for _, h := range strings.Split(os.Getenv("GBOUNCE_UI_EXCLUDE_HOSTS"), ",") {
+				if h = strings.TrimSpace(h); h != "" {
+					uiExcludeHostsMerged = append(uiExcludeHostsMerged, h)
+				}
+			}
 			var activeProfile *profile.Profile
 			if activeProfileName != "" {
 				resolvedProfilesPath := profilesPath
@@ -769,6 +826,7 @@ so liveness probes never touch the proxy data path.`,
 				AuditLogPath:           auditLogPath,
 				AuditLogFsync:          auditLogFsync,
 				AuditEventsToken:       auditEventsToken,
+				UIExcludeHosts:         uiExcludeHostsMerged,
 				Mode:                   cfgMode,
 				MITMCertMinter:         mitmMinter,
 				MITMRules:              mitmRules,
@@ -968,10 +1026,10 @@ so liveness probes never touch the proxy data path.`,
 			// enforcement means blocking IS happening, so the caveat would
 			// be inaccurate and confusing.
 			for _, line := range caveats.BannerLines(caveats.Trigger{
-				DiscoveryMode:     cfg.Mode == proxy.ModeDiscovery,
-				AllowConnect:      allowConnect,
-				MITMMode:          cfg.Mode == proxy.ModeMITM,
-				AnomalyBlockMode:  anomalyBlockModeArmed,
+				DiscoveryMode:    cfg.Mode == proxy.ModeDiscovery,
+				AllowConnect:     allowConnect,
+				MITMMode:         cfg.Mode == proxy.ModeMITM,
+				AnomalyBlockMode: anomalyBlockModeArmed,
 			}) {
 				fmt.Fprintln(cmd.OutOrStdout(), line)
 			}
@@ -983,6 +1041,7 @@ so liveness probes never touch the proxy data path.`,
 	cmd.Flags().IntVar(&mgmtPort, "mgmt-port", 8769, "management (/healthz) listener port")
 	cmd.Flags().StringVar(&mgmtHost, "mgmt-host", "127.0.0.1", "management listener host")
 	cmd.Flags().StringVar(&upstreamURL, "upstream", "", "upstream URL to forward to (e.g. https://api.target.com)")
+	cmd.Flags().StringVar(&runConfigPath, "config", "", "persistent run-config YAML loaded at startup so settings survive restarts (default $GBOUNCE_CONFIG or ~/.gbounce/config.yaml). Explicit flags + env override file values; a missing file is a no-op.")
 	cmd.Flags().BoolVar(&allowConnect, "allow-connect", false, "accept HTTP CONNECT verbs for HTTPS tunneling (TLS passthrough; no MITM)")
 	cmd.Flags().StringVar(&dbPath, "db", "", "SQLite audit DB path (default ~/.gbounce/state.db; honors GBOUNCE_DB)")
 	cmd.Flags().StringVar(&auditLogPath, "audit-log-path", "", "also append OCSF events to this JSONL file (opt-in)")
@@ -1060,6 +1119,10 @@ so liveness probes never touch the proxy data path.`,
 			"the audit log. MITM is OPT-IN; cert-pinning SDKs will break "+
 			"under it (`gbounce ca info` shows the installed CA).")
 	cmd.Flags().StringVar(&auditEventsToken, "audit-events-token", "", "bearer token required for GET /audit/events when the mgmt port is bound externally; empty = loopback-only (no auth)")
+	cmd.Flags().StringArrayVar(&uiExcludeHosts, "ui-exclude-host", nil,
+		"DISPLAY-ONLY: hide events for this host from the /audit/events UI view (repeatable; glob via path.Match against the port-stripped hostname, e.g. '*.datadoghq.com'). "+
+			"For environmental telemetry noise (Datadog, etc.) that isn't your agent traffic. Never affects gating/forwarding; the full audit log still records everything. "+
+			"Also settable via GBOUNCE_UI_EXCLUDE_HOSTS (comma-separated).")
 	// #315 / §A13 — MITM-mode flags.
 	cmd.Flags().BoolVar(&auditLogIncludeBodies, "audit-log-include-bodies", false,
 		"#315 — store the REDACTED request-body snapshot in the audit "+
@@ -1225,6 +1288,7 @@ func newAuditCmd() *cobra.Command {
 		Short: "Inspect the local decision audit log",
 	}
 	cmd.AddCommand(newAuditTailCmd())
+	cmd.AddCommand(newAuditQueryCmd())
 	return cmd
 }
 

@@ -302,6 +302,13 @@ main { padding: 18px; }
 <main>
 <div class="grid" id="grid"></div>
 </main>
+<div style="max-width:1100px;margin:6px auto 0;padding:0 20px;">
+  <div style="color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;">suite-wide views &mdash; gbounce anchor (read-only aggregation)</div>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;">
+    <a href="/cross" style="background:var(--panel);border:1px solid #2a2f3a;border-radius:8px;padding:10px 14px;text-decoration:none;color:var(--accent);font-size:13px;">cross-bouncer activity &rarr;</a>
+    <a href="/compliance" style="background:var(--panel);border:1px solid #2a2f3a;border-radius:8px;padding:10px 14px;text-decoration:none;color:var(--accent);font-size:13px;">compliance coverage &rarr;</a>
+  </div>
+</div>
 <div class="config-link">
   <a href="#" id="configure-ports">configure ports</a>
 </div>

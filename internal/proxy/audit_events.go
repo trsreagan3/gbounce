@@ -37,8 +37,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -71,7 +73,7 @@ const AuditEventsFormatOCSFBundle = "ocsf-bundle"
 // Pass requireBearer = "" to allow unauthenticated requests (loopback
 // mode); pass a non-empty token to require an Authorization header
 // match (external-bind mode).
-func auditEventsHandler(st *store.Store, requireBearer string) http.HandlerFunc {
+func auditEventsHandler(st *store.Store, requireBearer string, uiExcludeHosts []string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeAuditError(w, http.StatusMethodNotAllowed,
@@ -119,6 +121,13 @@ func auditEventsHandler(st *store.Store, requireBearer string) http.HandlerFunc 
 			return
 		}
 		events := rowsToAuditEvents(rows)
+		// DISPLAY-ONLY de-noise: drop events whose destination host matches
+		// an operator-configured exclude glob (e.g. "*.datadoghq.com"
+		// telemetry). This happens HERE, in the UI-serving read path — the
+		// proxy's gating/forwarding decisions never consult this list, and
+		// the persisted audit log already recorded every event. So the worst
+		// case is hiding a real event from the view, never blocking traffic.
+		events = applyUIExcludeHosts(events, uiExcludeHosts)
 		events = applyAuditEventsTimeBounds(events, opts.since, opts.until)
 		if len(opts.filters) > 0 {
 			kept := make([]audit.Event, 0, len(events))
@@ -159,6 +168,60 @@ func auditEventsHandler(st *store.Store, requireBearer string) http.HandlerFunc 
 			_ = enc.Encode(bundle)
 		}
 	}
+}
+
+// applyUIExcludeHosts returns events minus those whose destination host
+// matches one of the exclude globs. DISPLAY-ONLY (see the call site): this
+// runs in the UI read path and never affects gating/forwarding. Empty list
+// is a no-op.
+func applyUIExcludeHosts(events []audit.Event, excludeHosts []string) []audit.Event {
+	if len(excludeHosts) == 0 {
+		return events
+	}
+	kept := make([]audit.Event, 0, len(events))
+	for _, ev := range events {
+		if hostExcludedFromUI(ev, excludeHosts) {
+			continue
+		}
+		kept = append(kept, ev)
+	}
+	return kept
+}
+
+// hostExcludedFromUI reports whether the event's destination host matches any
+// exclude glob. The host is taken from dst_endpoint.hostname with any :port
+// stripped (CONNECT tunnels carry host:port), so "*.datadoghq.com" matches
+// "http-intake.logs.us5.datadoghq.com:443". Matching is case-insensitive;
+// an exact-string compare backstops a glob that path.Match can't parse, so a
+// malformed pattern can never silently swallow unrelated traffic.
+func hostExcludedFromUI(ev audit.Event, excludeHosts []string) bool {
+	if ev.DstEndpoint == nil {
+		return false
+	}
+	host := ev.DstEndpoint.Hostname
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
+	}
+	for _, pat := range excludeHosts {
+		pat = strings.ToLower(strings.TrimSpace(pat))
+		if pat == "" {
+			continue
+		}
+		if pat == host {
+			return true
+		}
+		if ok, err := path.Match(pat, host); err == nil && ok {
+			return true
+		}
+	}
+	return false
 }
 
 // auditEventsOpts holds the parsed query-string state. Internal to
@@ -328,22 +391,22 @@ func rowsToAuditEvents(rows []store.DecisionRow) []audit.Event {
 // events as an inline list. Same shape `gbounce audit tail --export
 // ocsf-bundle` produces, just streamed back to the HTTP caller.
 type auditEventsBundle struct {
-	Metadata     map[string]any  `json:"metadata"`
-	Time         int64           `json:"time"`
-	ClassUID     int             `json:"class_uid"`
-	ClassName    string          `json:"class_name"`
-	CategoryUID  int             `json:"category_uid"`
-	CategoryName string          `json:"category_name"`
-	ActivityID   int             `json:"activity_id"`
-	ActivityName string          `json:"activity_name"`
-	TypeUID      int             `json:"type_uid"`
-	TypeName     string          `json:"type_name"`
-	SeverityID   int             `json:"severity_id"`
-	Severity     string          `json:"severity"`
-	StatusID     int             `json:"status_id"`
-	Status       string          `json:"status"`
-	FindingInfo  map[string]any  `json:"finding_info"`
-	Events       []audit.Event   `json:"events"`
+	Metadata     map[string]any `json:"metadata"`
+	Time         int64          `json:"time"`
+	ClassUID     int            `json:"class_uid"`
+	ClassName    string         `json:"class_name"`
+	CategoryUID  int            `json:"category_uid"`
+	CategoryName string         `json:"category_name"`
+	ActivityID   int            `json:"activity_id"`
+	ActivityName string         `json:"activity_name"`
+	TypeUID      int            `json:"type_uid"`
+	TypeName     string         `json:"type_name"`
+	SeverityID   int            `json:"severity_id"`
+	Severity     string         `json:"severity"`
+	StatusID     int            `json:"status_id"`
+	Status       string         `json:"status"`
+	FindingInfo  map[string]any `json:"finding_info"`
+	Events       []audit.Event  `json:"events"`
 }
 
 // buildAuditEventsBundle wraps a slice of events as one OCSF Detection

@@ -53,6 +53,7 @@ import (
 
 	"github.com/trsreagan3/gbounce/internal/anomaly"
 	"github.com/trsreagan3/gbounce/internal/audit"
+	"github.com/trsreagan3/gbounce/internal/crossbouncer"
 	"github.com/trsreagan3/gbounce/internal/dynamicdeny"
 	"github.com/trsreagan3/gbounce/internal/mitm"
 	"github.com/trsreagan3/gbounce/internal/profile"
@@ -141,6 +142,15 @@ type Config struct {
 	// itself a trust anchor). Empty + external-bound: the constructor
 	// refuses to start.
 	AuditEventsToken string
+	// UIExcludeHosts is a DISPLAY-ONLY filter: events whose destination
+	// hostname matches one of these globs are hidden from the
+	// GET /audit/events UI view (e.g. "*.datadoghq.com" telemetry that is
+	// environmental noise, not the operator's agent traffic). This NEVER
+	// affects gating/forwarding and the full audit log still records every
+	// event — it only de-noises the live UI. Matched via path.Match
+	// against the port-stripped hostname. Operator-configured (flag/env),
+	// not hardcoded, because telemetry hostnames change.
+	UIExcludeHosts []string
 	// Mode: G-Slice 1 only supports ModeDiscovery.
 	Mode Mode
 	// DenyHosts — #314 / §A12. Operator-written deny-list entries
@@ -240,9 +250,9 @@ func (c Config) Normalize() Config {
 // Server is the gbounce proxy server. Wraps the inbound HTTP listener
 // + the management HTTP listener + the audit sinks.
 type Server struct {
-	cfg     Config
-	store   *store.Store
-	log     *audit.LogWriter
+	cfg   Config
+	store *store.Store
+	log   *audit.LogWriter
 	// #285 — optional per-session NDJSON recorder. Nil disables the
 	// channel. When wired, every audit event is teed to
 	// {dir}/{agent.session_id}.ndjson via Recorder.Record. Fail-soft
@@ -270,7 +280,7 @@ type Server struct {
 	anomalyMu     sync.Mutex
 	anomalyRecent []map[string]any
 	httpSrv       *http.Server
-	mgmtSrv  *http.Server
+	mgmtSrv       *http.Server
 	// upstreamURL is the parsed cfg.UpstreamURL, kept as *url.URL so
 	// each request avoids re-parsing.
 	upstreamURL *url.URL
@@ -341,9 +351,9 @@ type Server struct {
 	// Each is bumped from the MITM response path when the scanner's
 	// decided action (post-profile-config reconciliation) is the
 	// matching mode. Surfaced via /admin/stats.
-	totalInjectionScanWarns   atomic.Int64
-	totalInjectionScanStrips  atomic.Int64
-	totalInjectionScanDenies  atomic.Int64
+	totalInjectionScanWarns  atomic.Int64
+	totalInjectionScanStrips atomic.Int64
+	totalInjectionScanDenies atomic.Int64
 
 	// #729 / BUILD-8 — hallucinated tool-call validator counters.
 	// Bumped from the MITM request path when the validator's decided
@@ -364,21 +374,21 @@ type Server struct {
 	processStartedUnixMs atomic.Int64
 	// Per-feature last-fired timestamps (unix ms). Zero = never fired
 	// since process start.
-	mitmLastFiredUnixMs                atomic.Int64
-	mitmLastError                      atomic.Value // string
-	totalMITMIntercepted               atomic.Int64
-	denyHostsLastFiredUnixMs           atomic.Int64
-	dynamicDenyLastFiredUnixMs         atomic.Int64
-	injectionScanLastFiredUnixMs       atomic.Int64
-	toolCallValidatorLastFiredUnixMs   atomic.Int64
-	profileEnforcementLastFiredUnixMs  atomic.Int64
-	auditLogLastFiredUnixMs            atomic.Int64
-	sessionRecorderLastFiredUnixMs     atomic.Int64
-	sessionRecorderFireCount           atomic.Int64
-	objectStorageLastFiredUnixMs       atomic.Int64
-	objectStorageFireCount             atomic.Int64
-	diskPressureLastFiredUnixMs        atomic.Int64
-	diskPressureFireCount              atomic.Int64
+	mitmLastFiredUnixMs               atomic.Int64
+	mitmLastError                     atomic.Value // string
+	totalMITMIntercepted              atomic.Int64
+	denyHostsLastFiredUnixMs          atomic.Int64
+	dynamicDenyLastFiredUnixMs        atomic.Int64
+	injectionScanLastFiredUnixMs      atomic.Int64
+	toolCallValidatorLastFiredUnixMs  atomic.Int64
+	profileEnforcementLastFiredUnixMs atomic.Int64
+	auditLogLastFiredUnixMs           atomic.Int64
+	sessionRecorderLastFiredUnixMs    atomic.Int64
+	sessionRecorderFireCount          atomic.Int64
+	objectStorageLastFiredUnixMs      atomic.Int64
+	objectStorageFireCount            atomic.Int64
+	diskPressureLastFiredUnixMs       atomic.Int64
+	diskPressureFireCount             atomic.Int64
 }
 
 // NewServer builds a Server from the given Config + Store. Caller
@@ -485,7 +495,17 @@ func NewServer(cfg Config, st *store.Store, lw *audit.LogWriter, sr *audit.Sessi
 	// the cross-bouncer `iam-jit audit query` CLI calls this endpoint
 	// in parallel against each reachable bouncer to produce a single
 	// merged stream.
-	mgmtMux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken))
+	mgmtMux.HandleFunc("/audit/events", auditEventsHandler(st, cfg.AuditEventsToken, cfg.UIExcludeHosts))
+	// Cross-bouncer aggregator (read-only): fans out to every bouncer's
+	// /audit/events + merges into one stream. gbounce is the suite anchor for
+	// non-AWS shared functionality (founder decision 2026-06-04); it only
+	// READS each bouncer's mgmt endpoint, never controls another bouncer.
+	mgmtMux.HandleFunc("/cross/events", crossEventsHandler(cfg.AuditEventsToken, crossbouncer.DefaultEndpoints(false), nil))
+	mgmtMux.HandleFunc("/cross", crossDashboardHandler())
+	// CSO compliance coverage view — framework controls exercised by recent
+	// cross-bouncer activity (the compliance-without-extra-licenses angle).
+	mgmtMux.HandleFunc("/compliance/overlay", complianceOverlayHandler(cfg.AuditEventsToken, crossbouncer.DefaultEndpoints(false), nil))
+	mgmtMux.HandleFunc("/compliance", complianceDashboardHandler())
 	// #324d — POST /admin/dynamic-denies/reload triggers an immediate
 	// reload of the dynamic-deny YAML from disk. Useful for the
 	// cross-bouncer fan-out CLI (#324e), which will write the YAML
@@ -1718,7 +1738,7 @@ func (s *Server) recordWith(r *http.Request, startedAt time.Time, status int, re
 			decisionID = id
 		}
 	}
-	if s.log != nil || s.recorder != nil {
+	if s.log != nil || s.recorder != nil || s.objectStorage != nil {
 		// #285 — agent session context from inbound headers. Empty is
 		// fine; the recorder drops events without a session_id (raw
 		// curl / unknown caller). When a client (Claude Code, Cursor,
@@ -1957,7 +1977,7 @@ func writeStructuredDeny403(w http.ResponseWriter, r *http.Request, rule *DenyHo
 	body := map[string]any{
 		// Legacy keys (preserved per [[creates-never-mutates]] so old
 		// SDK clients + scripts grepping on `error` keep working).
-		"error":           legacyMsg,
+		"error":            legacyMsg,
 		"decision_verdict": "deny",
 		"decision_reason":  legacyMsg,
 		// #459 — structured-deny additive fields.

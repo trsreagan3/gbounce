@@ -86,7 +86,7 @@ func seedAuditEventsStore(t *testing.T) *store.Store {
 func newAuditEventsTestServer(t *testing.T, requireToken string) (*httptest.Server, *store.Store) {
 	t.Helper()
 	st := seedAuditEventsStore(t)
-	srv := httptest.NewServer(auditEventsHandler(st, requireToken))
+	srv := httptest.NewServer(auditEventsHandler(st, requireToken, nil))
 	t.Cleanup(srv.Close)
 	return srv, st
 }
@@ -464,7 +464,7 @@ func TestAuditEvents_HTTPSurfaceShowsAgentR302(t *testing.T) {
 	if _, err := st.RecordDecision(row); err != nil {
 		t.Fatalf("RecordDecision: %v", err)
 	}
-	srv := httptest.NewServer(auditEventsHandler(st, ""))
+	srv := httptest.NewServer(auditEventsHandler(st, "", nil))
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "?limit=10")
 	if err != nil {
