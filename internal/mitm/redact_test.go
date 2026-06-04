@@ -113,6 +113,41 @@ func TestRedactQueryParams_SecretsStripped(t *testing.T) {
 	}
 }
 
+// TestRedactBody_FormEncodedCredentialsStripped is the NUC-C regression:
+// form-encoded bodies previously leaked credentials verbatim because only
+// JSON bodies were redacted. RedactBody must strip credential-shape k=v pairs.
+func TestRedactBody_FormEncodedCredentialsStripped(t *testing.T) {
+	body := []byte("ssn=123-45-6789&password=hunter2&api_key=sk-secret&email=a@b.com")
+	out, changed := RedactBody("application/x-www-form-urlencoded", body)
+	if !changed {
+		t.Fatalf("form body with credentials not marked changed")
+	}
+	s := string(out)
+	if strings.Contains(s, "hunter2") {
+		t.Errorf("password value LEAKED in form body: %q", s)
+	}
+	if strings.Contains(s, "sk-secret") {
+		t.Errorf("api_key value LEAKED in form body: %q", s)
+	}
+	// Non-credential fields preserved (PII redaction is out of scope / BETA).
+	if !strings.Contains(s, "ssn=123-45-6789") {
+		t.Errorf("non-credential field unexpectedly altered: %q", s)
+	}
+	// Charset param in Content-Type must not defeat detection.
+	out2, changed2 := RedactBody("application/x-www-form-urlencoded; charset=utf-8", body)
+	if !changed2 || strings.Contains(string(out2), "hunter2") {
+		t.Errorf("charset-suffixed content-type not handled: %q", out2)
+	}
+}
+
+// TestRedactBody_JSONStillRedacted confirms the JSON path is unchanged.
+func TestRedactBody_JSONStillRedacted(t *testing.T) {
+	out, changed := RedactBody("application/json", []byte(`{"password":"hunter2","x":1}`))
+	if !changed || strings.Contains(string(out), "hunter2") {
+		t.Errorf("JSON body password not redacted: %q", out)
+	}
+}
+
 // TestIsRedactedHeader_KnownNames sanity-checks the known list.
 func TestIsRedactedHeader_KnownNames(t *testing.T) {
 	known := []string{

@@ -221,6 +221,26 @@ func isCredentialFieldName(name string) bool {
 	return false
 }
 
+// RedactBody redacts credential-shape fields from a captured body, choosing
+// the strategy by Content-Type. JSON bodies match by field name;
+// application/x-www-form-urlencoded bodies use the same k=v matching as query
+// params. Previously ALL bodies went through RedactJSONBody, which returns
+// non-JSON unchanged — so form-encoded credentials (e.g. `password=hunter2`)
+// leaked verbatim into the audit snapshot. This dispatcher closes that gap.
+func RedactBody(contentType string, body []byte) ([]byte, bool) {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	if ct == "application/x-www-form-urlencoded" {
+		redacted, changed := RedactQueryParams(string(body))
+		return []byte(redacted), changed
+	}
+	// Default: treat as JSON. RedactJSONBody returns the body unchanged for
+	// non-JSON content, preserving prior behavior for other types.
+	return RedactJSONBody(body)
+}
+
 // RedactQueryParams rewrites credential-shape query-param VALUES in
 // place. Returns the redacted string + a boolean reporting whether
 // anything was rewritten. Input is the raw query string (no leading

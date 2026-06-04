@@ -717,6 +717,24 @@ func buildResources(in RequestInput) []OCSFResource {
 	if in.Path == "" && in.UpstreamHost == "" {
 		return []OCSFResource{}
 	}
+	// CONNECT tunnels carry the "host:port" authority in Path — there is no
+	// URL path (TLS passthrough means we never see one). Use the authority
+	// directly as name + uid. Building scheme://host + path for CONNECT
+	// double-concatenated the host (uid="https://example.comexample.com:443").
+	if strings.EqualFold(in.Method, "CONNECT") {
+		authority := in.Path
+		if authority == "" {
+			authority = in.UpstreamHost
+			if in.UpstreamPort != 0 {
+				authority = in.UpstreamHost + ":" + strconv.Itoa(in.UpstreamPort)
+			}
+		}
+		return []OCSFResource{{
+			Name: authority,
+			UID:  authority,
+			Type: "http resource",
+		}}
+	}
 	scheme := in.UpstreamScheme
 	if scheme == "" {
 		scheme = "https"
