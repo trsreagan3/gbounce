@@ -31,6 +31,9 @@ package mitm
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"strings"
 )
@@ -228,17 +231,76 @@ func isCredentialFieldName(name string) bool {
 // non-JSON unchanged — so form-encoded credentials (e.g. `password=hunter2`)
 // leaked verbatim into the audit snapshot. This dispatcher closes that gap.
 func RedactBody(contentType string, body []byte) ([]byte, bool) {
-	ct := strings.ToLower(strings.TrimSpace(contentType))
-	if i := strings.IndexByte(ct, ';'); i >= 0 {
-		ct = strings.TrimSpace(ct[:i])
+	// Parse the media type (keeps params like the multipart boundary).
+	mt, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mt = strings.ToLower(strings.TrimSpace(contentType))
+		if i := strings.IndexByte(mt, ';'); i >= 0 {
+			mt = strings.TrimSpace(mt[:i])
+		}
 	}
-	if ct == "application/x-www-form-urlencoded" {
+	switch strings.ToLower(mt) {
+	case "application/x-www-form-urlencoded":
 		redacted, changed := RedactQueryParams(string(body))
 		return []byte(redacted), changed
+	case "multipart/form-data":
+		// multipart bodies (file uploads, legacy auth flows) can carry
+		// credential-named fields; the JSON walk leaves them verbatim →
+		// leak. Redact credential parts; never store file-part contents.
+		return redactMultipartBody(body, params["boundary"])
+	default:
+		// Default: treat as JSON. RedactJSONBody returns the body unchanged
+		// for non-JSON content, preserving prior behavior for other types.
+		return RedactJSONBody(body)
 	}
-	// Default: treat as JSON. RedactJSONBody returns the body unchanged for
-	// non-JSON content, preserving prior behavior for other types.
-	return RedactJSONBody(body)
+}
+
+// _maxMultipartFieldSnapshot bounds how much of a single non-file part value
+// we read into the audit snapshot (defense against a huge text field).
+const _maxMultipartFieldSnapshot = 64 * 1024
+
+// redactMultipartBody rewrites a multipart/form-data body into a compact,
+// credential-safe audit representation (`name=value&name=value`): credential-
+// shape fields are replaced with the sentinel, FILE parts are recorded by
+// name only (their contents are NEVER snapshotted), and a body we cannot
+// parse is SUPPRESSED with a marker so a raw secret can never reach the JSONL.
+// Returns (snapshot, anyCredentialRedacted).
+func redactMultipartBody(body []byte, boundary string) ([]byte, bool) {
+	if boundary == "" {
+		return []byte("***MULTIPART-BODY-SUPPRESSED (no boundary; credential-safe redaction unavailable)***"), true
+	}
+	r := multipart.NewReader(bytes.NewReader(body), boundary)
+	var parts []string
+	redactedAny := false
+	for {
+		p, perr := r.NextPart()
+		if perr == io.EOF {
+			break
+		}
+		if perr != nil {
+			// Malformed — never store the raw body; suppress.
+			return []byte("***MULTIPART-BODY-SUPPRESSED (parse error; credential-safe redaction unavailable)***"), true
+		}
+		name := p.FormName()
+		if name == "" {
+			name = p.FileName()
+		}
+		if fn := p.FileName(); fn != "" {
+			// File upload — record presence only, never the bytes.
+			parts = append(parts, name+"=[file:"+fn+"]")
+			_ = p.Close()
+			continue
+		}
+		val, _ := io.ReadAll(io.LimitReader(p, _maxMultipartFieldSnapshot))
+		_ = p.Close()
+		if isCredentialFieldName(name) {
+			parts = append(parts, name+"="+RedactedValue)
+			redactedAny = true
+		} else {
+			parts = append(parts, name+"="+string(val))
+		}
+	}
+	return []byte(strings.Join(parts, "&")), redactedAny
 }
 
 // RedactQueryParams rewrites credential-shape query-param VALUES in
