@@ -1,10 +1,54 @@
 package mitm
 
 import (
+	"bytes"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"testing"
 )
+
+// TestRedactBody_MultipartCredentialsStripped is the UAT-final regression:
+// multipart/form-data bodies previously leaked credential-named fields verbatim
+// into the audit snapshot (RedactBody fell through to the JSON walk). They must
+// now be redacted, and file-part contents must never be snapshotted.
+func TestRedactBody_MultipartCredentialsStripped(t *testing.T) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("username", "testuser")
+	_ = w.WriteField("password", "hunter2")
+	_ = w.WriteField("api_key", "sk-secret")
+	fw, _ := w.CreateFormFile("upload", "secrets.bin")
+	_, _ = fw.Write([]byte("BINARY-SECRET-FILE-CONTENT"))
+	_ = w.Close()
+
+	out, changed := RedactBody(w.FormDataContentType(), buf.Bytes())
+	s := string(out)
+	if !changed {
+		t.Fatalf("multipart with credentials not marked changed")
+	}
+	if strings.Contains(s, "hunter2") {
+		t.Errorf("password LEAKED in multipart snapshot: %q", s)
+	}
+	if strings.Contains(s, "sk-secret") {
+		t.Errorf("api_key LEAKED in multipart snapshot: %q", s)
+	}
+	if strings.Contains(s, "BINARY-SECRET-FILE-CONTENT") {
+		t.Errorf("file-part CONTENT leaked into snapshot: %q", s)
+	}
+	if !strings.Contains(s, "username=testuser") {
+		t.Errorf("non-credential field unexpectedly altered: %q", s)
+	}
+}
+
+func TestRedactBody_MultipartNoBoundarySuppressed(t *testing.T) {
+	// A multipart content-type with no boundary must be SUPPRESSED, never
+	// stored raw (we can't locate fields to redact).
+	out, changed := RedactBody("multipart/form-data", []byte("password=hunter2 raw"))
+	if !changed || strings.Contains(string(out), "hunter2") {
+		t.Errorf("no-boundary multipart must be suppressed; got %q", out)
+	}
+}
 
 // TestMITM_BodyRedactionMasksAuthorizationHeader (spec test): the
 // Authorization header value is replaced with the sentinel string.
