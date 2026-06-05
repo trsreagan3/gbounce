@@ -379,9 +379,11 @@ so liveness probes never touch the proxy data path.`,
 			if cfgPath == "" {
 				cfgPath = DefaultRunConfigPath()
 			}
+			var persistedAnomaly *RunConfigAnomaly
 			if rc, found, err := LoadRunConfig(cfgPath); err != nil {
 				return fmt.Errorf("gbounce: %w", err)
 			} else if found {
+				persistedAnomaly = rc.Anomaly
 				mode = resolveString(cmd.Flags().Changed("mode"), rc.Mode, mode)
 				allowConnect = resolveBool(cmd.Flags().Changed("allow-connect"), rc.AllowConnect, allowConnect)
 				auditLogPath = resolveString(cmd.Flags().Changed("audit-log-path"), rc.AuditLogPath, auditLogPath)
@@ -867,6 +869,16 @@ so liveness probes never touch the proxy data path.`,
 			acfg, aerr := proxy.AnomalyConfigFromEnv()
 			if aerr != nil {
 				return fmt.Errorf("anomaly_detection config: %w", aerr)
+			}
+			// env WINS; fall back to the persisted ~/.gbounce/config.yaml
+			// anomaly_detection block so an operator enables it once
+			// instead of exporting the env var every run.
+			if !acfg.Enabled && persistedAnomaly != nil && persistedAnomaly.Enabled {
+				acfg, aerr = proxy.AnomalyConfigFromValues(true, persistedAnomaly.Mode,
+					persistedAnomaly.Sensitivity, persistedAnomaly.MinActions)
+				if aerr != nil {
+					return fmt.Errorf("anomaly_detection config (from %s): %w", cfgPath, aerr)
+				}
 			}
 			if acfg.Enabled {
 				srv.SetAnomalyDetector(srv.NewAnomalyDetector(acfg))

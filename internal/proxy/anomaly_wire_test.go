@@ -37,6 +37,24 @@ func TestAnomalyConfigFromEnvEnable(t *testing.T) {
 	}
 }
 
+func TestAnomalyConfigFromValues(t *testing.T) {
+	// disabled in = the disabled default, no path resolution.
+	if c, err := AnomalyConfigFromValues(false, "", "", 0); err != nil || c.Enabled {
+		t.Fatalf("disabled values must yield disabled config: %+v err=%v", c, err)
+	}
+	// enabled honors mode/sensitivity/min + persists the baseline (path set
+	// from the default ~/.gbounce resolution so config-enable matures too).
+	t.Setenv("IAM_JIT_ANOMALY_BASELINE_PATH", "/tmp/test-baseline.json")
+	c, err := AnomalyConfigFromValues(true, "block", "high", 25)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.Enabled || c.Mode != "block" || c.Sensitivity != "high" ||
+		c.MinActionsForBaseline != 25 || c.BaselinePath != "/tmp/test-baseline.json" {
+		t.Fatalf("values not honored: %+v", c)
+	}
+}
+
 func TestAnomalyHealthzUnwired(t *testing.T) {
 	s := &Server{}
 	h := s.anomalyHealthz()

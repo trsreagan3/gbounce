@@ -36,6 +36,18 @@ type RunConfigFile struct {
 	UIExcludeHosts     []string                `yaml:"ui_exclude_hosts"`
 	DenyHosts          []string                `yaml:"deny_hosts"`
 	AuditObjectStorage *RunConfigObjectStorage `yaml:"audit_object_storage"`
+	Anomaly            *RunConfigAnomaly       `yaml:"anomaly_detection"`
+}
+
+// RunConfigAnomaly persists the Phase H anomaly detector opt-in so an
+// operator enables it once instead of exporting IAM_JIT_ANOMALY_DETECTION
+// on every run. The IAM_JIT_ANOMALY_* env vars still WIN when set (env >
+// file), matching the resolve* precedence used everywhere else.
+type RunConfigAnomaly struct {
+	Enabled     bool   `yaml:"enabled"`
+	Mode        string `yaml:"mode"`
+	Sensitivity string `yaml:"sensitivity"`
+	MinActions  int    `yaml:"min_actions_for_baseline"`
 }
 
 // RunConfigObjectStorage persists the #317 S3-compatible audit sink config.

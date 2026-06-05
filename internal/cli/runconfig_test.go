@@ -51,6 +51,33 @@ audit_object_storage:
 	}
 }
 
+func TestLoadRunConfig_ParsesAnomalyBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+mode: discovery
+anomaly_detection:
+  enabled: true
+  mode: block
+  sensitivity: high
+  min_actions_for_baseline: 25
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rc, found, err := LoadRunConfig(path)
+	if err != nil || !found {
+		t.Fatalf("load: found=%v err=%v", found, err)
+	}
+	if rc.Anomaly == nil {
+		t.Fatal("anomaly_detection block not parsed")
+	}
+	if !rc.Anomaly.Enabled || rc.Anomaly.Mode != "block" ||
+		rc.Anomaly.Sensitivity != "high" || rc.Anomaly.MinActions != 25 {
+		t.Errorf("anomaly block=%+v", rc.Anomaly)
+	}
+}
+
 func TestLoadRunConfig_MissingFileIsNoOp(t *testing.T) {
 	rc, found, err := LoadRunConfig(filepath.Join(t.TempDir(), "nope.yaml"))
 	if err != nil || found || rc != nil {

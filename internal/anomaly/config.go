@@ -238,7 +238,7 @@ func LoadConfig(block map[string]any) (Config, error) {
 		}
 	}
 	if len(extra) > 0 {
-		return Config{}, configErr("anomaly_detection has unknown key(s) %v; allowed: [baseline_decay_rate baseline_window cold_start_fallback enabled min_actions_for_baseline mode sensitivity]", sortedStrings(extra))
+		return Config{}, configErr("anomaly_detection has unknown key(s) %v; allowed: [baseline_decay_rate baseline_path baseline_window cold_start_fallback enabled min_actions_for_baseline mode sensitivity]", sortedStrings(extra))
 	}
 
 	return cfg, nil

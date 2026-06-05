@@ -78,6 +78,29 @@ func AnomalyConfigFromEnv() (anomaly.Config, error) {
 	return anomaly.LoadConfig(block)
 }
 
+// AnomalyConfigFromValues builds + validates a detector config from
+// explicit values (the persisted ~/.gbounce/config.yaml anomaly block).
+// It shares the env path's baseline-path resolution so a config-enabled
+// detector persists its baseline identically. mode/sensitivity empty =
+// the validated defaults; minActions <= 0 = the default floor.
+func AnomalyConfigFromValues(enabled bool, mode, sensitivity string, minActions int) (anomaly.Config, error) {
+	if !enabled {
+		return anomaly.DefaultConfig(), nil
+	}
+	block := map[string]any{"enabled": true}
+	if mode = strings.TrimSpace(mode); mode != "" {
+		block["mode"] = mode
+	}
+	if sensitivity = strings.TrimSpace(sensitivity); sensitivity != "" {
+		block["sensitivity"] = sensitivity
+	}
+	if minActions > 0 {
+		block["min_actions_for_baseline"] = minActions
+	}
+	block["baseline_path"] = anomalyBaselinePath()
+	return anomaly.LoadConfig(block)
+}
+
 // anomalyBaselinePath resolves the baseline persistence file:
 // IAM_JIT_ANOMALY_BASELINE_PATH if set, else ~/.gbounce/anomaly-baseline.json.
 // Returns "" only when neither is resolvable (degrades to in-memory).
