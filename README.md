@@ -659,6 +659,59 @@ Honest caveats:
   failure surfaces in `/healthz` (`total_dynamic_deny_parse_errors`)
   + as a `dynamic_deny.parse_error` admin-action OCSF event.
 
+### Anomaly detection (behavioral baseline — opt-in)
+
+gbounce can learn a per-agent behavioral baseline (which actions, against
+which resource *shapes*, at which hours) and surface a **neutral signal**
+when a request deviates — the burst of unfamiliar calls a freshly
+compromised agent makes before it has "learned" your normal traffic. It is
+the same cross-product core (config / baseline / detector) shared with
+kbouncer + dbounce per `[[config-export-wire-divergence]]`.
+
+**OFF by default, and ALERT-not-block when on**, per
+`[[ibounce-honest-positioning]]` + `[[safety-mode-lean-permissive]]`. Enable
+it per run with env vars:
+
+```sh
+IAM_JIT_ANOMALY_DETECTION=1 \
+IAM_JIT_ANOMALY_MODE=alert \         # alert (default) | block
+IAM_JIT_ANOMALY_SENSITIVITY=medium \ # low | medium (default) | high
+IAM_JIT_ANOMALY_MIN_ACTIONS=50 \     # baseline floor before scoring kicks in
+gbounce run --allow-connect --port 8080
+```
+
+…or enable it **once** in `~/.gbounce/config.yaml` so you don't export the
+env var every run (env still wins when both are set):
+
+```yaml
+anomaly_detection:
+  enabled: true
+  mode: alert
+  sensitivity: medium
+  min_actions_for_baseline: 50
+```
+
+- **`alert` (default)** surfaces a neutral high-severity OCSF event on the
+  same JSONL + webhook transport as decision events; the request is **not**
+  changed.
+- **`block`** additionally TIGHTENS allow→deny on an anomalous request
+  BEFORE the upstream is dialed (tighten-only — it never loosens a deny,
+  iam-jit#59). Startup says so honestly when armed.
+
+**The baseline persists across restarts.** It is written to
+`~/.gbounce/anomaly-baseline.json` (override with
+`IAM_JIT_ANOMALY_BASELINE_PATH`), flushed periodically + on shutdown, and
+reloaded on start — so the detector keeps maturing instead of resetting to
+cold-start every time the proxy restarts. Privacy-safe: only structural
+shapes + counts are stored, never raw hosts/paths. The current state shows
+on `/healthz` (`anomaly.persisted` / `persist_path` / `total_observations`).
+
+Honest caveats: this is a **signal for review, not a guarantee** — a low-and-
+slow attacker that mimics your baseline won't trip it, and (like every
+gbounce control) an operator who owns the agent's network can route around
+the proxy. It complements the scope + audit + short-TTL story; it does not
+replace it.
+
 ### Security-team observation preset
 
 ```sh
