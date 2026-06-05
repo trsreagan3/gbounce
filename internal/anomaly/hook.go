@@ -19,7 +19,7 @@
 //     no-op (no score, no emit) — alerting stays on the observe path.
 //   - Run (POST-decision): observes the (possibly tightened) decision
 //     into the per-agent baseline for learning AND, in alert mode, scores
-//     + emits the neutral alert. When the floor already denied (including
+//   - emits the neutral alert. When the floor already denied (including
 //     a deny that Decide just tightened to) Run short-circuits, so block
 //     never double-counts or double-emits.
 //
@@ -126,7 +126,16 @@ type Detector struct {
 // forces alert behavior regardless of cfg.Mode (the "detection-only
 // deployment" posture: score + surface, never block).
 func NewDetector(cfg Config, emitter AlertEmitter, detectionOnly bool) *Detector {
-	store := NewBaselineStore(cfg.BaselineWindowSeconds, cfg.BaselineDecayRate)
+	var store *BaselineStore
+	if cfg.BaselinePath != "" {
+		// FromFile always returns a usable store (missing=fresh,
+		// corrupt=usable+err); a load error degrades to a fresh baseline
+		// rather than failing construction, so a bad file never bricks the
+		// proxy. The path is still set, so the next Save overwrites it.
+		store, _ = NewBaselineStoreFromFile(cfg.BaselinePath, cfg.BaselineWindowSeconds, cfg.BaselineDecayRate)
+	} else {
+		store = NewBaselineStore(cfg.BaselineWindowSeconds, cfg.BaselineDecayRate)
+	}
 	return &Detector{
 		cfg:           cfg,
 		store:         store,
@@ -137,6 +146,17 @@ func NewDetector(cfg Config, emitter AlertEmitter, detectionOnly bool) *Detector
 
 // Store exposes the baseline store (diagnostics + tests).
 func (d *Detector) Store() *BaselineStore { return d.store }
+
+// SaveBaseline persists the learned baseline if a path is configured.
+// No-op (nil error) for a nil/disabled detector or an in-memory store.
+// The proxy lifecycle calls this on a periodic tick + at shutdown so the
+// baseline matures across restarts.
+func (d *Detector) SaveBaseline() error {
+	if d == nil || d.store == nil {
+		return nil
+	}
+	return d.store.Save()
+}
 
 // Enabled reports whether scoring runs.
 func (d *Detector) Enabled() bool { return d != nil && d.cfg.Enabled }

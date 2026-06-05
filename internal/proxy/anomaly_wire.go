@@ -25,7 +25,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/trsreagan3/gbounce/internal/anomaly"
@@ -68,7 +70,26 @@ func AnomalyConfigFromEnv() (anomaly.Config, error) {
 			block["min_actions_for_baseline"] = n
 		}
 	}
+	// Persist the baseline so it survives restarts (dogfood finding: the
+	// baseline was in-memory only). Honor an explicit override, else
+	// default to ~/.gbounce/anomaly-baseline.json. Empty path (no override
+	// + no resolvable home) keeps the historical in-memory behavior.
+	block["baseline_path"] = anomalyBaselinePath()
 	return anomaly.LoadConfig(block)
+}
+
+// anomalyBaselinePath resolves the baseline persistence file:
+// IAM_JIT_ANOMALY_BASELINE_PATH if set, else ~/.gbounce/anomaly-baseline.json.
+// Returns "" only when neither is resolvable (degrades to in-memory).
+func anomalyBaselinePath() string {
+	if v := strings.TrimSpace(os.Getenv("IAM_JIT_ANOMALY_BASELINE_PATH")); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".gbounce", "anomaly-baseline.json")
 }
 
 // SetAnomalyDetector wires the Phase H behavioral-deviation detector.
@@ -204,9 +225,9 @@ func (s *Server) decideAnomaly(w http.ResponseWriter, r *http.Request, startedAt
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
 	body := map[string]any{
-		"error":            legacyMsg,
-		"decision_verdict": "deny",
-		"decision_reason":  legacyMsg,
+		"error":                              legacyMsg,
+		"decision_verdict":                   "deny",
+		"decision_reason":                    legacyMsg,
 		"caught_by_bouncer":                  deny.CaughtByBouncer,
 		"is_likely_injection_classification": deny.IsLikelyInjectionClassification,
 		"suggested_allow_command":            deny.SuggestedAllowCommand,

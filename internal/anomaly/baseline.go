@@ -18,7 +18,11 @@
 package anomaly
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -146,6 +150,10 @@ type BaselineStore struct {
 	// the distinct-key cap is hit.
 	lastSeen map[aggKey]int64
 	dropped  int64
+	// persistPath, when set, is where Save() writes the baseline so it
+	// survives a restart (without it the baseline cold-starts every run —
+	// the detector never matures). "" = pure in-memory.
+	persistPath string
 }
 
 // Default tuning mirrors baseline.py defaults.
@@ -190,6 +198,124 @@ func NewBaselineStore(windowSeconds int, decayRate float64) *BaselineStore {
 		rolling:        map[aggKey][]observation{},
 		lastSeen:       map[aggKey]int64{},
 	}
+}
+
+// --- disk persistence (so the baseline survives restarts) ---------------
+
+type persistedObs struct {
+	ObservedAt int64 `json:"observed_at"`
+	HourOfDay  int   `json:"hour_of_day"`
+}
+
+type persistedEntry struct {
+	Agent        string         `json:"agent"`
+	Action       string         `json:"action"`
+	Resource     string         `json:"resource"`
+	LastSeen     int64          `json:"last_seen"`
+	Observations []persistedObs `json:"observations"`
+}
+
+type persistedBaseline struct {
+	Version       int              `json:"version"`
+	WindowSeconds int64            `json:"window_seconds"`
+	DecayRate     float64          `json:"decay_rate"`
+	Dropped       int64            `json:"dropped"`
+	Entries       []persistedEntry `json:"entries"`
+}
+
+// PersistPath returns the configured on-disk path ("" = in-memory only).
+func (s *BaselineStore) PersistPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistPath
+}
+
+// Save atomically writes the baseline to its persistPath. No-op when no path
+// is configured. Owner-only (0600): the baseline reveals an agent's behavioral
+// profile.
+func (s *BaselineStore) Save() error {
+	s.mu.Lock()
+	path := s.persistPath
+	if path == "" {
+		s.mu.Unlock()
+		return nil
+	}
+	doc := persistedBaseline{
+		Version:       1,
+		WindowSeconds: s.windowSeconds,
+		DecayRate:     s.decayRate,
+		Dropped:       s.dropped,
+		Entries:       make([]persistedEntry, 0, len(s.rolling)),
+	}
+	for k, obs := range s.rolling {
+		pe := persistedEntry{
+			Agent: k.agent, Action: k.action, Resource: k.resource,
+			LastSeen:     s.lastSeen[k],
+			Observations: make([]persistedObs, 0, len(obs)),
+		}
+		for _, o := range obs {
+			pe.Observations = append(pe.Observations, persistedObs{ObservedAt: o.observedAt, HourOfDay: o.hourOfDay})
+		}
+		doc.Entries = append(doc.Entries, pe)
+	}
+	s.mu.Unlock()
+
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("anomaly: marshal baseline: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// NewBaselineStoreFromFile builds a store bound to `path` and loads any
+// existing baseline from it. A missing file is a fresh store (not an error);
+// a corrupt file is logged-by-the-caller via the returned error but the store
+// is still usable (returned non-nil so the detector keeps running).
+func NewBaselineStoreFromFile(path string, windowSeconds int, decayRate float64) (*BaselineStore, error) {
+	s := NewBaselineStore(windowSeconds, decayRate)
+	s.persistPath = path
+	if path == "" {
+		return s, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s, nil
+		}
+		return s, fmt.Errorf("anomaly: read baseline %q: %w", path, err)
+	}
+	var doc persistedBaseline
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return s, fmt.Errorf("anomaly: parse baseline %q (starting fresh): %w", path, err)
+	}
+	s.mu.Lock()
+	if doc.WindowSeconds > 0 {
+		s.windowSeconds = doc.WindowSeconds
+	}
+	if doc.DecayRate > 0 && doc.DecayRate <= 1.0 {
+		s.decayRate = doc.DecayRate
+	}
+	s.dropped = doc.Dropped
+	for _, e := range doc.Entries {
+		k := aggKey{agent: e.Agent, action: e.Action, resource: e.Resource}
+		obs := make([]observation, 0, len(e.Observations))
+		for _, o := range e.Observations {
+			obs = append(obs, observation{observedAt: o.ObservedAt, hourOfDay: o.HourOfDay})
+		}
+		s.rolling[k] = obs
+		s.lastSeen[k] = e.LastSeen
+	}
+	s.mu.Unlock()
+	return s, nil
 }
 
 // withClock injects a fake clock for deterministic tests.
@@ -452,7 +578,9 @@ func (s *BaselineStore) Status() map[string]any {
 		"window_seconds":       s.windowSeconds,
 		"decay_rate":           s.decayRate,
 		"decay_period_seconds": s.decayPeriodSec,
-		"in_memory":            true,
+		"in_memory":            s.persistPath == "",
+		"persisted":            s.persistPath != "",
+		"persist_path":         s.persistPath,
 	}
 }
 

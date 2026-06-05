@@ -706,6 +706,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	// #461 / §A63c — start disk-pressure check loop. Goroutine exits
 	// when the Serve context is cancelled.
 	diskStop := s.startDiskPressureLoop(ctx)
+	// Phase H — periodically flush the anomaly baseline so learning
+	// survives restarts. nil when nothing is persisted.
+	anomalyStop := s.startAnomalyPersistLoop(ctx)
 
 	select {
 	case <-ctx.Done():
@@ -722,16 +725,28 @@ func (s *Server) Serve(ctx context.Context) error {
 		if diskStop != nil {
 			close(diskStop)
 		}
+		if anomalyStop != nil {
+			close(anomalyStop)
+		}
+		s.finalizeAnomalyBaseline()
 		return nil
 	case err := <-proxyErr:
 		if diskStop != nil {
 			close(diskStop)
 		}
+		if anomalyStop != nil {
+			close(anomalyStop)
+		}
+		s.finalizeAnomalyBaseline()
 		return err
 	case err := <-mgmtErr:
 		if diskStop != nil {
 			close(diskStop)
 		}
+		if anomalyStop != nil {
+			close(anomalyStop)
+		}
+		s.finalizeAnomalyBaseline()
 		return err
 	}
 }
@@ -747,6 +762,47 @@ func (s *Server) startDiskPressureLoop(ctx context.Context) chan struct{} {
 	stop := make(chan struct{})
 	go audit.RunDiskPressureLoop(ctx, s.cfg.DiskPressure, s.log, stop)
 	return stop
+}
+
+// anomalyPersistInterval is how often the learned baseline is flushed to
+// disk while serving, so a SIGKILL loses at most this much learning.
+const anomalyPersistInterval = 60 * time.Second
+
+// startAnomalyPersistLoop periodically flushes the anomaly baseline to
+// disk so it survives restarts (dogfood finding: the baseline was
+// in-memory only). Returns nil when there is nothing to persist (no
+// detector, disabled, or in-memory store) so the caller's close path can
+// nil-check uniformly. SaveBaseline is a no-op for an in-memory store, so
+// the cheap guard here just avoids spinning an idle ticker.
+func (s *Server) startAnomalyPersistLoop(ctx context.Context) chan struct{} {
+	if s == nil || s.anomalyDetector == nil || !s.anomalyDetector.Enabled() ||
+		s.anomalyDetector.Store() == nil || s.anomalyDetector.Store().PersistPath() == "" {
+		return nil
+	}
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(anomalyPersistInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-t.C:
+				_ = s.anomalyDetector.SaveBaseline()
+			}
+		}
+	}()
+	return stop
+}
+
+// finalizeAnomalyBaseline flushes the baseline one last time on shutdown
+// so the most recent learning is never lost. No-op when unpersisted.
+func (s *Server) finalizeAnomalyBaseline() {
+	if s != nil && s.anomalyDetector != nil {
+		_ = s.anomalyDetector.SaveBaseline()
+	}
 }
 
 // ServeListeners is a test helper that serves on caller-provided
@@ -770,6 +826,7 @@ func (s *Server) ServeListeners(ctx context.Context, proxyL, mgmtL net.Listener)
 		close(proxyErr)
 	}()
 	diskStop := s.startDiskPressureLoop(ctx)
+	anomalyStop := s.startAnomalyPersistLoop(ctx)
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -786,16 +843,28 @@ func (s *Server) ServeListeners(ctx context.Context, proxyL, mgmtL net.Listener)
 		if diskStop != nil {
 			close(diskStop)
 		}
+		if anomalyStop != nil {
+			close(anomalyStop)
+		}
+		s.finalizeAnomalyBaseline()
 		return nil
 	case err := <-proxyErr:
 		if diskStop != nil {
 			close(diskStop)
 		}
+		if anomalyStop != nil {
+			close(anomalyStop)
+		}
+		s.finalizeAnomalyBaseline()
 		return err
 	case err := <-mgmtErr:
 		if diskStop != nil {
 			close(diskStop)
 		}
+		if anomalyStop != nil {
+			close(anomalyStop)
+		}
+		s.finalizeAnomalyBaseline()
 		return err
 	}
 }

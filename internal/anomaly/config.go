@@ -142,6 +142,11 @@ type Config struct {
 	BaselineDecayRate     float64
 	MinActionsForBaseline int
 	ColdStartFallback     bool
+	// BaselinePath, when non-empty, persists the learned baseline to this
+	// file so it survives restarts (dogfood finding: the baseline was
+	// in-memory only and reset every restart, so the detector never
+	// matured). Empty = in-memory only (the historical behavior).
+	BaselinePath string
 }
 
 // DefaultConfig returns the conservative, DISABLED default per
@@ -219,11 +224,12 @@ func LoadConfig(block map[string]any) (Config, error) {
 	cfg.MinActionsForBaseline = minActions
 
 	cfg.ColdStartFallback = asBool(block["cold_start_fallback"], true)
+	cfg.BaselinePath = strings.TrimSpace(asString(block["baseline_path"], ""))
 
 	allowed := map[string]struct{}{
 		"enabled": {}, "mode": {}, "sensitivity": {}, "baseline_window": {},
 		"baseline_decay_rate": {}, "min_actions_for_baseline": {},
-		"cold_start_fallback": {},
+		"cold_start_fallback": {}, "baseline_path": {},
 	}
 	var extra []string
 	for k := range block {
